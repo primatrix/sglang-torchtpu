@@ -88,7 +88,8 @@ def _kernel(
     sin_ref,  # VMEM bf16[page_size, 128]; 0 past rope_dim
     cache_in_ref,  # HBM, aliased with cache_ref
     cache_ref,  # HBM u8[P, page_size // 4, 4, 256]
-    rec_ref,  # VMEM u32[page_size, 256]: one byte per lane
+    key_rec_ref,  # VMEM u32[page_size, 128]: record lanes [0, 128), one byte per lane
+    tail_rec_ref,  # VMEM u32[page_size, 128]: record lanes [128, 256)
     page_buf,  # VMEM u8[2, page_size // 4, 4, 256]
     sems,  # DMA[2]
     pending,  # SMEM i32[2]
@@ -143,16 +144,21 @@ def _kernel(
         k = bf16(bf16(k * cos) + bf16(partner * sin))
 
         values, exp = _ue8m0_quantize(k)
-        key_bytes = lax.bitcast_convert_type(values, jnp.uint8).astype(jnp.uint32)
-        tail = jnp.where(lane == 0, (exp + 127).astype(jnp.uint32), jnp.uint32(0))
-        rec_ref[...] = jnp.concatenate([key_bytes, tail], axis=1)
+        # Record lanes [0, 128): key bytes; [128, 256): scale byte, then zeros.
+        # Kept as two 128-lane halves: Mosaic strided loads need a 128-wide ref.
+        key_rec_ref[...] = lax.bitcast_convert_type(values, jnp.uint8).astype(jnp.uint32)
+        tail_rec_ref[...] = jnp.where(lane == 0, (exp + 127).astype(jnp.uint32), jnp.uint32(0))
 
         # A cache row holds tokens 4r .. 4r + 3; token 4r + b is byte b of each
         # 32-bit word, as dsa_key_store merges them.
-        words = rec_ref[pl.ds(0, rows_per_page, stride=_TOKENS_PER_ROW), :]
-        for b in range(1, _TOKENS_PER_ROW):
-            part = rec_ref[pl.ds(b, rows_per_page, stride=_TOKENS_PER_ROW), :]
-            words = words | (part << jnp.uint32(8 * b))
+        halves = []
+        for ref in (key_rec_ref, tail_rec_ref):
+            w = ref[pl.ds(0, rows_per_page, stride=_TOKENS_PER_ROW), :]
+            for b in range(1, _TOKENS_PER_ROW):
+                part = ref[pl.ds(b, rows_per_page, stride=_TOKENS_PER_ROW), :]
+                w = w | (part << jnp.uint32(8 * b))
+            halves.append(w)
+        words = jnp.concatenate(halves, axis=1)
         for r in range(rows_per_page):
             page_buf[slot, r] = pltpu.bitcast(words[r : r + 1], jnp.uint8)
         _write(slot, page).start()
@@ -224,7 +230,8 @@ def key_prologue_pallas(
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=[
-                pltpu.VMEM((page_size, record_bytes), jnp.uint32),
+                pltpu.VMEM((page_size, _HEAD_DIM), jnp.uint32),
+                pltpu.VMEM((page_size, _HEAD_DIM), jnp.uint32),
                 pltpu.VMEM((2, rows_per_page, tokens_per_row, record_bytes), jnp.uint8),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SMEM((2,), jnp.int32),
