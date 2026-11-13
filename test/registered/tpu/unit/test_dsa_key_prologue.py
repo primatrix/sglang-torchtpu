@@ -15,8 +15,11 @@ so it shares no code with the kernel. The tests guard what can go wrong silently
   UE8M0 scale must be the target's. The FP8 dot cannot be: on TPU both XLA's
   (the target's) and Mosaic's lose precision, in different elements. Keys are
   compared with an exact-dot reference within one FP8 step plus that dot error
-  carried through LayerNorm and rope, and top-k picks over the keys must pass
-  the selection rule of test_dsa_index_topk.py.
+  carried through LayerNorm and rope. On the same inputs and queries, the
+  kernel's top-k selection must be no worse than the target chain's (XLA, the
+  form that matched torch_tpu bit for bit on v7x): max shortfall, p99 shortfall
+  and the fraction of queries more than 2% short, each without extra margin.
+  This does not replace a comparison with the real torch_tpu chain.
 * The alignment guard. Batches the kernel cannot write whole pages for must be
   reported as unaligned so the caller keeps the existing path.
 
@@ -59,7 +62,8 @@ _INTERPRET = jax.default_backend() != "tpu"
 # Measured on v7x with these inputs: XLA's FP8 dot (the target) is up to 3.45
 # off the exact sum, Mosaic's up to 3.11. The margin to 4.0 is arbitrary.
 _DOT_ERR = 4.0
-# As in test_dsa_index_topk.py: a pick may score this far below the k-th best.
+# The 2% line of test_dsa_index_topk.py; here only the cut for counting how many
+# queries fall more than this far short, compared between kernel and target.
 _SCORE_SLACK = 0.02
 
 
@@ -89,6 +93,66 @@ def _reference_keys(x, wk, wk_scale, nw, nb, cos, sin):
     k = k.copy()
     k[:, 0:_ROPE:2], k[:, 1:_ROPE:2] = o1, o2
     return k
+
+
+def _target_keys(x, wk, wk_scale, nw, nb, cos, sin):
+    """The target chain's keys: XLA, one jit per stage, host round trip between.
+
+    On v7x this form matched torch_tpu's projection, LayerNorm and rope bit for
+    bit; reduce_precision keeps the bf16 rounding XLA would otherwise fold away.
+    """
+    from jax import lax
+
+    f32 = jnp.float32
+    rt = lambda a: lax.reduce_precision(a.astype(f32), exponent_bits=8, mantissa_bits=7)
+
+    @jax.jit
+    def proj(x, wk, ws):
+        xf = x.astype(f32)
+        xs = jnp.maximum(jnp.max(jnp.abs(xf), axis=1, keepdims=True) / 448.0, 1e-12)
+        xq = (xf / xs).astype(jnp.float8_e4m3fn)
+        acc = lax.dot_general(xq, wk, (((1,), (0,)), ((), ())), preferred_element_type=f32)
+        return rt(acc * xs * ws[None])
+
+    @jax.jit
+    def norm(k, nw, nb):
+        mean = jnp.mean(k, axis=1, keepdims=True)
+        var = jnp.mean(jnp.square(k - mean), axis=1, keepdims=True)
+        return rt((k - mean) * lax.rsqrt(var + _EPS) * nw + nb)
+
+    @jax.jit
+    def rope(k, cos, sin):
+        c, s = cos.astype(f32), sin.astype(f32)
+        x1, x2 = k[:, 0:_ROPE:2], k[:, 1:_ROPE:2]
+        o1 = rt(rt(x1 * c) - rt(x2 * s))
+        o2 = rt(rt(x2 * c) + rt(x1 * s))
+        rot = jnp.stack([o1, o2], axis=-1).reshape(k.shape[0], _ROPE)
+        return jnp.concatenate([rot, k[:, _ROPE:]], axis=1)
+
+    p = np.asarray(proj(jnp.asarray(x), jnp.asarray(wk), jnp.asarray(wk_scale)))
+    n = np.asarray(norm(jnp.asarray(p), jnp.asarray(nw), jnp.asarray(nb)))
+    return np.asarray(rope(jnp.asarray(n), jnp.asarray(cos), jnp.asarray(sin)))
+
+
+def _selection_shortfall(keys, exact_k, topk=128, heads=32, queries=512):
+    """Per query: 1 - (lowest exact score among the top-k picks over ``keys``)
+    / (exact k-th best score). 0 means the picks are a true top-k.
+
+    Scores are the indexer's: sum over heads of relu(q . k) * head weight. The
+    queries are fixed by seed, so the kernel and the target see the same ones.
+    """
+    rng = np.random.default_rng(1)
+    q = rng.normal(size=(queries, heads, _D)).astype(np.float32)
+    w = rng.uniform(0.1, 1.0, (queries, heads)).astype(np.float32)
+
+    def scores(k):
+        return np.einsum("qhk,qh->qk", np.maximum(np.einsum("qhd,kd->qhk", q, k), 0), w)
+
+    s_k, s_e = scores(keys), scores(exact_k)
+    picks = np.argpartition(-s_k, topk, axis=1)[:, :topk]
+    lowest = np.take_along_axis(s_e, picks, axis=1).min(1)
+    kth = -np.partition(-s_e, topk - 1, axis=1)[:, topk - 1]
+    return np.maximum(0.0, 1.0 - lowest / kth)
 
 
 def _dot_error_bound(x, wk, wk_scale, nw):
@@ -209,25 +273,34 @@ class TestDsaKeyPrologue(CustomTestCase):
         bound = 0.125 * np.abs(ref_k) + ref_scale[:, None] * 2.0**-8
         bound = bound + _dot_error_bound(x, wk, wk_scale, nw)[: got.shape[0]]
         self.assertTrue(np.all(err <= bound), f"max excess {float((err - bound).max())}")
-        self._assert_selection_holds(got_k, _dequant(ref_rec))
+        target_rec, _ = _reference_records(_target_keys(x, wk, wk_scale, nw, nb, cos, sin))
+        self._assert_selection_no_worse_than_target(
+            got_k=got_k,
+            target_k=_dequant(target_rec[: got.shape[0]]),
+            exact_k=_dequant(ref_rec),
+        )
 
-    def _assert_selection_holds(self, got_k, ref_k, topk=128, heads=32, queries=16):
-        """Top-k over the kernel's keys picks keys the reference ranks near the top."""
-        rng = np.random.default_rng(1)
-        q = rng.normal(size=(queries, heads, _D)).astype(np.float32)
-        w = rng.uniform(0.1, 1.0, (queries, heads)).astype(np.float32)
+    def _assert_selection_no_worse_than_target(self, *, got_k, target_k, exact_k):
+        """On the same queries, the kernel's top-k is no worse than the target's.
 
-        def scores(k):
-            # The indexer score: sum over heads of relu(q . k) * head weight.
-            return np.einsum("qhk,qh->qk", np.maximum(np.einsum("qhd,kd->qhk", q, k), 0), w)
-
-        s_got, s_ref = scores(got_k), scores(ref_k)
-        for t in range(queries):
-            picks = np.argpartition(-s_got[t], topk)[:topk]
-            kth_best = np.sort(s_ref[t])[::-1][topk - 1]
-            self.assertGreaterEqual(
-                float(s_ref[t][picks].min()), float(kth_best) * (1 - _SCORE_SLACK),
-                f"query {t} picked a key below the top-k cut",
+        The target's own FP8 dot already misses the exact top-k by up to ~5% on
+        v7x, so a fixed slack cannot be the bar; the target's shortfall is.
+        """
+        shortfall = {
+            "kernel": _selection_shortfall(got_k, exact_k),
+            "target": _selection_shortfall(target_k, exact_k),
+        }
+        stats = {
+            name: {
+                "max": float(v.max()),
+                "p99": float(np.quantile(v, 0.99)),
+                "frac_over_2pct": float(np.mean(v > _SCORE_SLACK)),
+            }
+            for name, v in shortfall.items()
+        }
+        for stat in ("max", "p99", "frac_over_2pct"):
+            self.assertLessEqual(
+                stats["kernel"][stat], stats["target"][stat], f"{stat}: {stats}"
             )
 
     def test_unaligned_batches_are_reported(self):
