@@ -115,6 +115,30 @@ def _key_stages(x, w, ws, nw, nb, cos, sin, *, eps):
     return x_scale, k_proj, k_norm, k_rope
 
 
+def key_chain_xla(hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin, *, eps):
+    """The kernel's key chain in plain XLA, for batches the kernel cannot take.
+
+    Same math as ``_key_stages`` (XLA's native FP8 dot), on any number of
+    tokens; returns bf16[T, 128], the key ``quantize_fp8_ue8m0`` takes.
+    """
+    f32 = jnp.float32
+    x = hidden.astype(f32)
+    x_scale = jnp.maximum(jnp.max(jnp.abs(x), axis=1, keepdims=True) / _FP8_MAX, 1e-12)
+    x_q = (x / x_scale).astype(jnp.float8_e4m3fn)
+    acc = lax.dot_general(x_q, wk, (((1,), (0,)), ((), ())), preferred_element_type=f32)
+    k = _bf16(acc * x_scale * wk_scale.astype(f32)[None])
+    mean = jnp.mean(k, axis=1, keepdims=True)
+    var = jnp.mean(jnp.square(k - mean), axis=1, keepdims=True)
+    k = _bf16((k - mean) * lax.rsqrt(var + eps) * norm_weight.astype(f32) + norm_bias.astype(f32))
+    rope_dim = 2 * rope_cos.shape[1]
+    c, s = rope_cos.astype(f32), rope_sin.astype(f32)
+    x1, x2 = k[:, 0:rope_dim:2], k[:, 1:rope_dim:2]
+    o1 = _bf16(_bf16(x1 * c) - _bf16(x2 * s))
+    o2 = _bf16(_bf16(x2 * c) + _bf16(x1 * s))
+    rot = jnp.stack([o1, o2], axis=-1).reshape(k.shape[0], rope_dim)
+    return jnp.concatenate([rot, k[:, rope_dim:]], axis=1).astype(jnp.bfloat16)
+
+
 def key_stages_pallas(
     hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin, *, eps, interpret=False
 ):

@@ -21,6 +21,11 @@ or for decode-sized batches the Pallas writer in ``dsa_key_store``.
 import jax
 import jax.numpy as jnp
 
+from sglang_tpu.attention.pallas.dsa_key_prologue import (
+    key_chain_xla,
+    key_prologue_pallas,
+    key_prologue_targets,
+)
 from sglang_tpu.attention.pallas.dsa_key_store import store_keys_pallas
 from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils
 from sglang_tpu.attention.pallas.util import align_to, quantize_fp8_ue8m0
@@ -214,7 +219,6 @@ def dsa_indexer_step(
       the row is ``-1``. A token with at most ``topk`` keys gets all of them.
     * ``cache_k``: the cache with this step's keys stored.
     """
-    q_fp8, q_scale, _ = quantize_fp8_ue8m0(query)
     if key_store == "xla":
         k_fp8, _, k_scale_byte = quantize_fp8_ue8m0(key)
         cache_k = _store_keys(
@@ -224,6 +228,104 @@ def dsa_indexer_step(
         cache_k = store_keys_pallas(
             cache_k, key, kv_lens, page_indices, cu_q_lens, distribution
         )
+    return _select_topk(
+        query, head_weights, cache_k, kv_lens, page_indices, cu_q_lens,
+        distribution, row_start, weight_scale=weight_scale, topk=topk,
+        decode_query_size=decode_query_size, segments=segments, row_count=row_count,
+    )
+
+
+def store_keys_fused(
+    cache_k: jax.Array,  # u8[num_pages, page_size // 4, 4, record_bytes]
+    hidden: jax.Array,  # bf16[max_num_tokens, hidden]; a multiple of page_size
+    wk: jax.Array,  # f8e4m3fn[hidden, index_head_dim]
+    wk_scale: jax.Array,  # f32[index_head_dim]
+    norm_weight: jax.Array,  # f32[index_head_dim]
+    norm_bias: jax.Array,  # f32[index_head_dim]
+    rope_cos: jax.Array,  # bf16[max_num_tokens, rope_dim // 2]
+    rope_sin: jax.Array,  # bf16[max_num_tokens, rope_dim // 2]
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    eps: float,
+    interpret: bool = False,
+) -> jax.Array:
+    """Compute this step's index keys from ``hidden`` and store them.
+
+    Page-aligned batches (``key_prologue_targets``) run the fused Pallas
+    kernel. Other batches run the same chain in XLA, then ``_store_keys``.
+    Both use the native FP8 dot, so neither is bit-exact with torch's
+    ``_scaled_mm``; test_dsa_key_prologue.py holds both to the target's
+    top-k selection quality.
+    """
+    num_tokens = hidden.shape[0]
+    page_size = cache_k.shape[1] * cache_k.shape[2]
+    targets, aligned = key_prologue_targets(
+        num_tokens, kv_lens, page_indices, cu_q_lens, distribution, page_size
+    )
+    weights = (hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin)
+
+    def fused(cache):
+        return key_prologue_pallas(*weights, cache, targets, eps=eps, interpret=interpret)
+
+    def unfused(cache):
+        key = key_chain_xla(*weights, eps=eps)
+        k_fp8, _, k_scale_byte = quantize_fp8_ue8m0(key)
+        return _store_keys(
+            cache, k_fp8, k_scale_byte, kv_lens, page_indices, cu_q_lens, distribution
+        )
+
+    # lax.cond traces both branches, and the kernel only accepts whole token
+    # pages: a token bucket that is not a multiple of the page never fuses.
+    if num_tokens % page_size:
+        return unfused(cache_k)
+    return jax.lax.cond(aligned, fused, unfused, cache_k)
+
+
+def dsa_indexer_step_fused_key(
+    query: jax.Array,
+    hidden: jax.Array,
+    wk: jax.Array,
+    wk_scale: jax.Array,
+    norm_weight: jax.Array,
+    norm_bias: jax.Array,
+    rope_cos: jax.Array,
+    rope_sin: jax.Array,
+    head_weights: jax.Array,
+    cache_k: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    row_start: jax.Array | None = None,
+    *,
+    eps: float,
+    weight_scale: float,
+    topk: int,
+    decode_query_size: int = 1,
+    segments: str = "all",
+    row_count: int = 0,
+) -> tuple[jax.Array, jax.Array]:
+    """``dsa_indexer_step`` that computes the keys itself (``store_keys_fused``)."""
+    cache_k = store_keys_fused(
+        cache_k, hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin,
+        kv_lens, page_indices, cu_q_lens, distribution, eps=eps,
+    )
+    return _select_topk(
+        query, head_weights, cache_k, kv_lens, page_indices, cu_q_lens,
+        distribution, row_start, weight_scale=weight_scale, topk=topk,
+        decode_query_size=decode_query_size, segments=segments, row_count=row_count,
+    )
+
+
+def _select_topk(
+    query, head_weights, cache_k, kv_lens, page_indices, cu_q_lens, distribution,
+    row_start, *, weight_scale, topk, decode_query_size, segments, row_count,
+):
+    """Score the cached keys against the queries; returns (topk_indices, cache_k)."""
+    q_fp8, q_scale, _ = quantize_fp8_ue8m0(query)
 
     # The kernel reads each key's scale from the cache. It has no input for the
     # query's scale, so multiply that into the head weight instead.

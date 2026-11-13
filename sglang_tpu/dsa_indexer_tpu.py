@@ -319,6 +319,241 @@ def build_dsa_index_topk_split_op():
     return custom_op
 
 
+_PALLAS_DSA_INDEX_TOPK_FUSED_KEY_OP = None
+
+
+def build_dsa_index_topk_fused_key_op():
+    """Register the indexer step that computes its own keys, once per process.
+
+    Same as ``dsa_index_topk`` (and, with ``row_count`` > 0, the token split
+    op), but it takes the indexer's input ``hidden`` and the ``wk`` / ``k_norm``
+    / rope parameters instead of a finished key, and computes the keys inside
+    the op (``dsa_indexer_step_fused_key``). One op covers both: ``row_count``
+    0 scores every row and ignores ``row_start``.
+    """
+    global _PALLAS_DSA_INDEX_TOPK_FUSED_KEY_OP
+    if _PALLAS_DSA_INDEX_TOPK_FUSED_KEY_OP is not None:
+        return _PALLAS_DSA_INDEX_TOPK_FUSED_KEY_OP
+
+    import jax  # noqa: F401  (force loud failure if JAX is missing)
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.attention.pallas.dsa_index_topk import dsa_indexer_step_fused_key
+
+    op_name = "sglang_tpu_pallas::dsa_index_topk_fused_key"
+
+    # Positional jax.Array tensors, as in build_dsa_index_topk_op.
+    def _wrapped(
+        query: jax.Array,
+        hidden: jax.Array,
+        wk: jax.Array,
+        wk_scale: jax.Array,
+        norm_weight: jax.Array,
+        norm_bias: jax.Array,
+        rope_cos: jax.Array,
+        rope_sin: jax.Array,
+        head_weights: jax.Array,
+        cache_k: jax.Array,
+        kv_lens: jax.Array,
+        page_indices: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        row_start: jax.Array,
+        eps: float,
+        weight_scale: float,
+        topk: int,
+        decode_query_size: int,
+        segments: str,
+        row_count: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        return dsa_indexer_step_fused_key(
+            query,
+            hidden,
+            wk,
+            wk_scale,
+            norm_weight,
+            norm_bias,
+            rope_cos,
+            rope_sin,
+            head_weights,
+            cache_k,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            row_start,
+            eps=eps,
+            weight_scale=weight_scale,
+            topk=topk,
+            decode_query_size=decode_query_size,
+            segments=segments,
+            row_count=row_count,
+        )
+
+    (cache_argnum,) = argnums(_wrapped, "cache_k")
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{op_name}",
+        static_argnums=argnums(
+            _wrapped,
+            "eps",
+            "weight_scale",
+            "topk",
+            "decode_query_size",
+            "segments",
+            "row_count",
+        ),
+        donate_argnums=(cache_argnum,),
+        input_output_aliases={cache_argnum: 1},
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(
+        op_name,
+        mutates_args=("cache_k",),
+        device_types=["tpu"],
+    )
+    def custom_op(
+        query: torch.Tensor,
+        hidden: torch.Tensor,
+        wk: torch.Tensor,
+        wk_scale: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_bias: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        head_weights: torch.Tensor,
+        cache_k: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        row_start: torch.Tensor,
+        eps: float,
+        weight_scale: float,
+        topk: int,
+        decode_query_size: int,
+        segments: str,
+        row_count: int,
+    ) -> torch.Tensor:
+        # See build_dsa_index_topk_op: JAX needs the TPU info to compile here.
+        with tpu_info_for_cpu_export():
+            topk_indices, _updated_cache = jax_kernel(
+                query,
+                hidden,
+                wk,
+                wk_scale,
+                norm_weight,
+                norm_bias,
+                rope_cos,
+                rope_sin,
+                head_weights,
+                cache_k,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                row_start,
+                eps,
+                weight_scale,
+                topk,
+                decode_query_size,
+                segments,
+                row_count,
+            )
+        return topk_indices
+
+    # Shape-only version for torch.compile tracing: row_count rows (all rows
+    # when 0) of topk.
+    def _fake_impl(
+        query: torch.Tensor,
+        hidden: torch.Tensor,
+        wk: torch.Tensor,
+        wk_scale: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_bias: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        head_weights: torch.Tensor,
+        cache_k: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        row_start: torch.Tensor,
+        eps: float,
+        weight_scale: float,
+        topk: int,
+        decode_query_size: int,
+        segments: str,
+        row_count: int,
+    ):
+        rows = row_count or query.shape[0]
+        return torch.empty((rows, topk), dtype=torch.int32, device=query.device)
+
+    custom_op.register_fake(_fake_impl)
+
+    _PALLAS_DSA_INDEX_TOPK_FUSED_KEY_OP = custom_op
+    return custom_op
+
+
+def fused_key_prologue_params(indexer: "Indexer", page_size: int):
+    """The fused key prologue's parameters for ``indexer``, or None to keep the torch chain.
+
+    A trace-time check: the fused op reproduces exactly one chain, GLM-5.2's.
+    Every condition is a property of the model, not of the batch.
+    """
+    from sglang.srt.layers.layernorm import LayerNorm
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSA_FUSED_KEY_PROLOGUE.get():
+        return None
+    if (
+        indexer.skip_rope
+        or indexer.is_neox_style  # the kernel's rope is interleaved (GPT-J)
+        or indexer.head_dim != 128
+        or page_size != 128
+        or 2 * indexer.rope_head_dim > indexer.head_dim
+        or getattr(indexer, "use_dsa_indexer_fusion", False)  # wk folded into wk_weights_proj
+        or not isinstance(indexer.k_norm, LayerNorm)
+        or indexer.k_norm.dtype != torch.float32
+    ):
+        return None
+    wk = indexer.wk
+    weight = getattr(wk, "weight", None)
+    scale = getattr(wk, "weight_scale", None)
+    if (
+        weight is None
+        or scale is None
+        or weight.dtype != torch.float8_e4m3fn
+        or getattr(wk, "bias", None) is not None
+        or tuple(weight.shape) != (indexer.hidden_size, indexer.head_dim)
+        or scale.numel() != indexer.head_dim  # channelwise, one scale per output
+    ):
+        return None
+    rope = indexer.rotary_emb
+    if not hasattr(rope, "cos_sin_cache"):
+        return None
+    return dict(
+        wk=weight,
+        wk_scale=scale.reshape(-1).float(),
+        norm_weight=indexer.k_norm.weight.float(),
+        norm_bias=indexer.k_norm.bias.float(),
+        eps=float(indexer.k_norm.variance_epsilon),
+    )
+
+
+def fused_key_rope_tables(indexer: "Indexer", positions: torch.Tensor):
+    """bf16 ``(cos, sin)`` ``[num_tokens, rope_dim // 2]`` of the indexer's rope.
+
+    The torch chain multiplies in the cache's dtype; the kernel rounds to
+    bf16 after each op, so the tables must be the same bf16 values.
+    """
+    cos_sin = indexer.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    return cos.to(torch.bfloat16).contiguous(), sin.to(torch.bfloat16).contiguous()
+
+
 def indexer_forward(
     indexer: "Indexer",
     *,
@@ -339,6 +574,39 @@ def indexer_forward(
     """
     query, _ = indexer.wq_b(q_lora)
     query = query.view(-1, indexer.n_heads, indexer.head_dim)
+
+    # Fused key prologue (SGLANG_TPU_DSA_FUSED_KEY_PROLOGUE): extend batches
+    # compute and store the index keys inside the op. Decode and verify keep
+    # the torch chain below.
+    params = (
+        fused_key_prologue_params(indexer, backend.index_page_size(layer_id))
+        if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        and not forward_batch.forward_mode.is_target_verify()
+        else None
+    )
+    if params is not None:
+        rope_dim = indexer.rope_head_dim
+        # Query rope only. rotary_emb also rotates a key; it gets query head 0
+        # ([T, rope_dim], the key's shape) and the result is dropped. The real
+        # key rope runs inside the op.
+        q_rope, _ = indexer.rotary_emb(
+            positions, query[..., :rope_dim], query[:, 0, :rope_dim]
+        )
+        query = torch.cat([q_rope.to(query.dtype), query[..., rope_dim:]], dim=-1)
+        rope_cos, rope_sin = fused_key_rope_tables(indexer, positions)
+        head_weights, weight_scale = _head_weights(indexer, x)
+        return backend.index_topk_fused_key(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            query=query,
+            hidden=x,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            head_weights=head_weights,
+            weight_scale=weight_scale,
+            params=params,
+        )
+
     key, _ = indexer.wk(x)
     key = indexer.k_norm(key)
 
@@ -354,12 +622,7 @@ def indexer_forward(
         query = torch.cat([q_rope.to(query.dtype), query[..., rope_dim:]], dim=-1)
         key = torch.cat([k_rope.to(key.dtype), key[..., rope_dim:]], dim=-1)
 
-    head_weights, _ = indexer.weights_proj(x)
-    weight_scale = indexer.softmax_scale * indexer.n_heads**-0.5
-    if indexer.bf16_head_gate:
-        # The gate is rounded to bf16 after the n_heads**-0.5 factor.
-        head_weights = (head_weights * indexer.n_heads**-0.5).to(torch.bfloat16)
-        weight_scale = indexer.softmax_scale
+    head_weights, weight_scale = _head_weights(indexer, x)
     return backend.index_topk(
         forward_batch=forward_batch,
         layer_id=layer_id,
@@ -369,6 +632,17 @@ def indexer_forward(
         weight_scale=weight_scale,
         key_store=_key_store_mode(indexer, x.shape[0]),
     )
+
+
+def _head_weights(indexer: "Indexer", x: torch.Tensor):
+    """The indexer's head weights and the constant factor applied to them."""
+    head_weights, _ = indexer.weights_proj(x)
+    weight_scale = indexer.softmax_scale * indexer.n_heads**-0.5
+    if indexer.bf16_head_gate:
+        # The gate is rounded to bf16 after the n_heads**-0.5 factor.
+        head_weights = (head_weights * indexer.n_heads**-0.5).to(torch.bfloat16)
+        weight_scale = indexer.softmax_scale
+    return head_weights, weight_scale
 
 
 # Batches up to this many tokens store their index keys with the Pallas

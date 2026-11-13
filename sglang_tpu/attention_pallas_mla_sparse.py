@@ -473,6 +473,78 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             key_store,
         )
 
+    @property
+    def _index_topk_fused_key_op(self):
+        """The fused-key indexer op, registered on first use (switch on only)."""
+        from sglang_tpu.dsa_indexer_tpu import build_dsa_index_topk_fused_key_op
+
+        return build_dsa_index_topk_fused_key_op()
+
+    def index_page_size(self, layer_id: int) -> int:
+        """Tokens per page of the index-key cache (``[P, page // 4, 4, record]``)."""
+        cache = self.token_to_kv_pool.get_index_key_cache(layer_id)
+        return cache.shape[1] * cache.shape[2]
+
+    def index_topk_fused_key(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        query: torch.Tensor,  # [num_tokens, index_n_heads, index_head_dim]
+        hidden: torch.Tensor,  # [num_tokens, hidden]; the indexer's input
+        rope_cos: torch.Tensor,  # bf16[num_tokens, rope_dim // 2]
+        rope_sin: torch.Tensor,  # bf16[num_tokens, rope_dim // 2]
+        head_weights: torch.Tensor,  # [num_tokens, index_n_heads]
+        weight_scale: float,
+        params: dict,  # from fused_key_prologue_params
+    ) -> torch.Tensor:
+        """``index_topk`` with the index keys computed inside the op.
+
+        Same rows as ``index_topk`` (and the same token split); the op runs
+        ``wk``, ``k_norm`` and the key rope itself (dsa_indexer_step_fused_key).
+        """
+        from sglang.srt.layers.dp_attention import _rank_tensor
+
+        metadata = self.forward_metadata
+        num_tokens = query.shape[0]
+        split_rows = self._indexer_split_rows(forward_batch, num_tokens)
+        if split_rows:
+            rank = _rank_tensor("attn_tp", query.device)
+            row_start = (rank * split_rows).to(torch.int32).reshape(1)
+        else:
+            row_start = torch.zeros(1, dtype=torch.int32, device=query.device)
+        rows = self._index_topk_fused_key_op(
+            query.contiguous(),
+            hidden.contiguous(),
+            params["wk"],
+            params["wk_scale"],
+            params["norm_weight"],
+            params["norm_bias"],
+            rope_cos,
+            rope_sin,
+            head_weights.contiguous(),
+            self.token_to_kv_pool.get_index_key_cache(layer_id),
+            self._kv_lens(forward_batch),
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            row_start,
+            params["eps"],
+            weight_scale,
+            self._topk,
+            metadata.decode_query_size,
+            metadata.segments,
+            split_rows,
+        )
+        if not split_rows:
+            return rows
+        rows = _assemble_split_rows(
+            rows, rank, self._idx_split_size, self._idx_split_group.all_reduce
+        )
+        if rows.shape[0] != num_tokens:
+            rows = rows[:num_tokens].contiguous()
+        return rows
+
     def _index_topk_token_split(
         self,
         *,

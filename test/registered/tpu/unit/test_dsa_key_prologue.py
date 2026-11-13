@@ -303,6 +303,55 @@ class TestDsaKeyPrologue(CustomTestCase):
                 stats["kernel"][stat], stats["target"][stat], f"{stat}: {stats}"
             )
 
+    def test_unaligned_batch_falls_back_to_the_xla_chain(self):
+        """store_keys_fused on a batch the kernel cannot take whole pages of.
+
+        The XLA fallback must store each token in the slot its position names,
+        leave every other slot alone, and select no worse than the target.
+        Request 0: 200 new tokens -> page 5 slots 0..127, page 2 slots 0..71.
+        Request 1: 128-token prefix, 256 new tokens -> pages 3 and 8.
+        """
+        from sglang_tpu.attention.pallas.dsa_index_topk import store_keys_fused
+
+        rng = np.random.default_rng(2)
+        b = _Batch()
+        b.kv_lens = np.array([200, 384, 0], np.int32)
+        b.cu_q_lens = np.array([0, 200, 456, 456], np.int32)
+        _, aligned = _targets(b)
+        self.assertFalse(bool(aligned))
+        x, wk, wk_scale, nw, nb, cos, sin = _inputs(rng, b.num_tokens)
+        before = rng.integers(0, 256, (b.num_pages, _PAGE // 4, 4, 256), dtype=np.uint8)
+
+        after = np.asarray(
+            store_keys_fused(
+                jnp.asarray(before), jnp.asarray(x), jnp.asarray(wk),
+                jnp.asarray(wk_scale), jnp.asarray(nw), jnp.asarray(nb),
+                jnp.asarray(cos), jnp.asarray(sin), jnp.asarray(b.kv_lens),
+                jnp.asarray(b.page_indices), jnp.asarray(b.cu_q_lens),
+                jnp.asarray(b.distribution), eps=_EPS, interpret=_INTERPRET,
+            )
+        )
+        rows = lambda c, p: c[p].reshape(_PAGE, 256)
+        # (page, first slot, token range) of every stored run.
+        runs = [(5, 0, range(0, 128)), (2, 0, range(128, 200)),
+                (3, 0, range(200, 328)), (8, 0, range(328, 456))]
+        written = {p for p, _, _ in runs}
+        untouched = [p for p in range(b.num_pages) if p not in written]
+        np.testing.assert_array_equal(after[untouched], before[untouched])
+        # Page 2 past request 0's last token.
+        np.testing.assert_array_equal(rows(after, 2)[72:], rows(before, 2)[72:])
+
+        got = np.concatenate([rows(after, p)[s : s + len(t)] for p, s, t in runs])
+        tokens = np.concatenate([np.asarray(t) for _, _, t in runs])
+        np.testing.assert_array_equal(got[:, _D + 1 :], 0)
+        ref_rec, _ = _reference_records(_reference_keys(x, wk, wk_scale, nw, nb, cos, sin))
+        target_rec, _ = _reference_records(_target_keys(x, wk, wk_scale, nw, nb, cos, sin))
+        self._assert_selection_no_worse_than_target(
+            got_k=_dequant(got),
+            target_k=_dequant(target_rec[tokens]),
+            exact_k=_dequant(ref_rec[tokens]),
+        )
+
     def test_unaligned_batches_are_reported(self):
         cases = {
             "prefix not on a page boundary": dict(kv_lens=[256, 320, 0], cu_q_lens=[0, 256, 512, 512]),

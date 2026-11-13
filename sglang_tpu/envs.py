@@ -298,6 +298,12 @@ class TpuEnvs:
     # one Pallas kernel (attention/pallas/dsa_key_store.py, same bytes as the
     # XLA path); False keeps the XLA whole-row scatter for every batch.
     SGLANG_TPU_DSA_PALLAS_KEY_STORE = EnvBool(True)
+    # DSA indexer, extend batches: compute the index keys inside the indexer op
+    # (wk FP8 linear, k_norm, rope, quantize, store) instead of in torch; page-
+    # aligned batches use one fused Pallas kernel (attention/pallas/
+    # dsa_key_prologue.py), others the same chain in XLA. Not bit-exact with the
+    # torch chain (FP8 dot rounding); see test_dsa_key_prologue.py.
+    SGLANG_TPU_DSA_FUSED_KEY_PROLOGUE = EnvBool(False)
     # SparseCore top-k (dsv4/sparsecore_topk.py): when every row's valid prefix fits
     # one slice, run a single pass over the narrowest 4096-wide bucket instead of the
     # partitioned top-k; long-context pools pad rows to the max context. Selects the
