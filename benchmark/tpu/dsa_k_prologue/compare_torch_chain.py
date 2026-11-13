@@ -208,6 +208,32 @@ def _stage_diagnostic(inp, tr, cos, sin):
     out["norm_after_host_proj"] = _compare(n, tr["eager_k_norm"])
     out["norm_fused_from_x"] = _compare(np.asarray(jax.jit(lambda a: norm(proj(a)))(x)), tr["eager_k_norm"])
     out["rope_variants"] = _rope_variants(tr["eager_k_norm"], np.asarray(cos), np.asarray(sin), tr["eager_k"])
+
+    # Which boundary loses rounding once rope joins the jit.
+    out["norm_rope_fused_from_torch_proj"] = _compare(
+        np.asarray(jax.jit(lambda a: rope(norm(a)))(t_proj)), tr["eager_k"]
+    )
+    n_host = np.asarray(jax.jit(lambda a: norm(proj(a)))(x))
+    out["chain_host_between_norm_rope"] = _compare(
+        np.asarray(jax.jit(rope)(jnp.asarray(n_host))), tr["eager_k"]
+    )
+    # reduce-precision ops XLA keeps in the optimized chained program.
+    chained = jax.jit(lambda a: rope(norm(proj(a)))).lower(x).compile().as_text()
+    out["chained_hlo_reduce_precision_ops"] = chained.count("reduce-precision(")
+    out["chained_hlo_convert_bf16_ops"] = chained.count("bf16[")
+
+    # The kernel's own per-stage values, compiled by Mosaic.
+    from sglang_tpu.attention.pallas.dsa_key_prologue import key_stages_pallas
+
+    ks = key_stages_pallas(
+        x, jnp.asarray(inp["wk"]), jnp.asarray(inp["wk_scale"]),
+        jnp.asarray(inp["nw"]), jnp.asarray(inp["nb"]), cos, sin, eps=EPS,
+    )
+    xs_k, p_k, n_k, r_k = (np.asarray(a) for a in ks)
+    out["kernel_x_scale_eq_torch"] = bool(np.array_equal(xs_k[:, :1], tr["eager_x_scale"]))
+    out["kernel_proj"] = _compare(p_k, tr["eager_k_proj"])
+    out["kernel_norm"] = _compare(n_k, tr["eager_k_norm"])
+    out["kernel_rope"] = _compare(r_k, tr["eager_k"])
     return out
 
 

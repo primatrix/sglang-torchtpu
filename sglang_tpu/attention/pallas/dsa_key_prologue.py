@@ -86,6 +86,73 @@ def key_prologue_targets(
     return targets, aligned
 
 
+def _key_stages(x, w, ws, nw, nb, cos, sin, *, eps):
+    """One token page's (x_scale, projected, normed, roped) keys, in f32 holding bf16 values.
+
+    Traced inside the kernel; also used by the stage diagnostic kernel.
+    """
+    x = x.astype(jnp.float32)
+    x_scale = jnp.maximum(jnp.max(jnp.abs(x), axis=1, keepdims=True) / _FP8_MAX, 1e-12)
+    x_q = (x / x_scale).astype(jnp.float8_e4m3fn)
+    acc = lax.dot_general(x_q, w, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
+    k_proj = _bf16(acc * x_scale * ws)
+
+    mean = jnp.mean(k_proj, axis=1, keepdims=True)
+    var = jnp.mean(jnp.square(k_proj - mean), axis=1, keepdims=True)
+    k_norm = _bf16((k_proj - mean) * lax.rsqrt(var + eps) * nw + nb)
+
+    # GPT-J rope: lane 2j pairs with 2j + 1. roll(k, s)[l] == k[l - s].
+    lane = lax.broadcasted_iota(jnp.int32, k_norm.shape, 1)
+    partner = jnp.where(
+        lane % 2 == 0, -pltpu.roll(k_norm, _HEAD_DIM - 1, 1), pltpu.roll(k_norm, 1, 1)
+    )
+    # Round after each op as the eager bf16 rope does (rotary_embedding/utils.py).
+    cos = cos.astype(jnp.float32)
+    sin = sin.astype(jnp.float32)
+    k_rope = _bf16(_bf16(k_norm * cos) + _bf16(partner * sin))
+    return x_scale, k_proj, k_norm, k_rope
+
+
+def key_stages_pallas(
+    hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin, *, eps, interpret=False
+):
+    """Diagnostic: the kernel's per-stage values, f32[T, 128] each (x_scale f32[T, 128], lane 0).
+
+    Same math as key_prologue_pallas, compiled by Mosaic; for comparing stages with torch.
+    """
+    num_tokens, hidden_dim = hidden.shape
+    page_size = 128
+    half = rope_cos.shape[1]
+    pad = ((0, 0), (0, _HEAD_DIM - 2 * half))
+    cos = jnp.pad(jnp.repeat(rope_cos.astype(jnp.bfloat16), 2, axis=1), pad, constant_values=1)
+    sin = jnp.pad(jnp.repeat(rope_sin.astype(jnp.bfloat16), 2, axis=1), pad)
+    row = lambda a: a.astype(jnp.float32).reshape(1, _HEAD_DIM)
+
+    def kernel(x_ref, w_ref, ws_ref, nw_ref, nb_ref, c_ref, s_ref, xs_o, p_o, n_o, r_o):
+        xs, p, n, r = _key_stages(
+            x_ref[...], w_ref[...], ws_ref[...], nw_ref[...], nb_ref[...],
+            c_ref[...], s_ref[...], eps=eps,
+        )
+        xs_o[...] = jnp.broadcast_to(xs, xs_o.shape)
+        p_o[...], n_o[...], r_o[...] = p, n, r
+
+    whole = lambda shape: pl.BlockSpec(shape, lambda i: (0, 0))
+    tokens = lambda width: pl.BlockSpec((page_size, width), lambda i: (i, 0))
+    out = jax.ShapeDtypeStruct((num_tokens, _HEAD_DIM), jnp.float32)
+    return pl.pallas_call(
+        kernel,
+        out_shape=(out, out, out, out),
+        grid=(num_tokens // page_size,),
+        in_specs=[
+            tokens(hidden_dim), whole((hidden_dim, _HEAD_DIM)), whole((1, _HEAD_DIM)),
+            whole((1, _HEAD_DIM)), whole((1, _HEAD_DIM)), tokens(_HEAD_DIM), tokens(_HEAD_DIM),
+        ],
+        out_specs=[tokens(_HEAD_DIM)] * 4,
+        interpret=interpret,
+        name="dsa_index_key_prologue_stages",
+    )(hidden, wk, row(wk_scale), row(norm_weight), row(norm_bias), cos, sin)
+
+
 def _kernel(
     targets_ref,  # SMEM i32[num_token_pages]
     x_ref,  # VMEM bf16[page_size, hidden]
@@ -128,30 +195,11 @@ def _kernel(
 
     @pl.when(page >= 0)
     def _():
-        x = x_ref[...].astype(jnp.float32)
-        x_scale = jnp.maximum(jnp.max(jnp.abs(x), axis=1, keepdims=True) / _FP8_MAX, 1e-12)
-        x_q = (x / x_scale).astype(jnp.float8_e4m3fn)
-        acc = lax.dot_general(
-            x_q, w_ref[...], (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        _, _, _, k = _key_stages(
+            x_ref[...], w_ref[...], ws_ref[...], nw_ref[...], nb_ref[...],
+            cos_ref[...], sin_ref[...], eps=eps,
         )
-        k = _bf16(acc * x_scale * ws_ref[...])
-
-        mean = jnp.mean(k, axis=1, keepdims=True)
-        var = jnp.mean(jnp.square(k - mean), axis=1, keepdims=True)
-        k = (k - mean) * lax.rsqrt(var + eps) * nw_ref[...] + nb_ref[...]
-        k = _bf16(k)
-
-        # GPT-J rope: lane 2j pairs with 2j + 1. roll(k, s)[l] == k[l - s].
         lane = lax.broadcasted_iota(jnp.int32, k.shape, 1)
-        partner = jnp.where(
-            lane % 2 == 0, -pltpu.roll(k, _HEAD_DIM - 1, 1), pltpu.roll(k, 1, 1)
-        )
-        # Round after each op as the eager bf16 rope does (rotary_embedding/utils.py).
-        bf16 = _bf16
-        cos = cos_ref[...].astype(jnp.float32)
-        sin = sin_ref[...].astype(jnp.float32)
-        k = bf16(bf16(k * cos) + bf16(partner * sin))
-
         values, exp = _ue8m0_quantize(k)
         # Record lanes [0, 128): key bytes; [128, 256): scale byte, then zeros.
         # Kept as two 128-lane halves: Mosaic strided loads need a 128-wide ref.
