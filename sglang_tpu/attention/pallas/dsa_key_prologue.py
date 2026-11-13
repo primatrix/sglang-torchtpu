@@ -205,44 +205,46 @@ def key_proj_probe_pallas(hidden, wk, inv_scale, xq_ext, *, interpret=False):
 _DOT_VARIANTS = ("default", "highest", "bf16_operands", "f32_operands", "k_chunked_512")
 
 
-def key_dot_variants_pallas(xq, wk, *, interpret=False):
-    """Diagnostic: the FP8 dot xq @ wk inside Mosaic, in several forms.
+def key_dot_variant_pallas(xq, wk, variant, *, interpret=False):
+    """Diagnostic: the FP8 dot xq @ wk inside Mosaic, in the form ``variant``.
 
-    Returns one f32[T, 128] accumulator per name in ``_DOT_VARIANTS``.
+    One kernel per variant, so a form Mosaic rejects does not hide the others.
+    Returns the f32[T, 128] accumulator.
     """
     num_tokens, hidden_dim = xq.shape
     page_size = 128
     dims = (((1,), (0,)), ((), ()))
     f32 = jnp.float32
 
-    def kernel(x_ref, w_ref, *outs):
+    def kernel(x_ref, w_ref, o_ref):
         x, w = x_ref[...], w_ref[...]
         dot = lambda a, b, **kw: lax.dot_general(a, b, dims, preferred_element_type=f32, **kw)
-        results = [
-            dot(x, w),
-            dot(x, w, precision=lax.Precision.HIGHEST),
-            dot(x.astype(jnp.bfloat16), w.astype(jnp.bfloat16)),
-            dot(x.astype(f32), w.astype(f32), precision=lax.Precision.HIGHEST),
-        ]
-        chunk = 512
-        acc = jnp.zeros((page_size, _HEAD_DIM), f32)
-        for k0 in range(0, hidden_dim, chunk):
-            acc = acc + dot(x[:, k0 : k0 + chunk], w[k0 : k0 + chunk, :])
-        results.append(acc)
-        for o, r in zip(outs, results):
-            o[...] = r
+        if variant == "default":
+            r = dot(x, w)
+        elif variant == "highest":
+            r = dot(x, w, precision=lax.Precision.HIGHEST)
+        elif variant == "bf16_operands":
+            r = dot(x.astype(jnp.bfloat16), w.astype(jnp.bfloat16))
+        elif variant == "f32_operands":
+            r = dot(x.astype(f32), w.astype(f32), precision=lax.Precision.HIGHEST)
+        elif variant == "k_chunked_512":
+            r = jnp.zeros((page_size, _HEAD_DIM), f32)
+            for k0 in range(0, hidden_dim, 512):
+                r = r + dot(x[:, k0 : k0 + 512], w[k0 : k0 + 512, :])
+        else:
+            raise ValueError(variant)
+        o_ref[...] = r
 
-    narrow = jax.ShapeDtypeStruct((num_tokens, _HEAD_DIM), f32)
     tokens = lambda width: pl.BlockSpec((page_size, width), lambda i: (i, 0))
     return pl.pallas_call(
         kernel,
-        out_shape=(narrow,) * len(_DOT_VARIANTS),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, _HEAD_DIM), f32),
         grid=(num_tokens // page_size,),
         in_specs=[tokens(hidden_dim), pl.BlockSpec((hidden_dim, _HEAD_DIM), lambda i: (0, 0))],
-        out_specs=[tokens(_HEAD_DIM)] * len(_DOT_VARIANTS),
+        out_specs=tokens(_HEAD_DIM),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 1024 * 1024),
         interpret=interpret,
-        name="dsa_index_key_dot_variants",
+        name=f"dsa_index_key_dot_{variant}",
     )(xq, wk)
 
 

@@ -275,7 +275,7 @@ def _proj_probe(inp, x):
         return {"exact_frac": float(np.mean(d == 0)), "max_abs": float(d.max()),
                 "max_rel": float((d / np.maximum(np.abs(acc_ref), 1e-30)).max())}
 
-    from sglang_tpu.attention.pallas.dsa_key_prologue import _DOT_VARIANTS, key_dot_variants_pallas
+    from sglang_tpu.attention.pallas.dsa_key_prologue import _DOT_VARIANTS, key_dot_variant_pallas
 
     # f64 reference of the same FP8 products: which side is closer to exact.
     exact = xq_ref.astype(np.float64) @ np.asarray(wk.astype(f32)).astype(np.float64)
@@ -285,8 +285,12 @@ def _proj_probe(inp, x):
         return {"max_abs": float(d.max()), "mean_abs": float(d.mean())}
 
     variants = {}
-    for name, a in zip(_DOT_VARIANTS, key_dot_variants_pallas(xq, wk)):
-        a = np.asarray(a)
+    for name in _DOT_VARIANTS:
+        try:
+            a = np.asarray(key_dot_variant_pallas(xq, wk, name))
+        except Exception as e:  # a form Mosaic rejects; record it, keep going
+            variants[name] = {"error": repr(e)[:300]}
+            continue
         variants[name] = {"vs_xla": acc_cmp(a), "vs_f64": err64(a)}
     return {
         "xq_div_vs_jax": q_cmp(xqd),
