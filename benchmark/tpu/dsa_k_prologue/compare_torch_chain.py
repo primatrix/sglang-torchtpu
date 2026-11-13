@@ -127,9 +127,81 @@ def stage_jax(torch_npz, out_json):
             "bad_rows_head": np.nonzero(~row_eq)[0][:20].tolist(),
         }
     report["eager_vs_compiled_k_equal"] = bool(np.array_equal(tr["eager_k"], tr["compiled_k"]))
+    report["stages"] = _stage_diagnostic(inp, tr, cos, sin)
     with open(out_json, "w") as f:
         json.dump(report, f, indent=1)
     print(json.dumps(report, indent=1))
+
+
+def _bf16_ulp(a, b):
+    """Distance in bf16 ULPs between two arrays already holding bf16 values."""
+    import ml_dtypes
+
+    def ordered(x):
+        i = np.asarray(x, np.float32).astype(ml_dtypes.bfloat16).view(np.int16).astype(np.int32)
+        return np.where(i < 0, -(i & 0x7FFF), i)
+
+    return np.abs(ordered(a) - ordered(b))
+
+
+def _compare(ours, theirs):
+    ulp = _bf16_ulp(ours, theirs)
+    return {
+        "exact_frac": float(np.mean(ulp == 0)),
+        "max_ulp": int(ulp.max()),
+        "frac_gt_1ulp": float(np.mean(ulp > 1)),
+        "max_abs": float(np.abs(np.asarray(ours, np.float32) - theirs).max()),
+    }
+
+
+def _stage_diagnostic(inp, tr, cos, sin):
+    """The kernel's math, one stage at a time in plain JAX, against torch.
+
+    Each stage is fed torch's output of the stage before it, so a mismatch is
+    attributed to one stage. ``chained`` runs the whole chain from x.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+
+    f32, bf = jnp.float32, jnp.bfloat16
+    rt = lambda a: a.astype(bf).astype(f32)
+
+    def proj(x):
+        x = x.astype(f32)
+        xs = jnp.maximum(jnp.max(jnp.abs(x), axis=1, keepdims=True) / 448.0, 1e-12)
+        xq = (x / xs).astype(jnp.float8_e4m3fn)
+        acc = lax.dot_general(
+            xq, jnp.asarray(inp["wk"]), (((1,), (0,)), ((), ())),
+            preferred_element_type=f32,
+        )
+        return rt(acc * xs * jnp.asarray(inp["wk_scale"])[None])
+
+    def norm(k):
+        k = k.astype(f32)
+        mean = jnp.mean(k, axis=1, keepdims=True)
+        var = jnp.mean(jnp.square(k - mean), axis=1, keepdims=True)
+        return rt((k - mean) * lax.rsqrt(var + EPS) * jnp.asarray(inp["nw"]) + jnp.asarray(inp["nb"]))
+
+    def rope(k):
+        k = k.astype(f32)
+        c, s = cos.astype(f32), sin.astype(f32)
+        x1, x2 = k[:, 0:ROPE:2], k[:, 1:ROPE:2]
+        o1 = rt(rt(x1 * c) - rt(x2 * s))
+        o2 = rt(rt(x2 * c) + rt(x1 * s))
+        rot = jnp.stack([o1, o2], axis=-1).reshape(k.shape[0], ROPE)
+        return jnp.concatenate([rot, k[:, ROPE:]], axis=1)
+
+    x = jnp.asarray(inp["x"])
+    t_proj, t_norm, t_k = (jnp.asarray(tr[f"eager_{n}"]) for n in ("k_proj", "k_norm", "k"))
+    out = {
+        "proj_from_x": _compare(np.asarray(jax.jit(proj)(x)), tr["eager_k_proj"]),
+        "norm_from_torch_proj": _compare(np.asarray(jax.jit(norm)(t_proj)), tr["eager_k_norm"]),
+        "rope_from_torch_norm": _compare(np.asarray(jax.jit(rope)(t_norm)), tr["eager_k"]),
+        "chained_from_x": _compare(np.asarray(jax.jit(lambda a: rope(norm(proj(a))))(x)), tr["eager_k"]),
+    }
+    del t_k
+    return out
 
 
 if __name__ == "__main__":
