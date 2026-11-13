@@ -165,7 +165,7 @@ def _stage_diagnostic(inp, tr, cos, sin):
     from jax import lax
 
     f32, bf = jnp.float32, jnp.bfloat16
-    rt = lambda a: a.astype(bf).astype(f32)
+    rt = lambda a: lax.reduce_precision(a.astype(f32), exponent_bits=8, mantissa_bits=7)
 
     def proj(x):
         x = x.astype(f32)

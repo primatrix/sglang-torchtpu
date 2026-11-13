@@ -41,6 +41,15 @@ _HEAD_DIM = 128
 _RECORD_BYTES = 256
 
 
+def _bf16(a):
+    """Round f32 to bf16 values, kept in f32.
+
+    torch_tpu holds real bf16 tensors between ops; XLA folds an
+    astype(bf16).astype(f32) pair away, so the rounding is explicit here.
+    """
+    return lax.reduce_precision(a, exponent_bits=8, mantissa_bits=7)
+
+
 def key_prologue_targets(
     num_tokens: int,
     kv_lens: jax.Array,  # i32[S]; already counts this step's tokens
@@ -125,12 +134,12 @@ def _kernel(
         acc = lax.dot_general(
             x_q, w_ref[...], (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
         )
-        k = (acc * x_scale * ws_ref[...]).astype(jnp.bfloat16).astype(jnp.float32)
+        k = _bf16(acc * x_scale * ws_ref[...])
 
         mean = jnp.mean(k, axis=1, keepdims=True)
         var = jnp.mean(jnp.square(k - mean), axis=1, keepdims=True)
         k = (k - mean) * lax.rsqrt(var + eps) * nw_ref[...] + nb_ref[...]
-        k = k.astype(jnp.bfloat16).astype(jnp.float32)
+        k = _bf16(k)
 
         # GPT-J rope: lane 2j pairs with 2j + 1. roll(k, s)[l] == k[l - s].
         lane = lax.broadcasted_iota(jnp.int32, k.shape, 1)
@@ -138,7 +147,7 @@ def _kernel(
             lane % 2 == 0, -pltpu.roll(k, _HEAD_DIM - 1, 1), pltpu.roll(k, 1, 1)
         )
         # Round after each op as the eager bf16 rope does (rotary_embedding/utils.py).
-        bf16 = lambda a: a.astype(jnp.bfloat16).astype(jnp.float32)
+        bf16 = _bf16
         cos = cos_ref[...].astype(jnp.float32)
         sin = sin_ref[...].astype(jnp.float32)
         k = bf16(bf16(k * cos) + bf16(partner * sin))

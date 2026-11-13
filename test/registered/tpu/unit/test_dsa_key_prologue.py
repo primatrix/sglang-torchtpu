@@ -64,8 +64,10 @@ def _bf16(a):
 def _reference_keys(x, wk, wk_scale, nw, nb, cos, sin):
     """f32 values of the bf16 key the target chain hands to quantize_fp8_ue8m0."""
     x = x.astype(np.float32)
-    # fp8_linear.apply_tpu_fp8_linear
-    x_scale = np.maximum(np.abs(x).max(1, keepdims=True) / 448.0, 1e-12).astype(np.float32)
+    # fp8_linear.apply_tpu_fp8_linear; torch_tpu computes amax / 448 as
+    # amax * (1 / 448) (measured on v7x), so the reference does too.
+    amax = np.abs(x).max(1, keepdims=True)
+    x_scale = np.maximum(amax * (np.float32(1) / np.float32(448.0)), np.float32(1e-12)).astype(np.float32)
     x_q = (x / x_scale).astype(_FP8).astype(np.float32)
     acc = (x_q.astype(np.float64) @ wk.astype(np.float32).astype(np.float64)).astype(np.float32)
     k = _bf16(acc * x_scale * wk_scale[None])
