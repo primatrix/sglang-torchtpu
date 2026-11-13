@@ -275,12 +275,27 @@ def _proj_probe(inp, x):
         return {"exact_frac": float(np.mean(d == 0)), "max_abs": float(d.max()),
                 "max_rel": float((d / np.maximum(np.abs(acc_ref), 1e-30)).max())}
 
+    from sglang_tpu.attention.pallas.dsa_key_prologue import _DOT_VARIANTS, key_dot_variants_pallas
+
+    # f64 reference of the same FP8 products: which side is closer to exact.
+    exact = xq_ref.astype(np.float64) @ np.asarray(wk.astype(f32)).astype(np.float64)
+
+    def err64(a):
+        d = np.abs(np.asarray(a, np.float64) - exact)
+        return {"max_abs": float(d.max()), "mean_abs": float(d.mean())}
+
+    variants = {}
+    for name, a in zip(_DOT_VARIANTS, key_dot_variants_pallas(xq, wk)):
+        a = np.asarray(a)
+        variants[name] = {"vs_xla": acc_cmp(a), "vs_f64": err64(a)}
     return {
         "xq_div_vs_jax": q_cmp(xqd),
         "xq_mul_vs_jax": q_cmp(xqm),
         "acc_div_vs_jax": acc_cmp(accd),
         "acc_mul_vs_jax": acc_cmp(accm),
         "acc_given_xq_vs_jax": acc_cmp(acce),
+        "xla_vs_f64": err64(acc_ref),
+        "dot_variants": variants,
     }
 
 

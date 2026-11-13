@@ -202,6 +202,50 @@ def key_proj_probe_pallas(hidden, wk, inv_scale, xq_ext, *, interpret=False):
     )(hidden, wk, inv_scale, xq_ext)
 
 
+_DOT_VARIANTS = ("default", "highest", "bf16_operands", "f32_operands", "k_chunked_512")
+
+
+def key_dot_variants_pallas(xq, wk, *, interpret=False):
+    """Diagnostic: the FP8 dot xq @ wk inside Mosaic, in several forms.
+
+    Returns one f32[T, 128] accumulator per name in ``_DOT_VARIANTS``.
+    """
+    num_tokens, hidden_dim = xq.shape
+    page_size = 128
+    dims = (((1,), (0,)), ((), ()))
+    f32 = jnp.float32
+
+    def kernel(x_ref, w_ref, *outs):
+        x, w = x_ref[...], w_ref[...]
+        dot = lambda a, b, **kw: lax.dot_general(a, b, dims, preferred_element_type=f32, **kw)
+        results = [
+            dot(x, w),
+            dot(x, w, precision=lax.Precision.HIGHEST),
+            dot(x.astype(jnp.bfloat16), w.astype(jnp.bfloat16)),
+            dot(x.astype(f32), w.astype(f32), precision=lax.Precision.HIGHEST),
+        ]
+        chunk = 512
+        acc = jnp.zeros((page_size, _HEAD_DIM), f32)
+        for k0 in range(0, hidden_dim, chunk):
+            acc = acc + dot(x[:, k0 : k0 + chunk], w[k0 : k0 + chunk, :])
+        results.append(acc)
+        for o, r in zip(outs, results):
+            o[...] = r
+
+    narrow = jax.ShapeDtypeStruct((num_tokens, _HEAD_DIM), f32)
+    tokens = lambda width: pl.BlockSpec((page_size, width), lambda i: (i, 0))
+    return pl.pallas_call(
+        kernel,
+        out_shape=(narrow,) * len(_DOT_VARIANTS),
+        grid=(num_tokens // page_size,),
+        in_specs=[tokens(hidden_dim), pl.BlockSpec((hidden_dim, _HEAD_DIM), lambda i: (0, 0))],
+        out_specs=[tokens(_HEAD_DIM)] * len(_DOT_VARIANTS),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 1024 * 1024),
+        interpret=interpret,
+        name="dsa_index_key_dot_variants",
+    )(xq, wk)
+
+
 def _kernel(
     targets_ref,  # SMEM i32[num_token_pages]
     x_ref,  # VMEM bf16[page_size, hidden]
