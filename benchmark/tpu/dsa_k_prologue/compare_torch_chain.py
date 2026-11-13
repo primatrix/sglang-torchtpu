@@ -201,6 +201,56 @@ def _stage_diagnostic(inp, tr, cos, sin):
         "chained_from_x": _compare(np.asarray(jax.jit(lambda a: rope(norm(proj(a))))(x)), tr["eager_k"]),
     }
     del t_k
+    # Same stages, but each stage's output is pulled to the host between stages,
+    # so XLA cannot fuse across a stage boundary and drop the bf16 round trip.
+    p = np.asarray(jax.jit(proj)(x))
+    n = np.asarray(jax.jit(norm)(jnp.asarray(p)))
+    out["norm_after_host_proj"] = _compare(n, tr["eager_k_norm"])
+    out["norm_fused_from_x"] = _compare(np.asarray(jax.jit(lambda a: norm(proj(a)))(x)), tr["eager_k_norm"])
+    out["rope_variants"] = _rope_variants(tr["eager_k_norm"], np.asarray(cos), np.asarray(sin), tr["eager_k"])
+    return out
+
+
+def _rope_variants(k_norm, cos, sin, torch_k):
+    """Interleaved rope on torch's LayerNorm output, in NumPy (no XLA rewrites),
+    under several rounding rules; each is compared with torch's rope output."""
+    import ml_dtypes
+
+    rt = lambda a: np.asarray(a, np.float32).astype(ml_dtypes.bfloat16).astype(np.float32)
+    k = np.asarray(k_norm, np.float32)
+    c, s = rt(np.asarray(cos, np.float32)), rt(np.asarray(sin, np.float32))
+    x1, x2 = k[:, 0:ROPE:2], k[:, 1:ROPE:2]
+    f64 = lambda a: a.astype(np.float64)
+    variants = {
+        # Kernel today: round after each multiply and after the add.
+        "round_each_op": (rt(rt(x1 * c) - rt(x2 * s)), rt(rt(x2 * c) + rt(x1 * s))),
+        # f32 arithmetic, one round at the end.
+        "f32_round_once": (rt(x1 * c - x2 * s), rt(x2 * c + x1 * s)),
+        # Exact products and sum (FMA-like), one round at the end.
+        "exact_round_once": (
+            rt((f64(x1) * f64(c) - f64(x2) * f64(s)).astype(np.float32)),
+            rt((f64(x2) * f64(c) + f64(x1) * f64(s)).astype(np.float32)),
+        ),
+        # One product rounded to f32, the other fused (a*b + c with one round).
+        "fma_first_product": (
+            rt((f64((x1 * c).astype(np.float32)) - f64(x2) * f64(s)).astype(np.float32)),
+            rt((f64((x2 * c).astype(np.float32)) + f64(x1) * f64(s)).astype(np.float32)),
+        ),
+    }
+    out = {}
+    for name, (o1, o2) in variants.items():
+        got = k.copy()
+        got[:, 0:ROPE:2], got[:, 1:ROPE:2] = o1, o2
+        res = _compare(got[:, :ROPE], torch_k[:, :ROPE])
+        bad = np.nonzero(_bf16_ulp(got[:, :ROPE], torch_k[:, :ROPE]) > 0)
+        res["mismatch_head"] = [
+            {"tok": int(t), "dim": int(d), "ours": float(got[t, d]), "torch": float(torch_k[t, d]),
+             "x1": float(k[t, d - d % 2]), "x2": float(k[t, d - d % 2 + 1]),
+             "cos": float(c[t, d // 2]), "sin": float(s[t, d // 2])}
+            for t, d in list(zip(*bad))[:5]
+        ]
+        out[name] = res
+    out["non_rope_dims_exact"] = bool(np.array_equal(rt(k[:, ROPE:]), torch_k[:, ROPE:]))
     return out
 
 
