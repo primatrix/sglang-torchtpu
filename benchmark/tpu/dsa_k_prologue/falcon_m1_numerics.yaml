@@ -1,0 +1,89 @@
+name: glm52-dsa-m1-k-prologue-numerics-47eacce-jaxai
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: gke-tpu-train-us-central1-1-prod
+priority: 0
+tags: [glm52, dsa, m1-k-prologue, numerics, v7x8]
+config: '{"module":"M1 K projection fusion","stage":"correctness+torch-contract","target_sha":"47eacce36f05fe6ca8783e0dcc34c62e6e83f987","image":"jax-ai-image + pinned pyproject_tpu stack"}'
+role_to_task_spec:
+  worker:
+    command: |
+      set -u
+      ulimit -c 0
+      OUT="${ARTIFACT_LOCAL_DIR:-/tmp/m1-out}"
+      mkdir -p "$OUT" /tmp/tpu_logs/tmp /tmp/tpu_logs/uv-cache /tmp/tpu_logs/pip-cache
+      export TMPDIR=/tmp/tpu_logs/tmp UV_CACHE_DIR=/tmp/tpu_logs/uv-cache PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache PYTHONUNBUFFERED=1
+      git clone --filter=blob:none https://github.com/primatrix/sglang-torchtpu.git /workspace/sglang-torchtpu
+      cd /workspace/sglang-torchtpu
+      git checkout --detach 47eacce36f05fe6ca8783e0dcc34c62e6e83f987
+      git rev-parse HEAD | tee "$OUT/source-revision.txt"
+      python3 -m pip install -q uv
+      LIBTPU_IDX=https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+      # Env A: JAX only, pinned as python/pyproject_tpu.toml (jax 0.11.2, libtpu 0.0.50).
+      uv venv --python 3.12 /tmp/venv-jax
+      VIRTUAL_ENV=/tmp/venv-jax uv pip install -q -f "$LIBTPU_IDX" \
+        jax==0.11.2 jaxlib==0.11.2 libtpu==0.0.50 numpy ml_dtypes msgspec
+      # The unit test imports sglang only for CI registration; importing sglang pulls torch.
+      # A two-symbol stub keeps env A JAX-only. sglang_tpu itself imports without torch.
+      S=/tmp/sglang-stub; mkdir -p $S/sglang/test/ci
+      : > $S/sglang/__init__.py; : > $S/sglang/test/__init__.py; : > $S/sglang/test/ci/__init__.py
+      echo 'def register_tpu_ci(**k): pass' > $S/sglang/test/ci/ci_register.py
+      printf 'import unittest\nclass CustomTestCase(unittest.TestCase):\n    pass\n' > $S/sglang/test/test_utils.py
+      JAXPY="/tmp/venv-jax/bin/python"
+      $JAXPY -c "import jax, libtpu; print('jax', jax.__version__, 'libtpu', libtpu.__version__, jax.devices())" 2>&1 | tee "$OUT/versions_jax.txt"
+
+      rc=0
+      # 1. Kernel unit test on real TPU (Mosaic compile + numerics vs NumPy reference).
+      JAX_PLATFORMS=tpu PYTHONPATH="$S:/workspace/sglang-torchtpu" $JAXPY \
+        test/registered/tpu/unit/test_dsa_key_prologue.py -v > "$OUT/unit_test.log" 2>&1 || rc=1
+      # 1b. Mosaic FP8 dot variants vs XLA; JAX only, independent of the torch_tpu wheel.
+      JAX_PLATFORMS=tpu PYTHONPATH="$S:/workspace/sglang-torchtpu" $JAXPY \
+        benchmark/tpu/dsa_k_prologue/compare_torch_chain.py --stage dots \
+        --out "$OUT/dots.json" > "$OUT/stage_dots.log" 2>&1 || rc=1
+      cat "$OUT/dots.json" 2>/dev/null || tail -n 30 "$OUT/stage_dots.log"
+
+      # Env B: the pinned TPU stack. The pod cannot read the torch_tpu registry (403),
+      # so the verified wheel is copied in with `falcon exp cp` once the pod runs.
+      WHL=/tmp/wheels/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl
+      SHA=47eacce36f05fe6ca8783e0dcc34c62e6e83f987e5b6a74434dbf2141757fd82
+      i=0
+      while [ ! -f /tmp/wheels/READY ] && [ $i -lt 360 ]; do sleep 5; i=$((i + 1)); done
+      TORCH_OK=1
+      if [ ! -f /tmp/wheels/READY ] || [ "$(sha256sum "$WHL" | cut -d' ' -f1)" != "$SHA" ]; then
+        echo "torch_tpu wheel missing or SHA256 mismatch" > "$OUT/torch_install.log"; TORCH_OK=0
+      fi
+      if [ "$TORCH_OK" = 1 ]; then
+        # As docker/tpu.Dockerfile: the TPU manifest replaces python/pyproject.toml.
+        cp python/pyproject_tpu.toml python/pyproject.toml
+        uv venv --python 3.12 /tmp/venv-torch > "$OUT/torch_install.log" 2>&1
+        VIRTUAL_ENV=/tmp/venv-torch SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0.dev0 uv pip install \
+          --index-strategy unsafe-best-match -f "$LIBTPU_IDX" \
+          --extra-index-url https://download.pytorch.org/whl/cpu \
+          "$WHL" -e ./python -e . >> "$OUT/torch_install.log" 2>&1 || TORCH_OK=0
+        VIRTUAL_ENV=/tmp/venv-torch uv pip freeze > "$OUT/freeze_torch.txt" 2>&1
+        git checkout -- python/pyproject.toml 2>/dev/null || true
+      fi
+      echo "torch_tpu install ok=$TORCH_OK" | tee -a "$OUT/torch_install.log"
+
+      if [ "$TORCH_OK" = 1 ]; then
+        # 2. torch_tpu target chain, eager and compiled; saves intermediates.
+        PYTHONPATH="/workspace/sglang-torchtpu/python:/workspace/sglang-torchtpu" /tmp/venv-torch/bin/python \
+          benchmark/tpu/dsa_k_prologue/compare_torch_chain.py --stage torch \
+          --npz "$OUT/torch_chain.npz" > "$OUT/stage_torch.log" 2>&1 || rc=1
+        # 3. JAX side on the same inputs: kernel and quantize vs the torch chain.
+        JAX_PLATFORMS=tpu PYTHONPATH="$S:/workspace/sglang-torchtpu" $JAXPY \
+          benchmark/tpu/dsa_k_prologue/compare_torch_chain.py --stage jax \
+          --npz "$OUT/torch_chain.npz" --out "$OUT/compare.json" > "$OUT/stage_jax.log" 2>&1 || rc=1
+      else
+        echo "SKIPPED stages 2-3: torch_tpu could not be installed (see torch_install.log)" | tee "$OUT/stage_torch.log"
+        rc=1
+      fi
+      tail -n 40 "$OUT"/unit_test.log "$OUT"/torch_install.log "$OUT"/stage_torch.log "$OUT"/stage_jax.log 2>/dev/null
+      cat "$OUT/compare.json" 2>/dev/null || true
+      exit $rc
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1

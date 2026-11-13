@@ -348,8 +348,21 @@ def _rope_variants(k_norm, cos, sin, torch_k):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--stage", choices=("torch", "jax"), required=True)
+    p.add_argument("--stage", choices=("torch", "jax", "dots"), required=True)
     p.add_argument("--npz", default="/tmp/k_prologue_torch.npz")
     p.add_argument("--out", default="/tmp/k_prologue_compare.json")
     a = p.parse_args()
-    stage_torch(a.npz) if a.stage == "torch" else stage_jax(a.npz, a.out)
+    if a.stage == "torch":
+        stage_torch(a.npz)
+    elif a.stage == "jax":
+        stage_jax(a.npz, a.out)
+    else:
+        # Mosaic vs XLA projection probe; JAX only, no torch inputs needed.
+        os.environ.setdefault("JAX_PLATFORMS", "tpu")
+        import jax.numpy as jnp
+
+        inp = _inputs()
+        res = _proj_probe(inp, jnp.asarray(inp["x"]))
+        with open(a.out, "w") as f:
+            json.dump(res, f, indent=1)
+        print(json.dumps(res, indent=1))
