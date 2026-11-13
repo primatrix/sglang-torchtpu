@@ -153,6 +153,55 @@ def key_stages_pallas(
     )(hidden, wk, row(wk_scale), row(norm_weight), row(norm_bias), cos, sin)
 
 
+def key_proj_probe_pallas(hidden, wk, inv_scale, xq_ext, *, interpret=False):
+    """Diagnostic: the FP8 projection inside Mosaic, split to find where it differs.
+
+    ``inv_scale`` f32[T, 128] (1 / x_scale, broadcast) and ``xq_ext`` f8[T, hidden]
+    are computed outside the kernel. Returns f32 arrays:
+    (xq_div, acc_div, xq_mul, acc_mul, acc_ext): x_q by in-kernel division and its
+    accumulator; x_q by multiplying the given inverse scale and its accumulator;
+    the accumulator of the given x_q (tests the dot alone).
+    """
+    num_tokens, hidden_dim = hidden.shape
+    page_size = 128
+    dot = lambda q, w: lax.dot_general(
+        q, w, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
+
+    def kernel(x_ref, w_ref, inv_ref, xe_ref, xqd_o, accd_o, xqm_o, accm_o, acce_o):
+        x = x_ref[...].astype(jnp.float32)
+        w = w_ref[...]
+        xs = jnp.maximum(jnp.max(jnp.abs(x), axis=1, keepdims=True) / _FP8_MAX, 1e-12)
+        xq_div = (x / xs).astype(jnp.float8_e4m3fn)
+        xq_mul = (x * inv_ref[...][:, :1]).astype(jnp.float8_e4m3fn)
+        xqd_o[...] = xq_div.astype(jnp.float32)
+        accd_o[...] = dot(xq_div, w)
+        xqm_o[...] = xq_mul.astype(jnp.float32)
+        accm_o[...] = dot(xq_mul, w)
+        acce_o[...] = dot(xe_ref[...], w)
+
+    whole = lambda shape: pl.BlockSpec(shape, lambda i: (0, 0))
+    tokens = lambda width: pl.BlockSpec((page_size, width), lambda i: (i, 0))
+    wide = jax.ShapeDtypeStruct((num_tokens, hidden_dim), jnp.float32)
+    narrow = jax.ShapeDtypeStruct((num_tokens, _HEAD_DIM), jnp.float32)
+    return pl.pallas_call(
+        kernel,
+        out_shape=(wide, narrow, wide, narrow, narrow),
+        grid=(num_tokens // page_size,),
+        in_specs=[
+            tokens(hidden_dim), whole((hidden_dim, _HEAD_DIM)),
+            tokens(_HEAD_DIM), tokens(hidden_dim),
+        ],
+        out_specs=[
+            tokens(hidden_dim), tokens(_HEAD_DIM), tokens(hidden_dim),
+            tokens(_HEAD_DIM), tokens(_HEAD_DIM),
+        ],
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 1024 * 1024),
+        interpret=interpret,
+        name="dsa_index_key_proj_probe",
+    )(hidden, wk, inv_scale, xq_ext)
+
+
 def _kernel(
     targets_ref,  # SMEM i32[num_token_pages]
     x_ref,  # VMEM bf16[page_size, hidden]

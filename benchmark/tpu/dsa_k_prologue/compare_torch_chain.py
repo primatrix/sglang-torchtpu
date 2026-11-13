@@ -234,7 +234,54 @@ def _stage_diagnostic(inp, tr, cos, sin):
     out["kernel_proj"] = _compare(p_k, tr["eager_k_proj"])
     out["kernel_norm"] = _compare(n_k, tr["eager_k_norm"])
     out["kernel_rope"] = _compare(r_k, tr["eager_k"])
+    out["proj_probe"] = _proj_probe(inp, x)
     return out
+
+
+def _proj_probe(inp, x):
+    """Split the Mosaic projection: activation quantization vs the FP8 dot."""
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+
+    from sglang_tpu.attention.pallas.dsa_key_prologue import key_proj_probe_pallas
+
+    f32 = jnp.float32
+    wk = jnp.asarray(inp["wk"])
+
+    @jax.jit
+    def ref(x):
+        xf = x.astype(f32)
+        xs = jnp.maximum(jnp.max(jnp.abs(xf), axis=1, keepdims=True) / 448.0, 1e-12)
+        xq = (xf / xs).astype(jnp.float8_e4m3fn)
+        acc = lax.dot_general(xq, wk, (((1,), (0,)), ((), ())), preferred_element_type=f32)
+        return xs, xq, acc
+
+    xs, xq, acc = ref(x)
+    inv = jnp.broadcast_to(1.0 / xs, (x.shape[0], 128)).astype(f32)
+    xqd, accd, xqm, accm, acce = (
+        np.asarray(a) for a in key_proj_probe_pallas(x, wk, inv, xq)
+    )
+    xq_ref = np.asarray(xq.astype(f32))
+    acc_ref = np.asarray(acc)
+
+    def q_cmp(a):
+        diff = a != xq_ref
+        return {"exact_frac": float(1 - diff.mean()), "mismatch": int(diff.sum()),
+                "rows_with_mismatch": int(diff.any(1).sum())}
+
+    def acc_cmp(a):
+        d = np.abs(a - acc_ref)
+        return {"exact_frac": float(np.mean(d == 0)), "max_abs": float(d.max()),
+                "max_rel": float((d / np.maximum(np.abs(acc_ref), 1e-30)).max())}
+
+    return {
+        "xq_div_vs_jax": q_cmp(xqd),
+        "xq_mul_vs_jax": q_cmp(xqm),
+        "acc_div_vs_jax": acc_cmp(accd),
+        "acc_mul_vs_jax": acc_cmp(accm),
+        "acc_given_xq_vs_jax": acc_cmp(acce),
+    }
 
 
 def _rope_variants(k_norm, cos, sin, torch_k):
