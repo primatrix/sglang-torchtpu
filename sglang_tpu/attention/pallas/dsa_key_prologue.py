@@ -94,6 +94,8 @@ def _key_stages(x, w, ws, nw, nb, cos, sin, *, eps):
     x = x.astype(jnp.float32)
     x_scale = jnp.maximum(jnp.max(jnp.abs(x), axis=1, keepdims=True) / _FP8_MAX, 1e-12)
     x_q = (x / x_scale).astype(jnp.float8_e4m3fn)
+    # Not bit-exact with the target's XLA FP8 dot: on v7x both lose ~0.5 (mean)
+    # on |acc| ~ 800, in different elements. test_dsa_key_prologue.py bounds it.
     acc = lax.dot_general(x_q, w, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
     k_proj = _bf16(acc * x_scale * ws)
 

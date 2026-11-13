@@ -12,10 +12,11 @@ so it shares no code with the kernel. The tests guard what can go wrong silently
 * The record. 128 FP8 key bytes, a UE8M0 scale byte, zeros: the layout the
   top-k kernel and the K3 megakernel read.
 * The numbers. FP8 activation quantization, LayerNorm, interleaved rope and the
-  UE8M0 scale must be the target's. The kernel's matmul sums in another order,
-  so a key may land one bf16 step away and then round to the neighbouring FP8
-  value; records are compared within one FP8 step, and almost all must match
-  exactly.
+  UE8M0 scale must be the target's. The FP8 dot cannot be: on TPU both XLA's
+  (the target's) and Mosaic's lose precision, in different elements. Keys are
+  compared with an exact-dot reference within one FP8 step plus that dot error
+  carried through LayerNorm and rope, and top-k picks over the keys must pass
+  the selection rule of test_dsa_index_topk.py.
 * The alignment guard. Batches the kernel cannot write whole pages for must be
   reported as unaligned so the caller keeps the existing path.
 
@@ -55,6 +56,11 @@ _EPS = 1e-6  # LayerNorm default; GLM-5.2 sets no index_k_norm_eps.
 _BF16 = ml_dtypes.bfloat16
 _FP8 = ml_dtypes.float8_e4m3fn
 _INTERPRET = jax.default_backend() != "tpu"
+# Measured on v7x with these inputs: XLA's FP8 dot (the target) is up to 3.45
+# off the exact sum, Mosaic's up to 3.11. The margin to 4.0 is arbitrary.
+_DOT_ERR = 4.0
+# As in test_dsa_index_topk.py: a pick may score this far below the k-th best.
+_SCORE_SLACK = 0.02
 
 
 def _bf16(a):
@@ -83,6 +89,24 @@ def _reference_keys(x, wk, wk_scale, nw, nb, cos, sin):
     k = k.copy()
     k[:, 0:_ROPE:2], k[:, 1:_ROPE:2] = o1, o2
     return k
+
+
+def _dot_error_bound(x, wk, wk_scale, nw):
+    """Per-element bound on the key error a dot error of _DOT_ERR causes.
+
+    First order: LayerNorm divides the projection error by the row's std and
+    multiplies by the norm weight; rope adds the errors of a pair. Doubled
+    (arbitrary) for the mean/variance shift and bf16 rounding flips.
+    """
+    x = x.astype(np.float32)
+    x_scale = np.abs(x).max(1, keepdims=True) * (np.float32(1) / np.float32(448.0))
+    x_q = (x / x_scale).astype(_FP8).astype(np.float64)
+    k = (x_q @ wk.astype(np.float32).astype(np.float64)) * x_scale * wk_scale[None]
+    e = _DOT_ERR * x_scale * wk_scale[None] * np.abs(nw)[None] / np.sqrt(k.var(1, keepdims=True) + _EPS)
+    pair = e[:, 0:_ROPE:2] + e[:, 1:_ROPE:2]
+    e = e.copy()
+    e[:, 0:_ROPE:2], e[:, 1:_ROPE:2] = pair, pair
+    return 2 * e
 
 
 def _reference_records(k):
@@ -178,12 +202,33 @@ class TestDsaKeyPrologue(CustomTestCase):
         scale_diff = got[:, _D].astype(np.int32) - ref_rec[:, _D]
         self.assertLessEqual(int(np.abs(scale_diff).max()), 1)
         self.assertGreaterEqual(float(np.mean(scale_diff == 0)), 0.99)
-        # Within one FP8 step of the reference bf16 key (plus the subnormal floor).
-        err = np.abs(_dequant(got) - ref_k)
+        # One FP8 step of the reference key (plus the subnormal floor), plus the
+        # dot error carried to the key.
+        got_k = _dequant(got)
+        err = np.abs(got_k - ref_k)
         bound = 0.125 * np.abs(ref_k) + ref_scale[:, None] * 2.0**-8
+        bound = bound + _dot_error_bound(x, wk, wk_scale, nw)[: got.shape[0]]
         self.assertTrue(np.all(err <= bound), f"max excess {float((err - bound).max())}")
-        exact = np.mean(np.all(got == ref_rec, axis=1))
-        self.assertGreaterEqual(float(exact), 0.95, f"exact records {exact:.3f}")
+        self._assert_selection_holds(got_k, _dequant(ref_rec))
+
+    def _assert_selection_holds(self, got_k, ref_k, topk=128, heads=32, queries=16):
+        """Top-k over the kernel's keys picks keys the reference ranks near the top."""
+        rng = np.random.default_rng(1)
+        q = rng.normal(size=(queries, heads, _D)).astype(np.float32)
+        w = rng.uniform(0.1, 1.0, (queries, heads)).astype(np.float32)
+
+        def scores(k):
+            # The indexer score: sum over heads of relu(q . k) * head weight.
+            return np.einsum("qhk,qh->qk", np.maximum(np.einsum("qhd,kd->qhk", q, k), 0), w)
+
+        s_got, s_ref = scores(got_k), scores(ref_k)
+        for t in range(queries):
+            picks = np.argpartition(-s_got[t], topk)[:topk]
+            kth_best = np.sort(s_ref[t])[::-1][topk - 1]
+            self.assertGreaterEqual(
+                float(s_ref[t][picks].min()), float(kth_best) * (1 - _SCORE_SLACK),
+                f"query {t} picked a key below the top-k cut",
+            )
 
     def test_unaligned_batches_are_reported(self):
         cases = {
