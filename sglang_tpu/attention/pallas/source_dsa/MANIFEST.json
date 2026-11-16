@@ -52,6 +52,41 @@
   "kernels/radix_topk/v2/tuned_configs.py": {
    "sha256": "9097c3a53267f79e35664e6d63fb5a8630673ebb1e9710b2347e879f676dd347",
    "import_lines_rewritten": 0
+  },
+  "kernels/dsa/fp8_kv_cache.py": {
+   "sha256": "ac7fbe8db2600d06719351b394799a58603bad03637cbbbc1dec1eab209f500b",
+   "import_lines_rewritten": 0,
+   "module": "M4-S"
+  },
+  "kernels/dsa/exact_attention.py": {
+   "sha256": "529787819153297226285e94be01eb5051f1239bb935c7b5f29f7006c0d80330",
+   "import_lines_rewritten": 8,
+   "module": "M4-S"
+  },
+  "kernels/dsa/gather.py": {
+   "sha256": "65a0cc881ede67f0c2b61c699d70cefa107df7f6cb88d0f7bae9c7fcef50b25e",
+   "import_lines_rewritten": 1,
+   "module": "M4-S"
+  },
+  "kernels/dsa/fp8_attention.py": {
+   "sha256": "a416a22dda84c215cc09a7536a7decf0d3da976bedc40976c8df4f71f5ebda91",
+   "import_lines_rewritten": 2,
+   "module": "M4-S"
+  },
+  "kernels/dsa/attention_inputs.py": {
+   "sha256": "704ece9d8f555c39f8e6d8e190ed97131030278c3f625eee1e8fae5532d503e1",
+   "import_lines_rewritten": 1,
+   "module": "M4-S"
+  },
+  "kernels/dsa/partial_attention.py": {
+   "sha256": "44fe5807ebdaf30e8f315092b61d794756169834a40d45b7f1397ef212887069",
+   "import_lines_rewritten": 0,
+   "module": "M4-S"
+  },
+  "layers/attention/dsa_cache_ops.py": {
+   "sha256": "336440a24532ebe5e81d98a9478bc0452241b84cf088c898bd2434095b608ee8",
+   "import_lines_rewritten": 0,
+   "module": "M4-S"
   }
  },
  "patches": [
