@@ -160,12 +160,15 @@ def main():
         positions = positions.to(DEV)
         row = {"tokens": m, "requests": seqs}
         picks = {}
+        # Valid FP8 UE8M0 records in every slot (prefix_cache.py); random bytes
+        # held NaN key bytes and scales from 2^-127 to 2^128.
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from prefix_cache import valid_prefix_cache
+
+        prefix = torch.from_numpy(valid_prefix_cache(num_pages, seed=m))
         for name, fn in variants.items():
-            # Same random prefix keys for both, so they select over the same cache.
-            cache = torch.randint(
-                0, 256, (num_pages, PAGE // 4, 4, 256), generator=torch.Generator().manual_seed(m),
-                dtype=torch.uint8,
-            ).to(DEV)
+            # Same prefix records for both, so they select over the same cache.
+            cache = prefix.clone().to(DEV)
             args = (query, hidden, positions, head_weights, cache, *meta)
             picks[name] = fn(*args).cpu()
             row[f"{name}_us"], row[f"{name}_runs"] = _time(fn, args, a.iters, a.repeats)
