@@ -93,7 +93,10 @@ Ported-S 在 page 128 上用 2×64 页视图调用迁移的 Source 代码（`dsa
 | decode b64 | 2091 | 1365（含约 560 µs 两个 cache copy） | 732 | 777（同样含 copy） |
 
 - 修正后的结论：Source 部署路径比 Target 的 sparse MLA 慢约 2×（prefill 8682 对 4407 µs；decode 1365 对 777 µs，两边都含 cache copy），不是 8×。
-- 对迁移的影响：torch op `sglang_tpu_pallas::dsa_fp8_attention` 现在仍做逻辑映射（extend 2048 下 25.7 ms）。接入框架前要决定：让 bf16 indexer 像 Source 一样直接输出物理 slot，或者换一个更便宜的映射。未做。
+- 对迁移的影响：已按 Source 部署改（提交 dc0b007）。bf16 indexer op 加 `physical`（scorer `output_physical_slots=True`，framework slot p×128+o 与 Source page-64 slot 同值），FP8 attention op 加 `topk_is_physical`（只做 `PhysicalTopKValidation`）。两者默认关，尚未接入 attention backend。
+- 验证（exp-lt9gre9714，`check_physical_topk.py`）：
+  - indexer `physical=True` 的输出逐行等于 `physical=False` 输出按页表映射的结果，两种模式写出的 cache 逐字节相同（extend 2048、unaligned、decode b64；每行 2048 个有效 slot）。
+  - attention op `topk_is_physical=True` 的输出和 cache 与逻辑路径的 Ported-S JAX 逐字节一致。torch op module 时间：extend 2048 34502 → 8669 µs，unaligned 33900 → 8752 µs，decode b64 1519 → 791 µs（torch op 无 cache copy；Target decode 去掉 copy 约 240 µs，I）。
 - 单独跑映射比融在 attention 里还慢（44 ms 对 25.7 ms），原因未查；部署不走这一步，所以不再追。
 
 ## 多机模型端到端（推迟到整个 DSA 迁完并完成整体对比之后）
