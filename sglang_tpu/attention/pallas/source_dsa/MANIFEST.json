@@ -131,5 +131,34 @@
    "count": 1,
    "import_added": "from sglang_tpu.attention.pallas.source_dsa.target_device import target_device_kind"
   }
- ]
+ ],
+ "extracts": {
+  "layers/attention/dsa_sparse_backend.py": {
+   "module": "M4-S",
+   "target": "layers/attention/dsa_sparse_backend_helpers.py",
+   "functions": {
+    "_scatter_fused_kv_paged": {
+     "lines": [
+      352,
+      422
+     ],
+     "sha256": "4b89ceb3e31707ec9ed00513bee5d3b234316cfd770e341f9c30f8ff1735e86e"
+    },
+    "_logical_topk_to_physical_slots": {
+     "lines": [
+      425,
+      465
+     ],
+     "sha256": "bfbaebaa688810ff3f03f160244c8e2a286b952c9be4ed1ed370e990105ca41c"
+    },
+    "_pad_first_axis": {
+     "lines": [
+      468,
+      470
+     ],
+     "sha256": "a6b6fa0506b96f5b5cfa9547daa48681ef50e739653f91f81333784ccdf8fd96"
+    }
+   }
+  }
+ }
 }
