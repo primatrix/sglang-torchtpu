@@ -128,7 +128,9 @@ def store_index_keys_bf16(
     """
     if cache.ndim != 3 or cache.shape[1:] != (PAGE_SIZE, INDEX_DIM) or cache.dtype != jnp.bfloat16:
         raise ValueError(f"expected a bf16 [P, {PAGE_SIZE}, {INDEX_DIM}] cache, got {cache.shape} {cache.dtype}")
-    if one_token_per_seq and (interpret or jax.default_backend() == "tpu"):
+    # No backend check, unlike the source: the torch op exports on the CPU backend
+    # (JAX_PLATFORMS=cpu) for a TPU target, so default_backend() is not "tpu" there.
+    if one_token_per_seq:
         slots = decode_token_slots(hidden.shape[0], seq_lens, page_indices, cu_q_lens, cu_kv_lens)
         return fused_fp8_k_projection_scatter_pallas(
             hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin, hadamard,
