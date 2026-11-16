@@ -71,6 +71,49 @@ class TestBf16KeyStoreOp(unittest.TestCase):
                 self.assertFalse(torch.equal(cache[p], before[p]), f"page {p} not written")
         self.assertTrue(torch.equal(results[0], results[1]), "eager and compiled differ")
 
+    def test_decode_writes_only_each_requests_next_slot(self):
+        op = build_dsa_store_index_keys_bf16_op()
+        gen = torch.Generator().manual_seed(1)
+        # Three decode requests: kv_len 10, 70 and 64 -> slots (page 2, 9), (page 5, 5), (page 3, 63).
+        kv_lens = [10, 70, 64]
+        tables = [[2, 0], [1, 5], [3, 0]]
+        pages, tokens = 6, 3
+        before = torch.randn(pages, _PAGE, _D, generator=gen).to(torch.bfloat16)
+        angle = torch.rand(tokens, 32, generator=gen) * 6.28
+        dev = lambda t: t.to("tpu")
+        inputs = (
+            dev(torch.randn(tokens, _HIDDEN, generator=gen).to(torch.bfloat16)),
+            dev((torch.randn(_D, _HIDDEN, generator=gen) * 0.02).to(torch.float8_e4m3fn)),
+            dev(torch.rand(_D, generator=gen) + 0.5),
+            dev(torch.ones(_D, dtype=torch.bfloat16)),
+            dev(torch.zeros(_D, dtype=torch.bfloat16)),
+            dev(angle.cos().to(torch.bfloat16)),
+            dev(angle.sin().to(torch.bfloat16)),
+            dev(_hadamard()),
+            dev(torch.tensor(kv_lens, dtype=torch.int32)),
+            dev(torch.tensor(sum(tables, []), dtype=torch.int32)),
+            dev(torch.tensor([0, 1, 2, 3], dtype=torch.int32)),
+            dev(torch.tensor([0, 128, 256], dtype=torch.int32)),
+        )
+
+        def run(cache, *a):
+            op(cache, *a, True)
+
+        compiled = torch.compile(run, backend="tpu", fullgraph=True, dynamic=False)
+        results = []
+        for call in (run, compiled):
+            cache = before.clone().to("tpu")
+            call(cache, *inputs)
+            results.append(cache.cpu())
+
+        written = torch.zeros(pages, _PAGE, dtype=torch.bool)
+        for (p, o) in ((2, 9), (5, 5), (3, 63)):
+            written[p, o] = True
+        for cache in results:
+            self.assertTrue(torch.equal(cache[~written], before[~written]), "a slot outside the targets changed")
+            self.assertFalse(torch.equal(cache[written], before[written]), "target slots not written")
+        self.assertTrue(torch.equal(results[0], results[1]), "eager and compiled differ")
+
 
 if __name__ == "__main__":
     unittest.main()

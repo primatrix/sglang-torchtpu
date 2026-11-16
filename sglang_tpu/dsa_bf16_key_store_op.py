@@ -44,16 +44,19 @@ def build_dsa_store_index_keys_bf16_op():
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
         cu_kv_lens: jax.Array,
+        one_token_per_seq: bool,
     ) -> jax.Array:
         return store_index_keys_bf16(
             cache, hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin,
             hadamard, seq_lens, page_indices, cu_q_lens, cu_kv_lens,
+            one_token_per_seq=one_token_per_seq,
         )
 
     (cache_argnum,) = argnums(_wrapped, "cache")
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
+        static_argnums=argnums(_wrapped, "one_token_per_seq"),
         donate_argnums=(cache_argnum,),
         input_output_aliases={cache_argnum: 0},
         warn_deprecated=False,
@@ -74,12 +77,13 @@ def build_dsa_store_index_keys_bf16_op():
         page_indices: torch.Tensor,
         cu_q_lens: torch.Tensor,
         cu_kv_lens: torch.Tensor,
+        one_token_per_seq: bool = False,
     ) -> None:
         # JAX exports the custom call on the CPU and needs the TPU info to lower Mosaic.
         with tpu_info_for_cpu_export():
             jax_kernel(
                 cache, hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin,
-                hadamard, seq_lens, page_indices, cu_q_lens, cu_kv_lens,
+                hadamard, seq_lens, page_indices, cu_q_lens, cu_kv_lens, one_token_per_seq,
             )
 
     custom_op.register_fake(lambda *args: None)

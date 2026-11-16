@@ -11,7 +11,8 @@ output, LayerNorm eps 1e-5 with bf16 parameters, interleaved rope on dims
   other pages, and the slots before a request's first new token, are untouched.
 * Numbers: both paths within ``_REL_TOL`` of the f64 reference, and of each other.
 * Dispatch: unaligned batches and token counts that are not a multiple of 64
-  take the XLA chain instead of failing.
+  take the XLA chain instead of failing; decode (one token per request) takes
+  the source's per-token ``token_slots`` kernel, padding rows write nothing.
 
 Sizes are GLM-5.2's: hidden 6144, 128-wide keys, rope on 64 dims.
 On a host without a TPU the kernel runs in Pallas interpret mode.
@@ -118,15 +119,18 @@ def _prefix_cache(num_pages, seed=1):
 
 
 class TestBf16KeyStore(CustomTestCase):
-    def _check(self, prefixes, q_lens, pages_per_seq=8):
+    def _check(self, prefixes, q_lens, pages_per_seq=8, pad=0, decode=False):
         tokens = int(sum(q_lens))
-        i = _inputs(tokens)
+        i = _inputs(tokens + pad)  # ``pad`` batch-padding rows after the real tokens
         meta, slots = _batch(prefixes, q_lens, pages_per_seq)
         before = _prefix_cache(1 + len(prefixes) * pages_per_seq)
         after = np.asarray(
-            ks.store_index_keys_bf16(jnp.asarray(before), *_args(i), *meta, interpret=_INTERPRET)
+            ks.store_index_keys_bf16(
+                jnp.asarray(before), *_args(i), *meta,
+                one_token_per_seq=decode, interpret=_INTERPRET,
+            )
         ).astype(np.float32)
-        ref = _reference(i)
+        ref = _reference(i)[:tokens]
         got = after[slots[:, 0], slots[:, 1]].astype(np.float64)
         rel = np.abs(got - ref).max() / np.abs(ref).max()
         self.assertLess(rel, _REL_TOL)
@@ -145,6 +149,30 @@ class TestBf16KeyStore(CustomTestCase):
 
     def test_token_count_not_a_multiple_of_the_page(self):
         self._check(prefixes=[64, 0], q_lens=[37, 50])
+
+    def test_decode_writes_one_slot_per_request(self):
+        # token_slots kernel: a fresh request, the last slot of a page, the first
+        # slot of the next page, a mid-page slot; two padding rows write nothing.
+        self._check(prefixes=[0, 63, 64, 200], q_lens=[1, 1, 1, 1], pad=2, decode=True)
+
+    def test_decode_requests_sharing_a_page_keep_each_other(self):
+        # Both requests' tables name the same physical page: the per-token
+        # read-modify-write must keep the first token's slot when writing the second.
+        i = _inputs(2)
+        meta = (
+            jnp.asarray([11, 21], jnp.int32), jnp.asarray([3, 3], jnp.int32),
+            jnp.asarray([0, 1, 2], jnp.int32), jnp.asarray([0, 64], jnp.int32),
+        )
+        before = _prefix_cache(5)
+        after = np.asarray(ks.store_index_keys_bf16(
+            jnp.asarray(before), *_args(i), *meta, one_token_per_seq=True, interpret=_INTERPRET,
+        )).astype(np.float32)
+        ref = _reference(i)
+        got = after[3, [10, 20]].astype(np.float64)
+        self.assertLess(np.abs(got - ref).max() / np.abs(ref).max(), _REL_TOL)
+        keep = np.ones((5, _PAGE), bool)
+        keep[3, [10, 20]] = False
+        np.testing.assert_array_equal(after[keep], before.astype(np.float32)[keep])
 
     def test_kernel_and_xla_chain_agree(self):
         i = _inputs(256)

@@ -102,18 +102,38 @@ def aligned_target_pages(num_tokens, seq_lens, page_indices, cu_q_lens, cu_kv_le
     return target_pages, aligned
 
 
+def decode_token_slots(num_tokens, seq_lens, page_indices, cu_q_lens, cu_kv_lens):
+    """The source's per-token flat slot ``page * 64 + offset``; -1 for padding tokens."""
+    token_id = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_id = jnp.clip(jnp.searchsorted(cu_q_lens[1:], token_id, side="right"), 0, seq_lens.shape[0] - 1)
+    q_start, q_end = cu_q_lens[seq_id], cu_q_lens[seq_id + 1]
+    kv_len = seq_lens[seq_id]
+    position = jnp.maximum(kv_len - (q_end - q_start) + token_id - q_start, 0)
+    page = page_indices[cu_kv_lens[seq_id] // PAGE_SIZE + position // PAGE_SIZE]
+    valid = (token_id >= q_start) & (token_id < q_end) & (kv_len > 0)
+    return jnp.where(valid, page * PAGE_SIZE + position % PAGE_SIZE, -1).astype(jnp.int32)
+
+
 def store_index_keys_bf16(
     cache, hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin, hadamard,
-    seq_lens, page_indices, cu_q_lens, cu_kv_lens, *, interpret=False,
+    seq_lens, page_indices, cu_q_lens, cu_kv_lens, *, one_token_per_seq=False, interpret=False,
 ):
-    """Write this step's index keys into ``cache`` (bf16 [P, 64, 128]); extend batches.
+    """Write this step's index keys into ``cache`` (bf16 [P, 64, 128]).
 
     ``wk`` is f8e4m3fn [128, K] with an f32 [128] channel scale; ``rope_cos`` /
-    ``rope_sin`` are [T, 32] per token. Decode (the source's ``token_slots``
-    kernel) is not wired here yet.
+    ``rope_sin`` are [T, 32] per token. ``one_token_per_seq`` (decode) runs the
+    source kernel in ``token_slots`` mode, one read-modify-write per token, as
+    the source does for an FP8 ``wk`` on TPU; extend batches use the aligned
+    kernel or the XLA chain.
     """
     if cache.ndim != 3 or cache.shape[1:] != (PAGE_SIZE, INDEX_DIM) or cache.dtype != jnp.bfloat16:
         raise ValueError(f"expected a bf16 [P, {PAGE_SIZE}, {INDEX_DIM}] cache, got {cache.shape} {cache.dtype}")
+    if one_token_per_seq and (interpret or jax.default_backend() == "tpu"):
+        slots = decode_token_slots(hidden.shape[0], seq_lens, page_indices, cu_q_lens, cu_kv_lens)
+        return fused_fp8_k_projection_scatter_pallas(
+            hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin, hadamard,
+            cache, slots, page_size=PAGE_SIZE, interpret=interpret, token_slots=True,
+        )
 
     def xla(current):
         key = project_keys_xla(hidden, wk, wk_scale, norm_weight, norm_bias, rope_cos, rope_sin, hadamard)
