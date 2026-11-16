@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import statistics
+import sys
 import time
 
 # TorchTPU owns the device; JAX exports the custom call on the CPU.
@@ -65,6 +66,29 @@ def _time(fn, args, iters, repeats):
     return statistics.median(runs), runs
 
 
+def _profile(fn, args, iters, out_dir):
+    """Device time per op of ``iters`` warm calls (xplane_summary), or the error."""
+    from pathlib import Path
+
+    from sglang_tpu.profiler import start_tpu_profile, stop_tpu_profile
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from xplane_summary import summarize
+
+    torch.accelerator.synchronize()
+    trace = start_tpu_profile(output_dir=Path(out_dir), with_cpu=False)
+    try:
+        for _ in range(iters):
+            fn(*args)
+        torch.accelerator.synchronize()
+    finally:
+        stop_tpu_profile(trace)
+    try:
+        return summarize(out_dir, iters)
+    except Exception as e:  # report, do not hide
+        return {"error": repr(e)[:2000]}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--tokens", type=int, nargs="+", default=[2048, 8192, 32768])
@@ -75,6 +99,8 @@ def main():
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--out", default="/tmp/torch_ab.json")
+    # Also capture --iters warm calls per point with xprof and sum device time per op.
+    p.add_argument("--xprof-dir", default="")
     a = p.parse_args()
 
     gen = torch.Generator().manual_seed(0)
@@ -143,6 +169,8 @@ def main():
             args = (query, hidden, positions, head_weights, cache, *meta)
             picks[name] = fn(*args).cpu()
             row[f"{name}_us"], row[f"{name}_runs"] = _time(fn, args, a.iters, a.repeats)
+            if a.xprof_dir:
+                row[f"{name}_xprof"] = _profile(fn, args, a.iters, f"{a.xprof_dir}/{m}_{name}")
         row["speedup"] = row["target_us"] / row["ported_us"]
         # Sanity, not a criterion: share of each row's picks both sides agree on.
         t, q = picks["target"].sort(1).values, picks["ported"].sort(1).values
