@@ -76,10 +76,25 @@ Ported-S 在 page 128 上用 2×64 页视图调用迁移的 Source 代码（`dsa
 说明：
 - Target 是不同格式（FP8 E4M3 per-tensor，`k_scale=1`，TensorCore 布局），不做逐字节对比，只比耗时和对同一参考的误差。
 - Target extend 2048 的 q-block prefill kernel（`sparse_mla_prefill_qblock_tokens`）在 64 head 单芯片下 VMEM 不够（需要 93 MB，上限 64 MB），所以表中是它的 per-query kernel，工作量与其他几方相同。按每卡 4 个 head 跑 q-block 能编译，498 µs；每卡 4 head 是按 64 head / tp16 的假设（I），GLM-5.2 的实际 head 数在两边仓库里都没找到，且这个耗时只有 1/16 工作量，不能和 64 head 的行直接比。
-- Source 的 prefill 时间里约 25.7 ms 是一个 `gather_fusion`（`s32[4194304]`），decode 里同一个 op 约 718 µs；Source、Ported-S、torch op 三边一样，不是迁移引入的。根因未查。
+- Source 的 prefill 时间里约 25.7 ms 是一个 `gather_fusion`（`s32[4194304]` = T×K），decode 里同一个 op 约 718 µs；三边一样，不是迁移引入的。根因见下一节：它是逻辑 top-k 到物理 slot 的映射，Source 部署不走这一步。
 - JAX bench 里 decode 有两个整 cache 的 `copy`（约 540 µs），torch op 里 cache donate + alias 后就没有了；Target 的 decode 行也包含这两个 copy，去掉后约 240 µs（I）。
-- 结论：迁移的 Source attention 与 Source 完全一致；在这些形状上它比 Target 的 sparse MLA 慢约 8×（prefill）和约 2×（decode，按 1520 对 777 µs），精度相近、Target 略好。
+- 结论（已被下一节修正）：迁移的 Source attention 与 Source 完全一致。表中 Source 列包含部署不付的逻辑映射，不能代表 Source 部署的耗时。
 - 实验：exp-7kvikla8m9、exp-45eqx0fnzf、exp-rgqv6jaw33、exp-u4cubhb90c（提交 a7c795f）。
+
+### `gather_fusion` 的来源：逻辑 top-k 映射（Source 部署不走）
+
+- 代码（V）：bench 一直给 attention 喂序列内逻辑 top-k，backend 用 `_logical_topk_to_physical_slots` 映射成物理行，其中 `page_indices[safe_ptr]` 是 [T,K] 的 gather，形状与 `gather_fusion` 一致。Source 部署的 exact 模式里 `topk_indices_are_physical=True`（`model_runner.py:860`），indexer 直接输出物理 slot（`glm5_moe.py:683` `output_physical_slots=True`），backend 只做 `PhysicalTopKValidation`（比较 + `where`，无 gather）。
+- 实测（exp-97x4ruzrrh，提交 2e1c339）：按部署路径跑 Source（输入换成物理 slot），输出与原 Source 逐字节一致，`gather_fusion` 消失。
+
+| 用例 | Source（逻辑 top-k，上表） | Source 部署路径（物理 top-k） | 单独跑映射 | Target |
+|---|---|---|---|---|
+| extend 2048 | 34503 | 8682 | 44076 | per-query 4407 |
+| unaligned extend | 33919 | 8759 | 25235 | q-block 4286 |
+| decode b64 | 2091 | 1365（含约 560 µs 两个 cache copy） | 732 | 777（同样含 copy） |
+
+- 修正后的结论：Source 部署路径比 Target 的 sparse MLA 慢约 2×（prefill 8682 对 4407 µs；decode 1365 对 777 µs，两边都含 cache copy），不是 8×。
+- 对迁移的影响：torch op `sglang_tpu_pallas::dsa_fp8_attention` 现在仍做逻辑映射（extend 2048 下 25.7 ms）。接入框架前要决定：让 bf16 indexer 像 Source 一样直接输出物理 slot，或者换一个更便宜的映射。未做。
+- 单独跑映射比融在 attention 里还慢（44 ms 对 25.7 ms），原因未查；部署不走这一步，所以不再追。
 
 ## 多机模型端到端（推迟到整个 DSA 迁完并完成整体对比之后）
 
