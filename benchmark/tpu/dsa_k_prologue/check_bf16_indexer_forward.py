@@ -115,10 +115,17 @@ def stage(a):
 
         cf = cache_f.cpu().view(torch.int16).numpy()
         cd = cache_d.cpu().view(torch.int16).numpy()
+        # Unaligned batches store keys through the XLA fallback, whose bf16
+        # rounding moves with the fusion boundary (source_chain.md, known
+        # differences): hold them to 1 bf16 ulp. Aligned batches stay exact.
+        o = lambda x: np.where(x < 0, -(x.astype(np.int32) & 0x7FFF), x.astype(np.int32))
+        max_ulp = int(np.abs(o(cf) - o(cd)).max())
+        aligned = name != "extend_unaligned"
         row = {
             "case": name, "mode": mode_name, "mapped_prefill_decode": list(mapped),
             "mapping_ok": mapped == (pre, dec),
-            "forward_vs_op_cache": bool(np.array_equal(cf, cd)),
+            "cache_max_ulp": max_ulp,
+            "forward_vs_op_cache": max_ulp == 0 if aligned else max_ulp <= 1,
             "forward_vs_op_topk": bool(np.array_equal(np.sort(rows_f, 1), np.sort(rows_d, 1))),
             "cache_changed": not bool(np.array_equal(cf, c["cache"].view(np.int16))),
             "params_cached": params_once,
