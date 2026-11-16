@@ -134,21 +134,57 @@ def stage_jax(a):
         sk = dict(k=K, pages_per_seq=2 * c["ppr"], one_token_per_seq=dec, topk_impl="radix",
                   output_physical_slots=False)
         row = {"case": name}
-        for prec in ("default", "highest"):
-            with jax.default_matmul_precision(None if prec == "default" else "highest"):
-                st = jax.jit(lambda cc: store_index_keys_bf16(
-                    cc, j["hidden"], j["wk"], j["ws"], j["nw"], j["nb"], j["cos"], j["sin"], H,
-                    j["kv"], jnp.asarray(pi64), j["cu_q"], jnp.asarray(cukv),
-                    one_token_per_seq=dec))(jnp.asarray(cache64))
-                q = jax.jit(lambda: index_query_tail(j["query"], j["cos"], j["sin"], H,
-                                                     prefill=pre))()
-                rows = jax.jit(lambda qq, cc: score(qq, j["w"], cc, j["kv"], jnp.asarray(pi64),
-                                                    j["cu_q"], jnp.asarray(cukv), j["dist"], **sk))(q, st)
-            row[prec] = {
+        from sglang_tpu.attention.pallas import dsa_bf16_key_store as ks
+        from sglang_tpu.attention.pallas.dsa_bf16_query import query_tail_xla
+
+        def store_fn(cc):
+            return store_index_keys_bf16(
+                cc, j["hidden"], j["wk"], j["ws"], j["nw"], j["nb"], j["cos"], j["sin"], H,
+                j["kv"], jnp.asarray(pi64), j["cu_q"], jnp.asarray(cukv), one_token_per_seq=dec)
+
+        def q_fn():
+            return index_query_tail(j["query"], j["cos"], j["sin"], H, prefill=pre)
+
+        def score_fn(qq, cc):
+            return score(qq, j["w"], cc, j["kv"], jnp.asarray(pi64), j["cu_q"],
+                         jnp.asarray(cukv), j["dist"], **sk)
+
+        def record(st, q, rows):
+            return {
                 "store_cache_vs_torch": _bf16_cache_diff(np.asarray(st).view(np.int16), tor["cache"]),
                 "query_vs_torch": _diff(np.asarray(q), tor["q"]),
                 "rows_vs_torch": _rows_diff(np.asarray(rows), tor["rows"]),
             }
+
+        # 1. Plain jit on the TPU backend (the earlier "default" run).
+        st = jax.jit(store_fn)(jnp.asarray(cache64))
+        q = jax.jit(q_fn)()
+        row["default"] = record(st, q, jax.jit(score_fn)(q, st))
+
+        # 2. The torch op's path in this process: jax.export for "tpu", then call.
+        #    If this matches torch, the difference is export lowering vs direct jit.
+        def exported(f, *x):
+            return jax.export.export(jax.jit(f), platforms=["tpu"]).call(*x)
+
+        st_e = exported(store_fn, jnp.asarray(cache64))
+        q_e = exported(q_fn)
+        row["exported"] = record(st_e, q_e, exported(score_fn, q_e, st_e))
+        row["exported_vs_default"] = {
+            "cache": _bf16_cache_diff(np.asarray(st_e).view(np.int16), np.asarray(st).view(np.int16)),
+            "query": _diff(np.asarray(q_e), np.asarray(q))}
+
+        # 3. "highest" on the XLA chains only. The earlier run also wrapped the source
+        #    Pallas K kernel, where Mosaic rejected the changed FP8 dot ("Bad lhs type").
+        with jax.default_matmul_precision("highest"):
+            key_h = jax.jit(lambda: ks.project_keys_xla(
+                j["hidden"], j["wk"], j["ws"], j["nw"], j["nb"], j["cos"], j["sin"], H))()
+            q_h = jax.jit(lambda: query_tail_xla(j["query"], j["cos"], j["sin"], H))()
+        key_d = jax.jit(lambda: ks.project_keys_xla(
+            j["hidden"], j["wk"], j["ws"], j["nw"], j["nb"], j["cos"], j["sin"], H))()
+        row["highest_xla_only"] = {
+            "key_vs_default": _diff(np.asarray(key_h).astype(np.float32), np.asarray(key_d).astype(np.float32)),
+            "query_vs_torch": _diff(np.asarray(q_h), tor["q"]),
+        }
         # Scorer alone on the torch stage outputs.
         import ml_dtypes
 
