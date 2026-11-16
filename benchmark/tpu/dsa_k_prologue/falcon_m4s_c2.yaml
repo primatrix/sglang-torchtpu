@@ -37,6 +37,10 @@ role_to_task_spec:
         rm -f "$WHL.gcs"; echo "wheel source=falcon-exp-cp" >> "$OUT/torch_install.log"
         i=0
         while [ ! -f /tmp/wheels/READY ] && [ $i -lt 360 ]; do sleep 5; i=$((i + 1)); done
+        # Large `falcon exp cp` transfers drop; the wheel may arrive as part_* chunks.
+        if [ ! -f "$WHL" ] && ls /tmp/wheels/part_* >/dev/null 2>&1; then
+          cat /tmp/wheels/part_* > "$WHL"; echo "wheel joined from $(ls /tmp/wheels/part_* | wc -l) parts" >> "$OUT/torch_install.log"
+        fi
       fi
       GOT=$(sha256sum "$WHL" 2>/dev/null | cut -d' ' -f1)
       echo "wheel sha256=${GOT:-missing} expected=$SHA" | tee -a "$OUT/torch_install.log"
