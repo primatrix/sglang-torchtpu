@@ -108,7 +108,8 @@ def load_source_helpers(source_root):
     for name, info in ext.items():
         a, b = info["lines"]
         text = "".join(lines[a - 1:b])
-        got = hashlib.sha256(text.encode()).hexdigest()
+        # The manifest hashes the extract without its final newline.
+        got = hashlib.sha256(text.rstrip("\n").encode()).hexdigest()
         if got != info["sha256"]:
             raise SystemExit(f"source {name} sha256 {got} != manifest {info['sha256']}")
         exec(compile("from __future__ import annotations\n" + text, name, "exec"), ns)
