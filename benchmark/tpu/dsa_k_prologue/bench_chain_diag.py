@@ -164,7 +164,7 @@ def stage_jax(a):
         # 2. The torch op's path in this process: jax.export for "tpu", then call.
         #    If this matches torch, the difference is export lowering vs direct jit.
         def exported(f, *x):
-            return jax.export.export(jax.jit(f), platforms=["tpu"]).call(*x)
+            return jax.export.export(jax.jit(f), platforms=["tpu"])(*x).call(*x)
 
         st_e = exported(store_fn, jnp.asarray(cache64))
         q_e = exported(q_fn)
