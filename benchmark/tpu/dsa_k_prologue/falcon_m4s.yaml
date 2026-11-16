@@ -1,0 +1,112 @@
+name: glm52-dsa-m4s-PINSHA
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: gke-tpu-train-us-central1-1-prod
+priority: 0
+tags: [glm52, dsa, m1-k-prologue, prologue3, v7x8]
+config: '{"module":"M1 K projection fusion","stage":"standalone prologue source/target/ported","target_sha":"f0c35901eb77547f1d906f37c439fb70a87651c0"}'
+role_to_task_spec:
+  worker:
+    # Runs under /bin/sh (dash): no pipefail or other bash-only syntax.
+    command: |
+      set -u
+      ulimit -c 0
+      OUT="${ARTIFACT_LOCAL_DIR:-/tmp/m1-out}"
+      mkdir -p "$OUT" /tmp/tpu_logs/tmp /tmp/tpu_logs/uv-cache /tmp/wheels /tmp/source
+      export TMPDIR=/tmp/tpu_logs/tmp UV_CACHE_DIR=/tmp/tpu_logs/uv-cache PYTHONUNBUFFERED=1
+      git clone --filter=blob:none https://github.com/primatrix/sglang-torchtpu.git /workspace/sglang-torchtpu
+      cd /workspace/sglang-torchtpu
+      git checkout --detach 5e054a6cb8fbe28a683a523b523394799cc7ddaa
+      git rev-parse HEAD | tee "$OUT/source-revision.txt"
+      python3 -m pip install -q uv
+      LIBTPU_IDX=https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+      # torch_tpu wheel: GCS if the pod may read it, else `falcon exp cp` + READY.
+      WHL=/tmp/wheels/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl
+      # Literal SHA256 of the verified wheel; never rewrite with commit-pinning seds.
+      SHA=6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82
+      OBJ=dsa-migration%2Fwheels%2Ftorch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl
+      MD=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default
+      TOKEN=$(curl -s -H Metadata-Flavor:Google "$MD/token" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)
+      CODE=$(curl -s -H "Authorization: Bearer $TOKEN" -o "$WHL.gcs" -w '%{http_code}' \
+        "https://storage.googleapis.com/storage/v1/b/inference-model-storage-sgl/o/$OBJ?alt=media")
+      echo "gcs download http=$CODE" > "$OUT/torch_install.log"
+      if [ "$CODE" = 200 ]; then
+        mv "$WHL.gcs" "$WHL"; echo "wheel source=gcs" >> "$OUT/torch_install.log"
+      else
+        rm -f "$WHL.gcs"; echo "wheel source=falcon-exp-cp" >> "$OUT/torch_install.log"
+        i=0
+        while [ ! -f /tmp/wheels/READY ] && [ $i -lt 360 ]; do sleep 5; i=$((i + 1)); done
+      fi
+      GOT=$(sha256sum "$WHL" 2>/dev/null | cut -d' ' -f1)
+      echo "wheel sha256=${GOT:-missing} expected=$SHA" | tee -a "$OUT/torch_install.log"
+      if [ "$GOT" != "$SHA" ]; then
+        echo "torch_tpu wheel missing or SHA256 mismatch"; cat "$OUT/torch_install.log"; exit 2
+      fi
+
+      # As docker/tpu.Dockerfile: the TPU manifest replaces python/pyproject.toml.
+      cp python/pyproject_tpu.toml python/pyproject.toml
+      uv venv --python 3.12 /tmp/venv-torch >> "$OUT/torch_install.log" 2>&1
+      VIRTUAL_ENV=/tmp/venv-torch SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0.dev0 uv pip install \
+        --index-strategy unsafe-best-match -f "$LIBTPU_IDX" \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        "$WHL" -e ./python -e . msgspec >> "$OUT/torch_install.log" 2>&1
+      INSTALL_RC=$?
+      git checkout -- python/pyproject.toml 2>/dev/null || true
+      echo "torch_tpu install rc=$INSTALL_RC" | tee -a "$OUT/torch_install.log"
+      if [ "$INSTALL_RC" != 0 ]; then tail -n 30 "$OUT/torch_install.log"; exit 2; fi
+      PY=/tmp/venv-torch/bin/python
+      export PYTHONPATH="/workspace/sglang-torchtpu/python:/workspace/sglang-torchtpu"
+
+      # XPlane protobuf for the per-op device-time summary; best effort, the
+      # summary reports the import error if this fails.
+      # Source files from sglang-jax-private at c948bdda95208e68a474c8088937347d08fe8937,
+      # an uncompressed tar of the 12 M3-S files, copied in by `falcon exp cp`;
+      # never cloned or committed here. Literal SHA256; never rewrite with pinning seds.
+      VIRTUAL_ENV=/tmp/venv-torch uv pip install -q absl-py >> "$OUT/torch_install.log" 2>&1 || echo "absl-py install failed"
+      # Source files from sglang-jax-private at c948bdda95208e68a474c8088937347d08fe8937,
+      # copied in by `falcon exp cp`; never cloned or committed here.
+      # Literal SHA256s; never rewrite with pinning seds.
+      SRC_K=/tmp/source/fused_fp8_k_projection_scatter.py
+      SRC_K_SHA=f7a8cef892275daa98181a0cb10b62450a48d654b40d0cd4734f94ee8ad08879
+      SRC_Q=/tmp/source/fused_q_rope_hadamard.py
+      SRC_Q_SHA=d8d8dedb32e7d8f575d825df33c85209e98d71ae23321cd102cc668e994eb111
+      SRC_TAR=/tmp/source/m3s_source.tar
+      SRC_TAR_SHA=529cc06e61d37e7f5ee12ffa662b78b82980671b7757b1ca6691a72e8bc382dd
+      sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+      i=0
+      while { [ "$(sha $SRC_K)" != "$SRC_K_SHA" ] || [ "$(sha $SRC_Q)" != "$SRC_Q_SHA" ] || [ "$(sha $SRC_TAR)" != "$SRC_TAR_SHA" ]; } && [ $i -lt 360 ]; do sleep 5; i=$((i + 1)); done
+      echo "source K sha256=$(sha $SRC_K) expected=$SRC_K_SHA" | tee "$OUT/source_check.log"
+      echo "source Q sha256=$(sha $SRC_Q) expected=$SRC_Q_SHA" | tee -a "$OUT/source_check.log"
+      echo "source tar sha256=$(sha $SRC_TAR) expected=$SRC_TAR_SHA" | tee -a "$OUT/source_check.log"
+      if [ "$(sha $SRC_K)" != "$SRC_K_SHA" ] || [ "$(sha $SRC_Q)" != "$SRC_Q_SHA" ] || [ "$(sha $SRC_TAR)" != "$SRC_TAR_SHA" ]; then echo "Source file missing or SHA256 mismatch"; exit 2; fi
+      mkdir -p /tmp/source/m3s && tar -xf "$SRC_TAR" -C /tmp/source/m3s
+      # M4-S Source files (split FP8 KV write, fp8-qk-pv exact attention, backend
+      # glue), an uncompressed tar from c948bdd. Literal SHA256.
+      SRC_M4S=/tmp/source/m4s_source.tar
+      SRC_M4S_SHA=9cd482fc31a65e6a0298b0063f827f128ca11d4b80cc746e214b6dfb6b2d9c08
+      i=0
+      while [ "$(sha $SRC_M4S)" != "$SRC_M4S_SHA" ] && [ $i -lt 360 ]; do sleep 5; i=$((i + 1)); done
+      echo "source m4s tar sha256=$(sha $SRC_M4S) expected=$SRC_M4S_SHA" | tee -a "$OUT/source_check.log"
+      if [ "$(sha $SRC_M4S)" != "$SRC_M4S_SHA" ]; then echo "M4-S source tar missing or SHA256 mismatch"; exit 2; fi
+      mkdir -p /tmp/source/m4s && tar -xf "$SRC_M4S" -C /tmp/source/m4s
+      rc=0
+      # 1. indexer_forward rerun: unaligned extend cache within 1 bf16 ulp, top-k exact.
+      FW=benchmark/tpu/dsa_k_prologue/check_bf16_indexer_forward.py
+      frc=0
+      SGLANG_TPU_DSA_BF16_INDEXER=1 $PY $FW > "$OUT/fwd.log" 2>&1 || frc=1
+      echo "==== FWD (rc=$frc)"; grep -E '^(FWD|REJECT)' "$OUT/fwd.log" | cut -c1-1500
+      [ $frc = 0 ] || { tail -n 40 "$OUT/fwd.log"; rc=1; }
+      # 2. M4-S baseline: Source split-FP8 KV write + fp8-qk-pv attention at page 64
+      #    vs Ported-S at page 128, same inputs; cache bytes and output byte for byte.
+      A=benchmark/tpu/dsa_k_prologue/bench_fp8_attention_ab.py
+      arc=0
+      $PY $A --source-root /tmp/source/m4s --xprof-dir "$OUT/xprof" > "$OUT/att.log" 2>&1 || arc=1
+      echo "==== FP8ATT (rc=$arc)"; grep '^FP8ATT ' "$OUT/att.log" | cut -c1-3000
+      [ $arc = 0 ] || { tail -n 60 "$OUT/att.log"; rc=1; }
+      exit $rc
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
