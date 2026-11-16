@@ -120,16 +120,20 @@ def stage_torch(a):
     i0 = pc.inputs(a.tokens[0])
     wk = torch.from_numpy(i0["wk"].view(np.uint8)).view(torch.float8_e4m3fn).to(dev)
     ws, nw, nb = (torch.from_numpy(i0[k]).to(dev) for k in ("ws", "nw", "nb"))
-    table = bf(i0["table"])  # the rope's bf16 cos_sin_cache, [positions, 64]
-    cos, sin = table.chunk(2, -1)
-    tpu_table = torch.cat([cos.repeat_interleave(2, -1), sin.repeat_interleave(2, -1)], -1).to(dev)
     rot = torch.zeros(ROPE, ROPE, dtype=torch.bfloat16)
     idx = torch.arange(ROPE)
     rot[idx[1::2], idx[0::2]] = -1.0
     rot[idx[0::2], idx[1::2]] = 1.0
-    rot, table = rot.to(dev), table.to(dev)
+    rot = rot.to(dev)
 
-    def target(hidden, positions, cache, kv, pages, cu, dist):
+    def tables(i):
+        """The rope's bf16 cos_sin_cache and the TPU path's expanded table."""
+        table = bf(i["table"])
+        cos, sin = table.chunk(2, -1)
+        tpu = torch.cat([cos.repeat_interleave(2, -1), sin.repeat_interleave(2, -1)], -1)
+        return table.to(dev), tpu.to(dev)
+
+    def target(hidden, positions, table, tpu_table, cache, kv, pages, cu, dist):
         k = apply_tpu_fp8_linear(hidden, wk, ws)
         k = F.layer_norm(k.float(), (D,), nw, nb, pc.EPS_TARGET).to(torch.bfloat16)
         cs = tpu_table[positions]
@@ -138,7 +142,7 @@ def stage_torch(a):
         k = torch.cat([kr.to(k.dtype), k[:, ROPE:]], -1)
         store_op(k.contiguous(), cache, kv, pages, cu, dist)
 
-    def ported(hidden, positions, cache, kv, pages, cu, dist):
+    def ported(hidden, positions, table, tpu_table, cache, kv, pages, cu, dist):
         c, s = table.index_select(0, positions).chunk(2, -1)
         fused_op(cache, hidden, wk, ws, nw, nb, c.contiguous(), s.contiguous(),
                  kv, pages, cu, dist, pc.EPS_TARGET)
@@ -154,16 +158,18 @@ def stage_torch(a):
         prefix = torch.from_numpy(prefix_np)
         hidden = bf(i["x"]).to(dev)
         positions = torch.from_numpy(i["pos"].astype(np.int64)).to(dev)
+        # Rope angles are drawn per token count (prologue_common.inputs), like the references.
+        tabs = tables(i)
         meta = [torch.from_numpy(L[k]).to(dev) for k in ("kv_lens", "page_indices", "cu_q_lens", "distribution")]
         row, recs = {"tokens": m, "requests": L["seqs"]}, {}
         for name, fn in variants.items():
             cache = prefix.clone().to(dev)
-            fn(hidden, positions, cache, *meta)
+            fn(hidden, positions, *tabs, cache, *meta)
             sync()
             after = cache.cpu().numpy()
             recs[name] = _new_records(after, L["slots"])
             row[f"{name}_prefix_untouched"] = _untouched(after, prefix_np, L["slots"])
-            args = (hidden, positions, prefix.clone().to(dev), *meta)
+            args = (hidden, positions, *tabs, prefix.clone().to(dev), *meta)
             row[f"{name}_us"], row[f"{name}_runs"] = _median_time(
                 lambda: fn(*args), sync, a.iters, a.repeats)
             if a.xprof_dir:
@@ -295,6 +301,8 @@ def _summary(row):
         out[name] = {
             "wall_us": r.get("us"),
             "device_us": x.get("device_us", x.get("error", "")[:200] or None),
+            "top_ops": [(n[:60], round(u, 1)) for n, u in x.get("ops", [])[:6]],
+            "modules": [(n[:60], round(u, 1)) for n, u in x.get("modules", [])[:4]],
             "prefix_untouched": r.get("prefix_untouched"),
             "sel_max": r.get("selection_vs_own_ref", {}).get("max"),
             "sel_p99": r.get("selection_vs_own_ref", {}).get("p99"),
