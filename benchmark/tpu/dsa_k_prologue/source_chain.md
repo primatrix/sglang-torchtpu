@@ -30,3 +30,17 @@ S5 行格式绑定 expand/gather/attention；page 64 绑定 S1 fused kernel 与 
 | LN 参数 | bf16 | f32 | 改变源方案（小） |
 | page size | 64 | 128 | 待定：框架适配还是改变方案 |
 | 框架 | JAX jit | torch_tpu custom op + lax.cond 回退 | 框架适配 |
+
+## 已知差异（记录，不处理）
+
+### S1–S4 串联：非对齐 extend 下 torch op 与 JAX 调用差约 1 个 bf16 ulp
+
+- 现象：unaligned extend（T=2000）时，key store 和 query tail 的 XLA 回退路径（`project_keys_xla`、`query_tail_xla`），torch op 与 JAX 直接调用的输出差约 1 个 bf16 ulp，top-k 有少量行不同。对齐 extend 和 decode 走 Pallas kernel，逐字节一致。
+- 已排除：scorer（用 torch 侧的 cache 和 q 跑 JAX scorer，top-k 完全一致）；matmul 默认精度（`"highest"` 不消除差异）；`jax.export` 降级（导出再调用与直接 jit 逐字节一致）；excess precision（两边 HLO 中 fusion 内运算 dtype 相同）。
+- 推测原因（未最终确认）：torch_tpu 编译时 bf16 elementwise 的融合边界不同，fusion 内中间值不舍入。完整 torch op 与逐阶段 torch op 之间也差 42 个元素。
+- 影响：两边对 f64 精确分的选择偏差都约 0.0017，超过 2% 的比例为 0，选择质量不受影响。
+- 实验：exp-3r882ygc3n、exp-b43xl43c7b、exp-fuhu2bl2uo。
+
+### S1–S4 串联：extend 2048 下 torch op 多约 634 µs `radix_topk_v2` 等待
+
+- torch op 的 profile 多一个 `radix_topk_v2.call-done.2`（约 634 µs），JAX 侧没有这段等待。推测是异步 SparseCore 调用和下一块打分的重叠在 torch op 里丢了。留到性能优化阶段处理。
