@@ -1,0 +1,100 @@
+{
+ "commit": "c948bdda95208e68a474c8088937347d08fe8937",
+ "import_prefix": [
+  "sgl_jax.srt.",
+  "sglang_tpu.attention.pallas.source_dsa."
+ ],
+ "files": {
+  "configs/dsa_config.py": {
+   "sha256": "d3b7ddcd98551ea2c7369b68b9efa3c696b05d35eebbd54f3f6b6d477bfd70a3",
+   "import_lines_rewritten": 0
+  },
+  "kernels/dsa/indexer.py": {
+   "sha256": "baffc5db7ec484d6fd3ec65c090fa3355e074d21b8be4b68c6b1e6e9ff139b22",
+   "import_lines_rewritten": 5
+  },
+  "kernels/dsa/paged_score.py": {
+   "sha256": "8ed7b6abb8d77fd5803385f6e1efcc19bb332e2610c1b4af66178d427af16fa6",
+   "import_lines_rewritten": 0
+  },
+  "kernels/dsa/topk.py": {
+   "sha256": "76219804c3822c90a520cba58abb8b832d4bad853ee06a020cfbcb5c78262a87",
+   "import_lines_rewritten": 5
+  },
+  "kernels/dsa/physical_mapping.py": {
+   "sha256": "f1b12d1c1ef4c4074fd5287004c5bcb99a76b16989de4f890127d108b51b8ca0",
+   "import_lines_rewritten": 0
+  },
+  "kernels/radix_topk/__init__.py": {
+   "sha256": "9166e9df67eee0f7f3913517c8c32707e2ad1ef504d33be4bc91ed959b93f560",
+   "import_lines_rewritten": 3
+  },
+  "kernels/radix_topk/tuned_configs.py": {
+   "sha256": "9f34dfe337206fe5dd3cafdac74f104c488d4fa8a9b8108feedecf943f8ee57c",
+   "import_lines_rewritten": 0
+  },
+  "kernels/radix_topk/v1/__init__.py": {
+   "sha256": "9bf5a0a756eaf18740c4a8bb380adb272eb697365549bd98ddcd241be82c8456",
+   "import_lines_rewritten": 1
+  },
+  "kernels/radix_topk/v1/kernel.py": {
+   "sha256": "fe6788789178db49f59cdf9916f40b3822d41a09a5777e6f9da7fcf3718c69a8",
+   "import_lines_rewritten": 0
+  },
+  "kernels/radix_topk/v2/__init__.py": {
+   "sha256": "1fe412df5e61075af9887c5422d8596b48038438682109eedb5dcc2f19f2a72f",
+   "import_lines_rewritten": 1
+  },
+  "kernels/radix_topk/v2/kernel.py": {
+   "sha256": "da4671e0d4e92c2f8deed6983c97dee08922fd9e4f40dc0b14e14565f40de62b",
+   "import_lines_rewritten": 0
+  },
+  "kernels/radix_topk/v2/tuned_configs.py": {
+   "sha256": "9097c3a53267f79e35664e6d63fb5a8630673ebb1e9710b2347e879f676dd347",
+   "import_lines_rewritten": 0
+  }
+ },
+ "patches": [
+  {
+   "file": "kernels/dsa/indexer.py",
+   "old": "jax.default_backend() == \"tpu\"",
+   "new": "targets_tpu()",
+   "count": 3,
+   "import_added": "from sglang_tpu.attention.pallas.source_dsa.target_device import targets_tpu"
+  },
+  {
+   "file": "kernels/dsa/physical_mapping.py",
+   "old": "jax.default_backend() == \"tpu\"",
+   "new": "targets_tpu()",
+   "count": 1,
+   "import_added": "from sglang_tpu.attention.pallas.source_dsa.target_device import targets_tpu"
+  },
+  {
+   "file": "kernels/dsa/topk.py",
+   "old": "jax.devices()[0].device_kind in (\"TPU7x\", \"TPU v7\", \"TPU v7x\")",
+   "new": "target_device_kind() in (\"TPU7x\", \"TPU v7\", \"TPU v7x\")",
+   "count": 1,
+   "import_added": "from sglang_tpu.attention.pallas.source_dsa.target_device import target_device_kind"
+  },
+  {
+   "file": "kernels/dsa/paged_score.py",
+   "old": "jax.default_backend() == \"tpu\"",
+   "new": "targets_tpu()",
+   "count": 1
+  },
+  {
+   "file": "kernels/dsa/paged_score.py",
+   "old": "jax.devices()[0].device_kind in (\"TPU7x\", \"TPU v7\", \"TPU v7x\")",
+   "new": "target_device_kind() in (\"TPU7x\", \"TPU v7\", \"TPU v7x\")",
+   "count": 1,
+   "import_added": "from sglang_tpu.attention.pallas.source_dsa.target_device import target_device_kind, targets_tpu"
+  },
+  {
+   "file": "kernels/radix_topk/tuned_configs.py",
+   "old": "kind = jax.devices()[0].device_kind",
+   "new": "kind = target_device_kind()",
+   "count": 1,
+   "import_added": "from sglang_tpu.attention.pallas.source_dsa.target_device import target_device_kind"
+  }
+ ]
+}
