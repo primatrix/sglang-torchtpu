@@ -115,6 +115,13 @@ role_to_task_spec:
         echo "==== FP8TORCH (rc=$trc2)"; grep '^FP8TORCH ' "$OUT/att_torch.log" | cut -c1-3000
         [ $trc2 = 0 ] || { tail -n 60 "$OUT/att_torch.log"; rc=1; }
       fi
+      # 3b. Physical top-k: indexer physical=True vs mapped logical; attention topk_is_physical.
+      if [ $arc = 0 ]; then
+        prc=0
+        $PY benchmark/tpu/dsa_k_prologue/check_physical_topk.py --npz-dir "$OUT/att" --xprof-dir "$OUT/xprof" > "$OUT/phys.log" 2>&1 || prc=1
+        echo "==== PHYS (rc=$prc)"; grep -E '^(PHYSIDX|PHYSATT|PHYS_)' "$OUT/phys.log" | cut -c1-3000
+        [ $prc = 0 ] || { tail -n 60 "$OUT/phys.log"; rc=1; }
+      fi
       # 4. Dispatch: the CPU-process export holds the SparseCore gather + FP8 attention.
       DT=test/registered/tpu/unit/test_dsa_fp8_attention_dispatch.py
       $PY $DT -v > "$OUT/fp8_dispatch.log" 2>&1 || rc=1

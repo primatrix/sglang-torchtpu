@@ -9,7 +9,9 @@ Chains the migrated source modules (``source_dsa``) the way the source
 1. quantize this step's latent + k_rope with one shared f32 scale per token and
    scatter them into the split cache (``_scatter_fused_kv_paged``);
 2. map the indexer's sequence-local top-k positions to physical cache rows
-   (``_logical_topk_to_physical_slots``);
+   (``_logical_topk_to_physical_slots``), or, when the indexer already emits
+   flat cache slots (the source deployment, ``topk_indices_are_physical``),
+   only validate them (the backend's ``PhysicalTopKValidation``);
 3. resolve the execution plan (``DsaConfig.resolve``), pad the queries to the
    SparseCore microbatch and run ``sparse_core_tensor_core_dsa``.
 
@@ -47,7 +49,7 @@ FP8 = jnp.float8_e4m3fn
 
 def source_step(
     cache, q_latent, q_rope, kv_c, k_pe, topk, seq_lens, page_indices, cu_q_lens, cu_kv_lens,
-    sm_scale, *, allow_fp8_q, is_prefill, precision="fp8-qk-pv",
+    sm_scale, *, allow_fp8_q, is_prefill, topk_is_physical=False, precision="fp8-qk-pv",
 ):
     """The source ``_run`` body at page 64: returns ``(out [T, H, 512], cache)``."""
     page_size = cache_primary(cache).shape[1]
@@ -55,9 +57,15 @@ def source_step(
         cache, kv_c, k_pe, seq_lens, page_indices, cu_q_lens, cu_kv_lens,
         kv_lora_rank=KV_LORA_RANK, fp8_dtype=FP8,
     )
-    slots, counts = _logical_topk_to_physical_slots(
-        topk, seq_lens, page_indices, cu_q_lens, cu_kv_lens, page_size
-    )
+    if topk_is_physical:
+        # dsa_sparse_backend.py PhysicalTopKValidation (source c948bdd, lines 212-216).
+        valid = (topk >= 0) & (topk < cache_primary(cache).shape[0] * page_size)
+        slots = jnp.where(valid, topk, jnp.int32(0))
+        counts = jnp.sum(valid, axis=1, dtype=jnp.int32)
+    else:
+        slots, counts = _logical_topk_to_physical_slots(
+            topk, seq_lens, page_indices, cu_q_lens, cu_kv_lens, page_size
+        )
     plan = DsaConfig(precision=precision).resolve(
         q_latent.shape[0], eligible=allow_fp8_q, is_prefill=is_prefill, fp8_kv=True
     )
@@ -83,11 +91,12 @@ def source_page_table(page_indices):
 
 def fp8_attention_step(
     latent, rope, q_latent, q_rope, kv_c, k_pe, topk, kv_lens, page_indices, cu_q_lens,
-    sm_scale, *, allow_fp8_q, is_prefill,
+    sm_scale, *, allow_fp8_q, is_prefill, topk_is_physical=False,
 ):
     """Page-128 framework entry: split u8 latent ``[P,128,4,128]`` + RoPE ``[P,32,4,128]``.
 
-    ``topk`` is the indexer's sequence-local rows (-1 padded); the page table
+    ``topk`` is the indexer's sequence-local rows (-1 padded), or its flat
+    cache slots when ``topk_is_physical``; the page table
     has a fixed number of pages per request row. Returns ``(out, latent, rope)``.
     """
     if latent.shape[1:] != (FRAMEWORK_PAGE, 4, 128) or rope.shape[1:] != (FRAMEWORK_PAGE // 4, 4, 128):
@@ -101,6 +110,7 @@ def fp8_attention_step(
     out, view = source_step(
         view, q_latent, q_rope, kv_c, k_pe, topk, kv_lens, source_page_table(page_indices),
         cu_q_lens, cu_kv_lens, sm_scale, allow_fp8_q=allow_fp8_q, is_prefill=is_prefill,
+        topk_is_physical=topk_is_physical,
     )
     return out, view.latent.reshape(latent.shape), view.rope.reshape(rope.shape)
 

@@ -4,7 +4,7 @@
 ``sglang_tpu_pallas::dsa_bf16_indexer`` runs
 ``dsa_bf16_indexer.bf16_indexer_step``: store this step's index keys in
 ``cache`` (bf16 ``[P, 128, 128]``, donated and aliased) and return each query's
-top-k sequence-local positions. The export runs under
+top-k sequence-local positions, or flat cache slots when ``physical``. The export runs under
 ``source_dsa.target_device.export_target`` with the chip torch_tpu reports, so
 the source scorer and radix top-k dispatch for the real target. Not wired into
 ``indexer_forward`` yet.
@@ -57,18 +57,19 @@ def build_dsa_bf16_indexer_op():
         topk: int,
         prefill: bool,
         decode: bool,
+        physical: bool,
     ) -> tuple[jax.Array, jax.Array]:
         return bf16_indexer_step(
             cache, hidden, wk, wk_scale, norm_weight, norm_bias, query, rope_cos,
             rope_sin, head_weights, kv_lens, page_indices, cu_q_lens, distribution,
-            hadamard, topk=topk, prefill=prefill, decode=decode,
+            hadamard, topk=topk, prefill=prefill, decode=decode, physical=physical,
         )
 
     (cache_argnum,) = argnums(_wrapped, "cache")
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=argnums(_wrapped, "topk", "prefill", "decode"),
+        static_argnums=argnums(_wrapped, "topk", "prefill", "decode", "physical"),
         donate_argnums=(cache_argnum,),
         input_output_aliases={cache_argnum: 1},
         warn_deprecated=False,
@@ -94,20 +95,21 @@ def build_dsa_bf16_indexer_op():
         topk: int,
         prefill: bool,
         decode: bool,
+        physical: bool = False,
     ) -> torch.Tensor:
         # The target is the chip torch_tpu reports, not JAX's CPU export backend.
         with tpu_info_for_cpu_export(), export_target(get_pallas_tpu_device_kind()):
             topk_indices, _cache = jax_kernel(
                 cache, hidden, wk, wk_scale, norm_weight, norm_bias, query, rope_cos,
                 rope_sin, head_weights, kv_lens, page_indices, cu_q_lens, distribution,
-                hadamard, topk, prefill, decode,
+                hadamard, topk, prefill, decode, physical,
             )
         return topk_indices
 
     @custom_op.register_fake
     def _fake(cache, hidden, wk, wk_scale, norm_weight, norm_bias, query, rope_cos,
               rope_sin, head_weights, kv_lens, page_indices, cu_q_lens, distribution,
-              hadamard, topk, prefill, decode):
+              hadamard, topk, prefill, decode, physical=False):
         return query.new_empty((query.shape[0], topk), dtype=torch.int32)
 
     _OP = custom_op

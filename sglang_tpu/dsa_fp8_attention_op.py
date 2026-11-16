@@ -5,7 +5,8 @@
 ``dsa_fp8_attention.fp8_attention_step``: quantize this step's latent + k_rope
 into the split FP8 cache (u8 latent ``[P, 128, 4, 128]`` and RoPE
 ``[P, 32, 4, 128]``, both donated and aliased), map the indexer's
-sequence-local top-k to physical rows, and run the source's
+sequence-local top-k to physical rows (or, with ``topk_is_physical``, only
+validate the indexer's flat cache slots), and run the source's
 ``sparse_core_tensor_core_dsa`` (SparseCore gather + TensorCore FP8 attention).
 
 The op exports with ``JAX_PLATFORMS=cpu``. The copied attention reads the
@@ -57,17 +58,19 @@ def build_dsa_fp8_attention_op():
         sm_scale: float,
         allow_fp8_q: bool,
         is_prefill: bool,
+        topk_is_physical: bool,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return fp8_attention_step(
             latent, rope, q_latent, q_rope, kv_c, k_pe, topk, kv_lens, page_indices,
             cu_q_lens, sm_scale, allow_fp8_q=allow_fp8_q, is_prefill=is_prefill,
+            topk_is_physical=topk_is_physical,
         )
 
     latent_argnum, rope_argnum = argnums(_wrapped, "latent", "rope")
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=argnums(_wrapped, "sm_scale", "allow_fp8_q", "is_prefill"),
+        static_argnums=argnums(_wrapped, "sm_scale", "allow_fp8_q", "is_prefill", "topk_is_physical"),
         donate_argnums=(latent_argnum, rope_argnum),
         input_output_aliases={latent_argnum: 1, rope_argnum: 2},
         warn_deprecated=False,
@@ -88,18 +91,19 @@ def build_dsa_fp8_attention_op():
         sm_scale: float,
         allow_fp8_q: bool,
         is_prefill: bool,
+        topk_is_physical: bool = False,
     ) -> torch.Tensor:
         # The target is the chip torch_tpu reports, not JAX's CPU export backend.
         with tpu_info_for_cpu_export(), export_target(get_pallas_tpu_device_kind()):
             out, _latent, _rope = jax_kernel(
                 latent, rope, q_latent, q_rope, kv_c, k_pe, topk, kv_lens, page_indices,
-                cu_q_lens, sm_scale, allow_fp8_q, is_prefill,
+                cu_q_lens, sm_scale, allow_fp8_q, is_prefill, topk_is_physical,
             )
         return out
 
     @custom_op.register_fake
     def _fake(latent, rope, q_latent, q_rope, kv_c, k_pe, topk, kv_lens, page_indices,
-              cu_q_lens, sm_scale, allow_fp8_q, is_prefill):
+              cu_q_lens, sm_scale, allow_fp8_q, is_prefill, topk_is_physical=False):
         return q_latent.new_empty(q_latent.shape)
 
     _OP = custom_op

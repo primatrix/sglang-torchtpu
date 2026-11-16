@@ -15,9 +15,11 @@ Framework adaptation (not in the source):
   ``2p + 1``. A token's flat slot ``p * 128 + o`` is the same number either way.
 * ``cu_kv_lens``. The framework's page table has a fixed number of pages per
   request row, so the token offset of row ``s`` is ``s * pages_per_row * 128``.
-* Output format. The target sparse attention, which GLM-5.2 keeps until S6
-  migrates, reads sequence-local logical positions, so this calls the scorer
-  with ``output_physical_slots=False`` (the source deployment uses True).
+* Output format. ``physical=False`` returns sequence-local logical positions,
+  which the target sparse attention reads. ``physical=True`` is the source
+  deployment (``output_physical_slots=True``): flat cache slots for the
+  migrated S6 attention, which then only validates them. Slot ``p * 128 + o``
+  of a framework page equals the source's page-64 slot.
 
 Head weights go in as ``weights_proj`` produces them, without the target's
 ``softmax_scale * n_heads ** -0.5``: the source applies no factor. A positive
@@ -54,7 +56,7 @@ def source_cache_view(cache):
 def bf16_indexer_step(
     cache, hidden, wk, wk_scale, norm_weight, norm_bias, query, rope_cos, rope_sin,
     head_weights, kv_lens, page_indices, cu_q_lens, distribution, hadamard=None,
-    *, topk, prefill, decode, topk_impl="radix", interpret=False,
+    *, topk, prefill, decode, physical=False, topk_impl="radix", interpret=False,
 ):
     """Store this step's index keys, then pick each query's top-k keys.
 
@@ -64,7 +66,8 @@ def bf16_indexer_step(
     framework's metadata (page 128, fixed pages per request row). ``prefill``
     selects the source's fused query tail, ``decode`` its one-token-per-request
     store and scorer. Returns ``(topk_indices, cache)``: ``i32[T, topk]``
-    sequence-local positions, ``-1`` padded, and the updated cache.
+    sequence-local positions (flat cache slots when ``physical``), ``-1``
+    padded, and the updated cache.
     """
     num_seqs = kv_lens.shape[0]
     pages_per_row = page_indices.shape[0] // num_seqs
@@ -83,7 +86,7 @@ def bf16_indexer_step(
     topk_indices = compute_scores_and_select_topk_indices(
         q_idx, head_weights, view, kv_lens, table, cu_q_lens, cu_kv_lens, distribution,
         k=topk, pages_per_seq=pages_per_row * SPLIT, one_token_per_seq=decode,
-        topk_impl=topk_impl, output_physical_slots=False,
+        topk_impl=topk_impl, output_physical_slots=physical,
     )
     return topk_indices, view.reshape(cache.shape)
 
