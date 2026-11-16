@@ -270,16 +270,69 @@ def stage_jax(a):
         for side in ("source", "ported_s_jax"):
             row[side].pop("runs", None)
         print("FP8ATT " + json.dumps(row), flush=True)
+        if a.npz_dir:
+            # Inputs (prefilled cache) and Ported-S JAX outputs for --stage torch.
+            np.savez(os.path.join(a.npz_dir, f"fp8att_{name}.npz"), lat0=lat0, rope0=rope0,
+                     out=po.view(np.uint16), latent=pl_, rope=pr)
+
+
+def stage_torch(a):
+    """The torch op on the JAX stage's prefilled cache; must equal Ported-S JAX byte for byte."""
+    os.environ["JAX_PLATFORMS"] = "cpu"  # TorchTPU owns the device
+    import torch
+    import torch_tpu  # noqa: F401
+
+    from bench_torch_ab import _profile
+    from sglang_tpu.dsa_fp8_attention_op import build_dsa_fp8_attention_op
+
+    op = build_dsa_fp8_attention_op()
+    sync = torch.accelerator.synchronize
+    bf = lambda x: torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).view(torch.bfloat16).to("tpu")
+    i32 = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to("tpu")
+    u8 = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to("tpu")
+    for name in a.cases:
+        c = case(name)
+        ref = np.load(os.path.join(a.npz_dir, f"fp8att_{name}.npz"))
+        P = c["P"]
+        lat0 = ref["lat0"].reshape(P, FP, 4, 128)
+        rope0 = ref["rope0"].reshape(P, FP // 4, 4, 128)
+        prefill = c["mode"] == "prefill"
+        static = (float(c["sm_scale"]), True, prefill)
+        ins = (bf(c["q_latent"]), bf(c["q_rope"]), bf(c["kv_c"]), bf(c["k_pe"]), i32(c["topk"]),
+               i32(c["kv"]), i32(c["pi"]), i32(c["cu_q"]))
+        fn = torch.compile(lambda lat, rope, *x: op(lat, rope, *x, *static), backend="tpu",
+                           fullgraph=True, dynamic=False)
+        lat, rope = u8(lat0), u8(rope0)
+        out = fn(lat, rope, *ins).cpu().view(torch.int16).numpy().view(np.uint16)
+        sync()
+        row = {
+            "case": name,
+            "op_vs_jax_out": bool(np.array_equal(out, ref["out"])),
+            "op_vs_jax_cache": bool(np.array_equal(lat.cpu().numpy().reshape(-1), ref["latent"].reshape(-1))
+                                    and np.array_equal(rope.cpu().numpy().reshape(-1), ref["rope"].reshape(-1))),
+        }
+        bl, br = u8(lat0), u8(rope0)
+        row["us"], _ = _median_time(lambda: fn(bl, br, *ins), sync, a.iters, a.repeats)
+        if a.xprof_dir:
+            prof = _profile(fn, (u8(lat0), u8(rope0), *ins), a.iters, f"{a.xprof_dir}/fp8att_torch_{name}")
+            row["module_us"] = round(sum(u for _, u in prof.get("modules", [])), 1)
+            row["top_ops"] = [(n[:60], round(u, 1)) for n, u in prof.get("ops", [])[:6]]
+        print("FP8TORCH " + json.dumps(row), flush=True)
 
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--stage", choices=("jax", "torch"), default="jax")
     p.add_argument("--cases", nargs="+", default=list(CASES))
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--xprof-dir", default="")
+    p.add_argument("--npz-dir", default="")
     p.add_argument("--source-root", default="/tmp/source/m4s")
-    stage_jax(p.parse_args())
+    a = p.parse_args()
+    if a.npz_dir:
+        os.makedirs(a.npz_dir, exist_ok=True)
+    stage_jax(a) if a.stage == "jax" else stage_torch(a)
 
 
 if __name__ == "__main__":
