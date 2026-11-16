@@ -84,10 +84,9 @@ role_to_task_spec:
       rc=0
       # HLO comparison: unaligned extend only; each side dumps its optimized HLO.
       D=benchmark/tpu/dsa_k_prologue/bench_chain_diag.py
-      DUMP="--xla_dump_to=DIR --xla_dump_hlo_as_text --xla_dump_hlo_pass_re=^$"
       for side in torch jax; do
         mkdir -p "$OUT/hlo_$side"
-        F="${DUMP//DIR/$OUT/hlo_$side}"
+        F="--xla_dump_to=$OUT/hlo_$side --xla_dump_hlo_as_text --xla_dump_hlo_pass_re=^\$"
         XLA_FLAGS="$F" LIBTPU_INIT_ARGS="$F" $PY $D --stage $side --cases extend_unaligned --iters 2 \
           --npz-dir "$OUT/d" --xprof-dir "$OUT/xprof" > "$OUT/d_$side.log" 2>&1 || rc=1
         echo "==== $side (rc=$rc) dumps=$(ls "$OUT/hlo_$side" | wc -l) after_opt=$(ls "$OUT/hlo_$side" | grep -c after_optimizations)"
