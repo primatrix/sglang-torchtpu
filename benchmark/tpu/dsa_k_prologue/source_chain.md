@@ -60,3 +60,10 @@ S5 行格式绑定 expand/gather/attention；page 64 绑定 S1 fused kernel 与 
 - 权重：`gs://inference-model-storage-sgl/model_scope/GLM5.2-fp8-channel-wise`。Falcon pod 读同一 bucket 里的 wheel 时一直回退到 `falcon exp cp`，大概率也读不了权重；`falcon exp cp` 不适合 762 GB。需要给 Falcon job 的身份开该 bucket 的读权限（类似 `iam_grant_request.md`）。
 - 对比方式：同一 recipe 分别以 `SGLANG_TPU_DSA_BF16_INDEXER=1` 和关闭运行，比较输出质量和吞吐。
 - 在此之前用单层或小模型验证 `indexer_forward` 的真实调用路径。
+
+## 集群状况（记录）
+
+- 2026-11-17 00:25 起，`falcon exp cp` 传 torch_tpu wheel（约 99 MB）在 c1 和 c2 上都失败（`transfer agent disconnected`、`did not reach a terminal state`、`connection reset by peer`），涉及 exp-70ldncj77u、exp-r1ld2gwaet（c1）和 exp-ey8mviy8ww（c2）。不是单个集群的问题。
+- 01:00 在 exp-ey8mviy8ww 上测试：小文件（几字节、1 MB、20 MB）都传成功，各 40～76 s；随后重传 wheel，213 s 后 `connection reset by peer`。所以是大文件传输不通，小文件正常。
+- 本机 `falcon v0.1.0`（commit 9e69585，2026-06-11 构建）。
+- 可选办法：等传输服务恢复；或把 wheel 切成小于 20 MB 的分片分别传，在 pod 里拼接后校验 SHA256；或给 Falcon job 身份开 wheel 所在 GCS bucket 的读权限（manifest 已有 GCS 下载路径，同 `iam_grant_request.md`）。
