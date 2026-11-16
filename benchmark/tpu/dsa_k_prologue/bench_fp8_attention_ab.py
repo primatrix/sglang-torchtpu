@@ -117,8 +117,12 @@ def load_source_helpers(source_root):
 
 
 def source_run(src, cache, ql, qr, kvc, kpe, topk, seq_lens, pi, cuq, cukv, sm_scale, *,
-               allow_fp8_q, is_prefill):
-    """``DSASparseAttentionBackend._run`` (FP8 delivery) with the source modules."""
+               allow_fp8_q, is_prefill, topk_is_physical=False):
+    """``DSASparseAttentionBackend._run`` (FP8 delivery) with the source modules.
+
+    ``topk_is_physical`` is the deployed exact path (``topk_indices_are_physical``):
+    the indexer emits physical slots and the backend only validates them.
+    """
     from sgl_jax.srt.configs.dsa_config import DsaConfig
     from sgl_jax.srt.kernels.dsa.exact_attention import sparse_core_tensor_core_dsa
     from sgl_jax.srt.kernels.dsa.fp8_kv_cache import cache_primary, map_cache_parts
@@ -127,7 +131,14 @@ def source_run(src, cache, ql, qr, kvc, kpe, topk, seq_lens, pi, cuq, cukv, sm_s
     page_size = cache_primary(cache).shape[1]
     cache4d = src["_scatter_fused_kv_paged"](
         cache, kvc, kpe, seq_lens, pi, cuq, cukv, kv_lora_rank=LAT, fp8_dtype=jnp.float8_e4m3fn)
-    slots, counts = src["_logical_topk_to_physical_slots"](topk, seq_lens, pi, cuq, cukv, page_size)
+    if topk_is_physical:
+        # dsa_sparse_backend.py PhysicalTopKValidation, verbatim.
+        valid = (topk >= 0) & (topk < cache_primary(cache4d).shape[0] * page_size)
+        slots = jnp.where(valid, topk, jnp.int32(0))
+        counts = jnp.sum(valid, axis=1, dtype=jnp.int32)
+    else:
+        slots, counts = src["_logical_topk_to_physical_slots"](
+            topk, seq_lens, pi, cuq, cukv, page_size)
     plan = DsaConfig(precision="fp8-qk-pv").resolve(
         ql.shape[0], eligible=allow_fp8_q, is_prefill=is_prefill, fp8_kv=True)
     bq_sparse, bq, b_topk = plan.tiles
@@ -319,6 +330,29 @@ def stage_jax(a):
             row["source"] = {"error": repr(e)[:3000]}
             print("FP8ATT " + json.dumps(row), flush=True)
             continue
+
+        # Deployed exact path: physical top-k from the indexer, no logical mapping.
+        # Physical rows are the logical mapping's valid prefix, -1 after it.
+        try:
+            def phys_fn(tk, sl_, pi_, cq_, ckv_):
+                sl, cnt = src["_logical_topk_to_physical_slots"](tk, sl_, pi_, cq_, ckv_, FP // 2)
+                return jnp.where(jnp.arange(K)[None, :] < cnt[:, None], sl, jnp.int32(-1))
+            m_args = (j["topk"], j["kv"], pi64, j["cu_q"], cukv)
+            phys, row["logical_mapping_alone"] = timed(phys_fn, m_args, f"{name}_mapping")
+            row["logical_mapping_alone"].pop("runs", None)
+
+            def sp_fn(lat, rope, *x):
+                out, cc, _ = source_run(src, SrcSplit(lat, rope), *x, allow_fp8_q=allow,
+                                        is_prefill=prefill, topk_is_physical=True)
+                return out, cc.latent, cc.rope
+
+            sp_args = s_args[:6] + (phys,) + s_args[7:]
+            (spo, _, _), row["source_physical"] = timed(sp_fn, sp_args, f"{name}_source_phys")
+            row["source_physical"].pop("runs", None)
+            row["source_physical"]["out_exact_vs_source"] = bool(
+                np.array_equal(np.asarray(spo).view(np.uint16), np.asarray(so).view(np.uint16)))
+        except Exception as e:  # report, do not hide
+            row["source_physical"] = {"error": repr(e)[:3000]}
 
         def p_fn(lat, rope, *x):
             return port.fp8_attention_step(lat, rope, *x, allow_fp8_q=allow, is_prefill=prefill)
