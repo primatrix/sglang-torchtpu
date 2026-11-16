@@ -98,12 +98,16 @@ def _positions(c, rows):
     return out
 
 
-def shortfall(c, rows, queries=64):
-    """Per sampled query: 1 - (lowest exact score picked) / (exact k-th best), f64."""
+def shortfall(c, rows, queries=64, keys=None, q=None):
+    """Per sampled query: 1 - (lowest exact score picked) / (exact k-th best), f64.
+
+    The reference scores use bf16 ``q`` / keys (the source contract) unless
+    ``keys`` [P, 64, D] and ``q`` [T, H, D] are given (e.g. FP8-dequantized).
+    """
     pos = _positions(c, rows)
     seq = np.searchsorted(c["cu_q"][1:], np.arange(c["T"]), side="right")
-    keys = _bf16(c["cache"]).astype(np.float64)
-    q = _bf16(c["q"]).astype(np.float64)
+    keys = (_bf16(c["cache"]) if keys is None else keys).astype(np.float64)
+    q = (_bf16(c["q"]) if q is None else q).astype(np.float64)
     vals = []
     for t in np.linspace(0, c["T"] - 1, min(queries, c["T"])).astype(int):
         s = seq[t]
@@ -187,6 +191,16 @@ def _target(c):
     return fn, (jnp.asarray(_bf16(c["q"])), jnp.asarray(c["w"])), cache
 
 
+def _fp8_dequantized(x):
+    """``values * scale`` of the target's per-row UE8M0 FP8 quantization, f32."""
+    import jax.numpy as jnp
+
+    from sglang_tpu.attention.pallas.util import quantize_fp8_ue8m0
+
+    v, scale, _ = quantize_fp8_ue8m0(jnp.asarray(_bf16(x)))
+    return np.asarray(v.astype(jnp.float32) * scale)
+
+
 def stage_jax(a):
     os.environ.setdefault("JAX_PLATFORMS", "tpu")
     import jax
@@ -250,8 +264,16 @@ def stage_jax(a):
             fn, targs, cache = _target(c)
             out, res = run(lambda q, w, cc: fn(q, w, cc), (*targs, cache), f"{name}_target")
             tc = dict(c, phys=False)
-            row["target"] = {**res, "selection": shortfall(tc, out),
-                             "note": "FP8 UE8M0 records, page 128, no Hadamard"}
+            row["target"] = {
+                **res,
+                # vs bf16 exact scores: FP8 format loss plus kernel error.
+                "selection": shortfall(tc, out),
+                # vs exact scores of the FP8-dequantized q and keys the kernel sees:
+                # kernel error under the target's own contract.
+                "selection_own": shortfall(tc, out, keys=_fp8_dequantized(c["cache"]),
+                                           q=_fp8_dequantized(c["q"])),
+                "note": "FP8 UE8M0 records, page 128, no Hadamard",
+            }
         except Exception as e:  # report, do not hide
             row["target"] = {"error": repr(e)[:3000]}
         print("SCORE " + json.dumps(_summary(row)), flush=True)
@@ -273,6 +295,7 @@ def _summary(row):
             "module_us": round(sum(u for _, u in x.get("modules", [])), 1) if "modules" in x else None,
             "top_ops": [(n[:50], round(u, 1)) for n, u in x.get("ops", [])[:5]],
             "sel": r.get("selection"),
+            **({"sel_own": r["selection_own"]} if "selection_own" in r else {}),
         }
     for k in ("ported_s_jax_vs_source_exact", "ported_s_vs_source_exact"):
         out[k] = row.get(k)
