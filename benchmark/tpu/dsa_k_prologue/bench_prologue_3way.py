@@ -51,6 +51,11 @@ def _median_time(call, sync, iters, repeats):
     return statistics.median(runs), runs
 
 
+def cu_kv_lens(L):
+    """Token offset of each request's page-table row (the source's ``cu_kv_lens``)."""
+    return (np.arange(L["seqs"] + 1) * L["pps"] * 64).astype(np.int32)
+
+
 def _new_records(cache, slots):
     """Records of the new tokens from a ``u8[P, page // 4, 4, 256]`` cache."""
     p, s = slots[:, 0], slots[:, 1]
@@ -147,8 +152,23 @@ def stage_torch(a):
         fused_op(cache, hidden, wk, ws, nw, nb, c.contiguous(), s.contiguous(),
                  kv, pages, cu, dist, pc.EPS_TARGET)
 
+    # Ported-S: the source-contract op (BF16 cache, page 64, Hadamard, W8A16).
+    from sglang_tpu.dsa_bf16_key_store_op import build_dsa_store_index_keys_bf16_op
+
+    s_op = build_dsa_store_index_keys_bf16_op()
+    wk_nk = torch.from_numpy(np.ascontiguousarray(i0["wk"].T).view(np.uint8)).view(torch.float8_e4m3fn).to(dev)
+    nw16 = bf(pc.bf16(i0["nw"]).astype(pc.BF16)).to(dev)
+    nb16 = bf(pc.bf16(i0["nb"]).astype(pc.BF16)).to(dev)
+    had = torch.from_numpy(pc.hadamard()).to(dev)
+
+    def ported_s(hidden, positions, table, cache, seq, pages, cuq, cukv):
+        c, s = table.index_select(0, positions).chunk(2, -1)
+        s_op(cache, hidden, wk_nk, ws, nw16, nb16, c.contiguous(), s.contiguous(), had,
+             seq, pages, cuq, cukv)
+
     compile_ = lambda f: torch.compile(f, backend="tpu", fullgraph=True, dynamic=False)
     variants = {"target": compile_(target), "ported": compile_(ported)}
+    ported_s_c = compile_(ported_s)
     sync = torch.accelerator.synchronize
     rows = []
     for m in a.tokens:
@@ -174,6 +194,23 @@ def stage_torch(a):
                 lambda: fn(*args), sync, a.iters, a.repeats)
             if a.xprof_dir:
                 row[f"{name}_xprof"] = _profile(fn, args, a.iters, f"{a.xprof_dir}/torch_{m}_{name}")
+        L64 = pc.layout(m, 64)
+        pre64 = pc.prefix_bf16(L64["num_pages"], seed=m).view(np.int16)
+        pre64_t = torch.from_numpy(pre64).view(torch.bfloat16)
+        meta64 = [torch.from_numpy(v).to(dev) for v in (
+            L64["kv_lens"], L64["page_indices"], L64["cu_q_lens"], cu_kv_lens(L64))]
+        cache = pre64_t.clone().to(dev)
+        ported_s_c(hidden, positions, tabs[0], cache, *meta64)
+        sync()
+        after = cache.cpu().view(torch.int16).numpy()
+        sl = L64["slots"]
+        recs["ported_s"] = after[sl[:, 0], sl[:, 1]]
+        row["ported_s_prefix_untouched"] = _untouched(after, pre64, sl)
+        args = (hidden, positions, tabs[0], pre64_t.clone().to(dev), *meta64)
+        row["ported_s_us"], row["ported_s_runs"] = _median_time(
+            lambda: ported_s_c(*args), sync, a.iters, a.repeats)
+        if a.xprof_dir:
+            row["ported_s_xprof"] = _profile(ported_s_c, args, a.iters, f"{a.xprof_dir}/torch_{m}_ported_s")
         np.savez(os.path.join(a.npz_dir, f"torch_{m}.npz"), **recs)
         print("TORCH " + json.dumps(row), flush=True)
         rows.append(row)
@@ -187,6 +224,7 @@ def stage_jax(a):
     import jax.numpy as jnp
 
     from xplane_summary import summarize
+    from sglang_tpu.attention.pallas import dsa_bf16_key_store as ks
     from sglang_tpu.attention.pallas import dsa_index_topk as dit
 
     sys.path.insert(0, os.path.dirname(a.source_kernel))
@@ -235,24 +273,46 @@ def stage_jax(a):
                     jnp.asarray(pc.bf16(i["nb"]).astype(pc.BF16)), cos, sin, jnp.asarray(H))
         src_fn = lambda *args: source(*args[:-1], args[-1], tp64, page_size=64)
         prefix64 = pc.prefix_bf16(L64["num_pages"], seed=m)
-        try:
-            after = np.asarray(src_fn(*src_args, jnp.asarray(prefix64))).astype(np.float32)
-            sl = L64["slots"]
-            keys = after[sl[:, 0], sl[:, 1]] @ H  # undo the orthonormal, symmetric Hadamard
-            ref = pc.source_reference({**i, "x": i["x"][:n], "pos": i["pos"][:n]})
+        sl = L64["slots"]
+        ref = pc.source_reference({**i, "x": i["x"][:n], "pos": i["pos"][:n]})
+
+        def score_bf16(new_rows_i16):
+            """Source-contract keys (bf16 bytes of the new slots) against the f64 reference."""
+            keys = new_rows_i16.view(pc.BF16).astype(np.float32) @ H  # undo the orthonormal Hadamard
             err = np.abs(keys[:n] - ref)
-            keep = np.ones(after.shape[0], bool)
-            keep[np.unique(sl[:, 0])] = False
+            return {"max_abs_vs_own_ref": float(err.max()), "mean_abs_vs_own_ref": float(err.mean()),
+                    "rel_max_vs_own_ref": float(err.max() / np.abs(ref).max()),
+                    "selection_vs_own_ref": pc.shortfall(keys[:S], ref[:S])}
+
+        src_new = None
+        try:
+            after = np.asarray(src_fn(*src_args, jnp.asarray(prefix64))).view(np.int16)
+            src_new = after[sl[:, 0], sl[:, 1]]
             row["source"] = {
-                "prefix_untouched": bool(np.array_equal(after[keep], prefix64[keep].astype(np.float32))),
-                "max_abs_vs_own_ref": float(err.max()),
-                "mean_abs_vs_own_ref": float(err.mean()),
-                "rel_max_vs_own_ref": float(err.max() / np.abs(ref).max()),
-                "selection_vs_own_ref": pc.shortfall(keys[:S], ref[:S]),
+                "prefix_untouched": _untouched(after, prefix64.view(np.int16), sl),
+                **score_bf16(src_new),
                 **run(src_fn, src_args, jnp.asarray(prefix64), f"{m}_source"),
             }
         except Exception as e:  # report, do not hide
             row["source"] = {"error": repr(e)[:3000]}
+
+        # Ported-S from JAX: the migrated source-contract store, same inputs and cache as Source.
+        m64 = tuple(jnp.asarray(v) for v in (L64["kv_lens"], L64["page_indices"], L64["cu_q_lens"], cu_kv_lens(L64)))
+        ps_w = src_args[1:5]
+        ps_fn = lambda x, c, s, h, cache: ks.store_index_keys_bf16(cache, x, *ps_w, c, s, h, *m64)
+        ps_args = (x, cos, sin, jnp.asarray(H))
+        try:
+            after = np.asarray(ps_fn(*ps_args, jnp.asarray(prefix64))).view(np.int16)
+            ps_new = after[sl[:, 0], sl[:, 1]]
+            row["ported_s_jax"] = {
+                "prefix_untouched": _untouched(after, prefix64.view(np.int16), sl),
+                **score_bf16(ps_new),
+                **run(ps_fn, ps_args, jnp.asarray(prefix64), f"{m}_ported_s_jax"),
+            }
+            if src_new is not None:
+                row["ported_s_jax_vs_source_exact"] = float(np.mean(np.all(ps_new == src_new, axis=1)))
+        except Exception as e:  # report, do not hide
+            row["ported_s_jax"] = {"error": repr(e)[:3000]}
 
         # Ported from JAX: same kernel as the torch op, same framework as Source.
         L = pc.layout(m, PAGE)
@@ -280,6 +340,15 @@ def stage_jax(a):
                 "us": tr[f"{name}_us"], "runs": tr[f"{name}_runs"],
                 **({"xprof": tr[f"{name}_xprof"]} if f"{name}_xprof" in tr else {}),
             }
+        tr = torch_rows[m]
+        row["ported_s"] = {
+            "prefix_untouched": tr["ported_s_prefix_untouched"],
+            **score_bf16(t["ported_s"]),
+            "us": tr["ported_s_us"], "runs": tr["ported_s_runs"],
+            **({"xprof": tr["ported_s_xprof"]} if "ported_s_xprof" in tr else {}),
+        }
+        if src_new is not None:
+            row["ported_s_vs_source_exact"] = float(np.mean(np.all(t["ported_s"] == src_new, axis=1)))
         row["target_vs_ported_exact_records"] = float(np.mean(np.all(t["target"] == t["ported"], axis=1)))
         row["ported_torch_vs_jax_exact_records"] = float(np.mean(np.all(t["ported"] == pj_rec, axis=1)))
         print("ROW " + json.dumps(row), flush=True)
@@ -292,7 +361,7 @@ def stage_jax(a):
 def _summary(row):
     """The few numbers per point that fit in a log tail; the full row is in the report."""
     out = {"tokens": row["tokens"]}
-    for name in ("source", "target", "ported", "ported_jax"):
+    for name in ("source", "ported_s", "ported_s_jax", "target", "ported", "ported_jax"):
         r = row.get(name, {})
         if "error" in r:
             out[name] = {"error": r["error"][:300]}
@@ -312,6 +381,8 @@ def _summary(row):
         }
     out["target_vs_ported_exact"] = row.get("target_vs_ported_exact_records")
     out["ported_torch_vs_jax_exact"] = row.get("ported_torch_vs_jax_exact_records")
+    out["ported_s_vs_source_exact"] = row.get("ported_s_vs_source_exact")
+    out["ported_s_jax_vs_source_exact"] = row.get("ported_s_jax_vs_source_exact")
     return out
 
 

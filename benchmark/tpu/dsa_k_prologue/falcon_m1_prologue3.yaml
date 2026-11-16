@@ -1,4 +1,4 @@
-name: glm52-dsa-m1-prologue3-PINSHA
+name: glm52-dsa-m1s-prologue3-PINSHA
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: gke-tpu-train-us-central1-1-prod
@@ -71,7 +71,12 @@ role_to_task_spec:
       SRC_GOT=$(sha256sum "$SRC" 2>/dev/null | cut -d' ' -f1)
       echo "source sha256=${SRC_GOT:-missing} expected=$SRC_SHA" | tee "$OUT/source_check.log"
       if [ "$SRC_GOT" != "$SRC_SHA" ]; then echo "Source kernel missing or SHA256 mismatch"; exit 2; fi
-      rc=0
+      rc=0; trc=0
+      # Source-contract store (BF16 cache, page 64): kernel + XLA chain, then the torch op.
+      for t in test_dsa_bf16_key_store test_dsa_bf16_key_store_op; do
+        $PY test/registered/tpu/unit/$t.py -v > "$OUT/$t.log" 2>&1 || trc=1
+        echo "==== $t"; tail -n 12 "$OUT/$t.log"
+      done
       B=benchmark/tpu/dsa_k_prologue/bench_prologue_3way.py
       $PY $B --stage torch --tokens 2048 8192 32768 --iters 10 --repeats 3 \
         --npz-dir "$OUT/p3" --xprof-dir "$OUT/xprof" > "$OUT/p3_torch.log" 2>&1 || rc=1
@@ -85,6 +90,8 @@ role_to_task_spec:
       echo "==== P3 (rc=$rc)"
       grep '^SUM ' "$OUT/p3_jax.log" 2>/dev/null || { tail -n 40 "$OUT/p3_torch.log"; tail -n 40 "$OUT/p3_jax.log" 2>/dev/null; }
       grep -E 'Traceback|Error' "$OUT/p3_jax.log" 2>/dev/null | head -n 20
+      echo "==== TESTS (rc=$trc)"
+      [ $trc = 0 ] || rc=1
       exit $rc
     replica: 1
     image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1

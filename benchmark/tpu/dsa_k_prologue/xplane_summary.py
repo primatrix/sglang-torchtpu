@@ -7,9 +7,13 @@ calls. Only device time; host time is not read.
 No profiler package is needed: the few XSpace fields read here are decoded
 from the protobuf wire format directly (field numbers from tsl's xplane.proto:
 XSpace.planes 1; XPlane name 2, lines 3, event_metadata 4 (map: key 1, value
-2); XLine name 2, events 4; XEvent metadata_id 1, duration_ps 3;
+2); XLine name 2, events 4; XEvent metadata_id 1, offset_ps 2, duration_ps 3;
 XEventMetadata name 2). The plane and line names found are reported, so a
 wrong decode shows up as unexpected names rather than plausible numbers.
+
+Events on one line nest (a ``conditional`` or ``while`` spans the ops it runs),
+so each op is charged its self time (duration minus its direct children) and
+``device_us`` is the sum of self time, i.e. the span of the top-level events.
 """
 
 import collections
@@ -78,19 +82,53 @@ def _planes(data):
                     if lf == 2:
                         line_name = lv.decode("utf-8", "replace")
                     elif lf == 4:
-                        mid = dur = 0
+                        mid = off = dur = 0
                         for xf, xv in _fields(lv):
                             if xf == 1:
                                 mid = xv
+                            elif xf == 2:
+                                off = xv
                             elif xf == 3:
                                 dur = xv
-                        events.append((mid, dur))
+                        events.append((mid, off, dur))
                 lines.append((line_name, events))
         yield name, names, lines
 
 
+def _self_times(events):
+    """``[(metadata_id, self_ps)]``: each event's duration minus its direct children's."""
+    order = sorted(range(len(events)), key=lambda k: (events[k][1], -events[k][2]))
+    self_ps = [e[2] for e in events]
+    stack = []  # indices of open events, innermost last
+    for k in order:
+        _, off, dur = events[k]
+        while stack and off >= events[stack[-1]][1] + events[stack[-1]][2]:
+            stack.pop()
+        if stack:
+            self_ps[stack[-1]] -= dur
+        stack.append(k)
+    return [(events[k][0], max(0, self_ps[k])) for k in range(len(events))]
+
+
+def _self_times(events):
+    """``[(metadata_id, self_ps)]``: each event minus the events nested inside it.
+
+    One line can hold an op and the ops inside it (a ``conditional`` and the
+    kernel in its branch); summing raw durations counts the inner op twice.
+    """
+    out, stack = [], []  # stack of [end_ps, index into out]
+    for mid, off, dur in sorted(events, key=lambda e: (e[1], -e[2])):
+        while stack and stack[-1][0] <= off:
+            stack.pop()
+        if stack:
+            out[stack[-1][1]][1] -= dur
+        out.append([mid, dur])
+        stack.append([off + dur, len(out) - 1])
+    return out
+
+
 def summarize(trace_dir: str, calls: int, top: int = 25) -> dict:
-    """``{"ops": [(name, us_per_call), ...], "modules": [...], "device_us": total}``."""
+    """``{"ops": [(name, self_us_per_call), ...], "modules": [...], "device_us": total}``."""
     files = glob.glob(os.path.join(trace_dir, "**", "*.xplane.pb"), recursive=True)
     if not files:
         return {"error": f"no .xplane.pb under {trace_dir}"}
@@ -108,7 +146,7 @@ def summarize(trace_dir: str, calls: int, top: int = 25) -> dict:
                 target = {"XLA Ops": ops, "XLA Modules": modules}.get(line_name)
                 if target is None:
                     continue
-                for mid, dur in events:
+                for mid, dur in _self_times(events):
                     target[names.get(mid, "?")] += dur
     per_call = lambda c: [(n, ps / 1e6 / calls) for n, ps in c.most_common(top)]
     return {
