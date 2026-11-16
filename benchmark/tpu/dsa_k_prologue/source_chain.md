@@ -54,6 +54,33 @@ S5 行格式绑定 expand/gather/attention；page 64 绑定 S1 fused kernel 与 
 
 - torch op 的 profile 多一个 `radix_topk_v2.call-done.2`（约 634 µs），JAX 侧没有这段等待。推测是异步 SparseCore 调用和下一块打分的重叠在 torch op 里丢了。留到性能优化阶段处理。
 
+## M4-S 结果：split FP8 KV 写入 + fp8-qk-pv exact attention（S5–S6）
+
+配置：Source FP8 交付路径（`fp8_e4m3` KV、split 布局、`fp8-qk-pv`，`DsaConfig.resolve` 选 `pipeline="split"`、`cache_read_mode="packed"`）。
+Ported-S 在 page 128 上用 2×64 页视图调用迁移的 Source 代码（`dsa_fp8_attention.py`、torch op `sglang_tpu_pallas::dsa_fp8_attention`）。
+单芯片 v7x，64 个 head，K=2048，bench `bench_fp8_attention_ab.py`。
+
+正确性（V）：
+- Ported-S（JAX）对 Source：三个用例（extend 2048、unaligned extend T=2000、decode b64）的 split KV cache（latent + RoPE）和 attention 输出都逐字节一致。
+- torch op 对 Ported-S JAX：三个用例输出和 cache 都逐字节一致。
+- dispatch 测试（`test_dsa_fp8_attention_dispatch.py`）：CPU 进程按 TPU7x 导出，prefill 和 decode 计划都含 `dsa_sparse_core_gather` 和 `dsa_tensor_core_attention_fp8`；不打补丁时导出报错，不会悄悄回退。
+
+耗时与精度（module 时间 µs；精度为相对同一 f64 参考的中位 / 最大相对误差，参考用未量化的 bf16 K/V）：
+
+| 用例 | Source | Ported-S JAX | Ported-S torch op | Target |
+|---|---|---|---|---|
+| extend 2048 | 34497，7.6% / 19.0% | 34510，逐字节一致 | 34497 | per-query 4407，6.1% / 9.7% |
+| unaligned extend | 33917，7.6% / 10.4% | 33915，逐字节一致 | 33896 | q-block 4286，6.4% / 11.7% |
+| decode b64 | 2091，7.9% / 13.0% | 2074，逐字节一致 | 1520 | per-query 777（取自 exp-rgqv6jaw33），6.5% / 9.3% |
+
+说明：
+- Target 是不同格式（FP8 E4M3 per-tensor，`k_scale=1`，TensorCore 布局），不做逐字节对比，只比耗时和对同一参考的误差。
+- Target extend 2048 的 q-block prefill kernel（`sparse_mla_prefill_qblock_tokens`）在 64 head 单芯片下 VMEM 不够（需要 93 MB，上限 64 MB），所以表中是它的 per-query kernel，工作量与其他几方相同。按每卡 4 个 head 跑 q-block 能编译，498 µs；每卡 4 head 是按 64 head / tp16 的假设（I），GLM-5.2 的实际 head 数在两边仓库里都没找到，且这个耗时只有 1/16 工作量，不能和 64 head 的行直接比。
+- Source 的 prefill 时间里约 25.7 ms 是一个 `gather_fusion`（`s32[4194304]`），decode 里同一个 op 约 718 µs；Source、Ported-S、torch op 三边一样，不是迁移引入的。根因未查。
+- JAX bench 里 decode 有两个整 cache 的 `copy`（约 540 µs），torch op 里 cache donate + alias 后就没有了；Target 的 decode 行也包含这两个 copy，去掉后约 240 µs（I）。
+- 结论：迁移的 Source attention 与 Source 完全一致；在这些形状上它比 Target 的 sparse MLA 慢约 8×（prefill）和约 2×（decode，按 1520 对 777 µs），精度相近、Target 略好。
+- 实验：exp-7kvikla8m9、exp-45eqx0fnzf、exp-rgqv6jaw33、exp-u4cubhb90c（提交 a7c795f）。
+
 ## 多机模型端到端（推迟到整个 DSA 迁完并完成整体对比之后）
 
 - 资源：GLM-5.2 FP8（约 762 GB）需要 2 台 tpu7x 主机、tp16（`benchmark/tpu/recipe/configs/glm_5_2/server.py`）。目前所有 Falcon manifest 都是单 pod（`2x2x1`），需要一个 2 主机 job。
@@ -67,3 +94,5 @@ S5 行格式绑定 expand/gather/attention；page 64 绑定 S1 fused kernel 与 
 - 01:00 在 exp-ey8mviy8ww 上测试：小文件（几字节、1 MB、20 MB）都传成功，各 40～76 s；随后重传 wheel，213 s 后 `connection reset by peer`。所以是大文件传输不通，小文件正常。
 - 本机 `falcon v0.1.0`（commit 9e69585，2026-06-11 构建）。
 - 可选办法：等传输服务恢复；或把 wheel 切成小于 20 MB 的分片分别传，在 pod 里拼接后校验 SHA256；或给 Falcon job 身份开 wheel 所在 GCS bucket 的读权限（manifest 已有 GCS 下载路径，同 `iam_grant_request.md`）。
+- 采用分片：wheel 切成 7 片（6×15 MB + 1×5 MB），M4-S manifest 在 pod 里拼接后校验 SHA256（提交 3a9a0a1 起）。之后 exp-7kvikla8m9、exp-45eqx0fnzf、exp-rgqv6jaw33、exp-u4cubhb90c 都成功，个别分片要重试 1～2 次。c1 和 c2 都可用。
+- 同一时段本机到 github.com 的连接也不稳定（`Empty reply from server`、443 连接超时），push 需要多次重试。
