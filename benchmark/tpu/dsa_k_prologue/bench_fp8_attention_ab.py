@@ -172,6 +172,80 @@ def reference_error(c, out, latent_u8, rope_u8, queries=24):
     return {"max_rel": float(np.max(errs)), "median_rel": float(np.median(errs))}
 
 
+def bf16_rows(c):
+    """f64 latent / rope per framework flat slot as the step leaves them, unquantized."""
+    lat = np.asarray(c["prefix_kv"], np.float64).copy()
+    rope = np.asarray(c["prefix_pe"], np.float64).copy()
+    for t in range(c["T"]):
+        s = c["seq"][t]
+        pos = c["kv"][s] - c["q_lens"][s] + (t - c["cu_q"][s])
+        slot = c["pi"][s * c["ppr"] + pos // FP] * FP + pos % FP
+        lat[slot] = np.asarray(c["kv_c"][t], np.float64)
+        rope[slot] = np.asarray(c["k_pe"][t], np.float64)
+    return lat, rope
+
+
+def error_vs_bf16(c, out, rows, queries=24):
+    """Max / median relative error of ``out`` vs f64 attention on the unquantized K/V.
+
+    One reference for every side, whatever its FP8 format (per-token scale for
+    Source, per-tensor ``k_scale`` for Target).
+    """
+    lat, rope = rows
+    out = np.asarray(out, np.float64)
+    errs = []
+    for t in np.linspace(0, c["T"] - 1, min(queries, c["T"])).astype(int):
+        s = c["seq"][t]
+        pos = c["topk"][t][c["topk"][t] >= 0]
+        tab = c["pi"][s * c["ppr"]:(s + 1) * c["ppr"]]
+        slots = tab[pos // FP] * FP + pos % FP
+        ql = np.asarray(c["q_latent"][t], np.float64)
+        qr = np.asarray(c["q_rope"][t], np.float64)
+        logits = (ql @ lat[slots].T + qr @ rope[slots].T) * float(c["sm_scale"])
+        p = np.exp(logits - logits.max(-1, keepdims=True))
+        p /= p.sum(-1, keepdims=True)
+        ref = p @ lat[slots]
+        errs.append(np.abs(out[t] - ref).max() / max(np.abs(ref).max(), 1e-30))
+    return {"max_rel": float(np.max(errs)), "median_rel": float(np.median(errs))}
+
+
+TARGET_K_SCALE = 1.0  # layer.k_scale_float default when the checkpoint has none
+
+
+def target_fns(c):
+    """Target's deployed sparse MLA step (FP8 per-tensor KV, TensorCore layout, page 128).
+
+    Prefill: ``sparse_mla_prefill_fused_tokens`` (head-major; the GLM-5.2 recipe
+    sets SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL=1). Decode:
+    ``sparse_mla_attention_fused``. The torch-side static quantization
+    (``_quantize_kv_to_fp8``) is included in the step.
+    """
+    import jax.numpy as jnp
+
+    from sglang_tpu.attention.pallas import mla_sparse_fused as mf
+
+    f8 = jnp.float8_e4m3fn
+    fmax = float(jnp.finfo(f8).max)
+    q8 = lambda x: jnp.clip(x.astype(jnp.float32) / TARGET_K_SCALE, -fmax, fmax).astype(f8)
+    prefill = c["mode"] == "prefill"
+
+    def fill(nope, rope, kv, pe, n, pages):
+        return mf._store_step(nope, rope, q8(kv), q8(pe), jnp.array([n], jnp.int32), pages,
+                              jnp.array([0, n], jnp.int32), jnp.array([0, 0, 1], jnp.int32))
+
+    def step(nope, rope, ql, qr, kvc, kpe, topk, kv_lens, pi, cuq, dist, sm):
+        kw = dict(sm_scale=float(c["sm_scale"]), k_scale=TARGET_K_SCALE)
+        if prefill:
+            out, nope, rope = mf.sparse_mla_prefill_fused_tokens(
+                ql.transpose(1, 0, 2), qr.transpose(1, 0, 2), q8(kvc), q8(kpe), nope, rope,
+                kv_lens, pi, cuq, dist, topk, **kw)
+            return out.transpose(1, 0, 2), nope, rope
+        return mf.sparse_mla_attention_fused(ql, qr, q8(kvc), q8(kpe), nope, rope, kv_lens, pi,
+                                             cuq, dist, topk, **kw)
+
+    return fill, step
+
+
 def stage_jax(a):
     os.environ.setdefault("JAX_PLATFORMS", "tpu")
     import jax
@@ -267,6 +341,29 @@ def stage_jax(a):
         row["cache_changed"] = not bool(np.array_equal(sl, lat0))
         row["source"]["accuracy"] = reference_error(c, so, sl, sr)
         row["ported_s_jax"]["accuracy"] = reference_error(c, po, pl_, pr)
+        # Target: its deployed FP8 sparse MLA (per-tensor k_scale, TensorCore
+        # layout). Different format and precision: labelled, no byte comparison.
+        # Every side is also scored against one f64 reference on unquantized K/V.
+        rows_bf = bf16_rows(c)
+        row["source"]["accuracy_vs_bf16"] = error_vs_bf16(c, so, rows_bf)
+        row["ported_s_jax"]["accuracy_vs_bf16"] = error_vs_bf16(c, po, rows_bf)
+        try:
+            fill, t_step = target_fns(c)
+            n = P * FP
+            tn, tr = jax.jit(fill, static_argnums=(4,))(
+                jnp.zeros((P, FP, 4, 128), jnp.uint8), jnp.zeros((P, FP // 4, 4, 128), jnp.uint8),
+                jnp.asarray(c["prefix_kv"]), jnp.asarray(c["prefix_pe"]), n,
+                jnp.arange(P, dtype=jnp.int32))
+            dist = jnp.asarray([c["S"]] * 3 if c["mode"] == "decode" else [0, 0, c["S"]],
+                               jnp.int32)
+            t_args = (tn, tr, j["q_latent"], j["q_rope"], j["kv_c"], j["k_pe"], j["topk"],
+                      j["kv"], j["pi"], j["cu_q"], dist, sm)
+            (to, _, _), row["target"] = timed(t_step, t_args, f"{name}_target")
+            row["target"]["format"] = "FP8 E4M3 per-tensor k_scale=1, TensorCore layout"
+            row["target"]["accuracy_vs_bf16"] = error_vs_bf16(c, np.asarray(to), rows_bf)
+            row["target"].pop("runs", None)
+        except Exception as e:  # report, do not hide
+            row["target"] = {"error": repr(e)[:3000]}
         for side in ("source", "ported_s_jax"):
             row[side].pop("runs", None)
         print("FP8ATT " + json.dumps(row), flush=True)
