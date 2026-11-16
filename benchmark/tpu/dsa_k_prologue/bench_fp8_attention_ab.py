@@ -212,13 +212,14 @@ def error_vs_bf16(c, out, rows, queries=24):
 TARGET_K_SCALE = 1.0  # layer.k_scale_float default when the checkpoint has none
 
 
-def target_fns(c):
-    """Target's deployed sparse MLA step (FP8 per-tensor KV, TensorCore layout, page 128).
+def target_fns(c, *, qblock=True):
+    """Target's sparse MLA step (FP8 per-tensor KV, TensorCore layout, page 128).
 
-    Prefill: ``sparse_mla_prefill_fused_tokens`` (head-major; the GLM-5.2 recipe
-    sets SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL=1). Decode:
-    ``sparse_mla_attention_fused``. The torch-side static quantization
-    (``_quantize_kv_to_fp8``) is included in the step.
+    Prefill with ``qblock``: ``sparse_mla_prefill_fused_tokens`` (head-major; the
+    GLM-5.2 recipe sets SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL=1; batches of
+    512+ tokens, a multiple of 128, take the query-blocked kernel). Without it,
+    and for decode: ``sparse_mla_attention_fused`` (the per-query kernel). The
+    torch-side static quantization (``_quantize_kv_to_fp8``) is in the step.
     """
     import jax.numpy as jnp
 
@@ -227,7 +228,7 @@ def target_fns(c):
     f8 = jnp.float8_e4m3fn
     fmax = float(jnp.finfo(f8).max)
     q8 = lambda x: jnp.clip(x.astype(jnp.float32) / TARGET_K_SCALE, -fmax, fmax).astype(f8)
-    prefill = c["mode"] == "prefill"
+    prefill = c["mode"] == "prefill" and qblock
 
     def fill(nope, rope, kv, pe, n, pages):
         return mf._store_step(nope, rope, q8(kv), q8(pe), jnp.array([n], jnp.int32), pages,
@@ -358,12 +359,35 @@ def stage_jax(a):
                                jnp.int32)
             t_args = (tn, tr, j["q_latent"], j["q_rope"], j["kv_c"], j["k_pe"], j["topk"],
                       j["kv"], j["pi"], j["cu_q"], dist, sm)
-            (to, _, _), row["target"] = timed(t_step, t_args, f"{name}_target")
-            row["target"]["format"] = "FP8 E4M3 per-tensor k_scale=1, TensorCore layout"
-            row["target"]["accuracy_vs_bf16"] = error_vs_bf16(c, np.asarray(to), rows_bf)
-            row["target"].pop("runs", None)
+            fmt = "FP8 E4M3 per-tensor k_scale=1, TensorCore layout"
+            try:
+                (to, _, _), row["target"] = timed(t_step, t_args, f"{name}_target")
+                row["target"]["format"] = fmt
+                row["target"]["kernel"] = "qblock" if c["mode"] == "prefill" else "per-query"
+                row["target"]["accuracy_vs_bf16"] = error_vs_bf16(c, np.asarray(to), rows_bf)
+                row["target"].pop("runs", None)
+            except Exception as e:  # q-block VMEM limit at 64 heads on one chip
+                row["target"] = {"error": repr(e)[:400]}
+                if c["mode"] != "prefill":
+                    raise
+                # (a) Target's per-query kernel, all heads: same work as the other sides.
+                _, pq_step = target_fns(c, qblock=False)
+                (to, _, _), r = timed(pq_step, t_args, f"{name}_target_perquery")
+                r.update(format=fmt, kernel="per-query (q-block did not compile)",
+                         accuracy_vs_bf16=error_vs_bf16(c, np.asarray(to), rows_bf))
+                r.pop("runs", None)
+                row["target_perquery"] = r
+                # (b) q-block at the per-chip head count the deployment would see
+                # (--target-heads, an assumption: heads / tp). Less work per call;
+                # not comparable in time with the 64-head rows.
+                h = a.target_heads
+                qb_args = (t_args[:2] + (t_args[2][:, :h], t_args[3][:, :h]) + t_args[4:])
+                (_, _, _), r = timed(t_step, qb_args, f"{name}_target_qblock_h{h}")
+                r.update(format=fmt, kernel=f"qblock, {h} heads per chip (assumed)")
+                r.pop("runs", None)
+                row["target_qblock_per_chip"] = r
         except Exception as e:  # report, do not hide
-            row["target"] = {"error": repr(e)[:3000]}
+            row.setdefault("target", {})["error2"] = repr(e)[:3000]
         for side in ("source", "ported_s_jax"):
             row[side].pop("runs", None)
         print("FP8ATT " + json.dumps(row), flush=True)
@@ -425,6 +449,8 @@ def main():
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--xprof-dir", default="")
     p.add_argument("--npz-dir", default="")
+    # Per-chip attention heads for the q-block retry (heads / tp; 64 / 16 = 4).
+    p.add_argument("--target-heads", type=int, default=4)
     p.add_argument("--source-root", default="/tmp/source/m4s")
     a = p.parse_args()
     if a.npz_dir:
