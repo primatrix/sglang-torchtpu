@@ -1,4 +1,4 @@
-name: glm52-dsa-chain-diag-PINSHA
+name: glm52-dsa-hlo-PINSHA
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: gke-tpu-train-us-central1-1-prod
@@ -82,19 +82,24 @@ role_to_task_spec:
       if [ "$(sha $SRC_K)" != "$SRC_K_SHA" ] || [ "$(sha $SRC_Q)" != "$SRC_Q_SHA" ] || [ "$(sha $SRC_TAR)" != "$SRC_TAR_SHA" ]; then echo "Source file missing or SHA256 mismatch"; exit 2; fi
       mkdir -p /tmp/source/m3s && tar -xf "$SRC_TAR" -C /tmp/source/m3s
       rc=0
-      # Chain diagnosis: stage-wise torch ops vs JAX (default / highest matmul
-      # precision) on unaligned extend, aligned extend as the control.
+      # HLO comparison: unaligned extend only; each side dumps its optimized HLO.
       D=benchmark/tpu/dsa_k_prologue/bench_chain_diag.py
-      $PY $D --stage torch --npz-dir "$OUT/d" --xprof-dir "$OUT/xprof" > "$OUT/d_torch.log" 2>&1 || rc=1
-      echo "==== D TORCH (rc=$rc)"
-      grep '^DTORCH ' "$OUT/d_torch.log" | cut -c1-3000
-      grep -E 'Traceback|Error' "$OUT/d_torch.log" | head -n 20
-      if [ $rc = 0 ]; then
-        $PY $D --stage jax --npz-dir "$OUT/d" --xprof-dir "$OUT/xprof" > "$OUT/d_jax.log" 2>&1 || rc=1
-      fi
-      echo "==== D (rc=$rc)"
-      grep '^DIAG ' "$OUT/d_jax.log" 2>/dev/null | cut -c1-6000 || tail -n 40 "$OUT/d_jax.log"
-      grep -E 'Traceback|Error' "$OUT/d_jax.log" 2>/dev/null | head -n 20
+      DUMP="--xla_dump_to=DIR --xla_dump_hlo_as_text --xla_dump_hlo_pass_re=^$"
+      for side in torch jax; do
+        mkdir -p "$OUT/hlo_$side"
+        F="${DUMP//DIR/$OUT/hlo_$side}"
+        XLA_FLAGS="$F" LIBTPU_INIT_ARGS="$F" $PY $D --stage $side --cases extend_unaligned --iters 2 \
+          --npz-dir "$OUT/d" --xprof-dir "$OUT/xprof" > "$OUT/d_$side.log" 2>&1 || rc=1
+        echo "==== $side (rc=$rc) dumps=$(ls "$OUT/hlo_$side" | wc -l) after_opt=$(ls "$OUT/hlo_$side" | grep -c after_optimizations)"
+        grep -E 'Traceback|Error' "$OUT/d_$side.log" | head -n 10
+      done
+      grep '^DIAG ' "$OUT/d_jax.log" | cut -c1-1500
+      H=benchmark/tpu/dsa_k_prologue/hlo_compare.py
+      echo "==== HLO query tail (f32[2000,32,128] + bf16[2000,32,32])"
+      $PY $H "$OUT/hlo_torch" "$OUT/hlo_jax" 'f32[2000,32,128]' 'bf16[2000,32,32]' 2>&1 | head -n 140
+      echo "==== HLO key store (bf16[2000,128] + f8e4m3fn)"
+      $PY $H "$OUT/hlo_torch" "$OUT/hlo_jax" 'bf16[2000,128]' 'f8e4m3fn' 2>&1 | head -n 140
+      tar -czf "$OUT/hlo_dumps.tgz" -C "$OUT" hlo_torch hlo_jax 2>/dev/null || true
       exit $rc
     replica: 1
     image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
