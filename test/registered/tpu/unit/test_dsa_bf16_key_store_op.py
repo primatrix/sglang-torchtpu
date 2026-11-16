@@ -156,47 +156,5 @@ class TestDecodeDispatch(unittest.TestCase):
         self.assertEqual(kernel.call_args.args[9].tolist(), [2 * _PAGE + 9, 3 * _PAGE + 5])
 
 
-class TestDecodeDispatchUnderCpuExport(unittest.TestCase):
-    """Decode must reach the source kernel when JAX runs on the CPU backend.
-
-    The op exports with ``JAX_PLATFORMS=cpu``; a backend check copied from the
-    source sent decode to the XLA chain there, and the slot-level op test above
-    still passed because both paths write the same slots.
-    """
-
-    def test_decode_calls_the_token_slots_kernel(self):
-        from unittest import mock
-
-        import jax
-        import jax.numpy as jnp
-
-        from sglang_tpu.attention.pallas import dsa_bf16_key_store as ks
-
-        self.assertEqual(jax.default_backend(), "cpu")
-        cache = jnp.zeros((4, _PAGE, _D), jnp.bfloat16)
-        kernel = mock.Mock(return_value=cache)
-        with mock.patch.object(ks, "fused_fp8_k_projection_scatter_pallas", kernel):
-            ks.store_index_keys_bf16(
-                cache,
-                jnp.zeros((2, _HIDDEN), jnp.bfloat16),
-                jnp.zeros((_D, _HIDDEN), jnp.float8_e4m3fn),
-                jnp.ones((_D,), jnp.float32),
-                jnp.ones((_D,), jnp.bfloat16),
-                jnp.zeros((_D,), jnp.bfloat16),
-                jnp.ones((2, 32), jnp.bfloat16),
-                jnp.zeros((2, 32), jnp.bfloat16),
-                ks.hadamard_128(),
-                jnp.array([10, 70], jnp.int32),  # kv_lens
-                jnp.array([2, 0, 1, 3], jnp.int32),  # page tables [2, 0] and [1, 3]
-                jnp.array([0, 1, 2], jnp.int32),
-                jnp.array([0, 128], jnp.int32),
-                one_token_per_seq=True,
-            )
-        self.assertEqual(kernel.call_count, 1)
-        self.assertTrue(kernel.call_args.kwargs["token_slots"])
-        # Request 0: position 9 on page 2; request 1: position 69 -> page 3, slot 5.
-        self.assertEqual(kernel.call_args.args[9].tolist(), [2 * _PAGE + 9, 3 * _PAGE + 5])
-
-
 if __name__ == "__main__":
     unittest.main()
