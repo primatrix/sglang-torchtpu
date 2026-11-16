@@ -481,8 +481,14 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         return build_dsa_index_topk_fused_key_op()
 
     def index_page_size(self, layer_id: int) -> int:
-        """Tokens per page of the index-key cache (``[P, page // 4, 4, record]``)."""
+        """Tokens per page of the index-key cache.
+
+        FP8 records are ``u8[P, page // 4, 4, record]``; the source-contract
+        bf16 cache (SGLANG_TPU_DSA_BF16_INDEXER) is ``bf16[P, page, 128]``.
+        """
         cache = self.token_to_kv_pool.get_index_key_cache(layer_id)
+        if cache.dtype == torch.bfloat16:
+            return cache.shape[1]
         return cache.shape[1] * cache.shape[2]
 
     def index_topk_fused_key(
@@ -544,6 +550,60 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         if rows.shape[0] != num_tokens:
             rows = rows[:num_tokens].contiguous()
         return rows
+
+    def index_topk_bf16(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        query: torch.Tensor,  # bf16[num_tokens, 32, 128], the wq_b output
+        hidden: torch.Tensor,  # bf16[num_tokens, hidden]; the indexer's input
+        rope_cos: torch.Tensor,  # bf16[num_tokens, 32]
+        rope_sin: torch.Tensor,  # bf16[num_tokens, 32]
+        head_weights: torch.Tensor,  # [num_tokens, 32], weights_proj output
+        params: dict,  # from bf16_indexer_params
+        prefill: bool,
+        decode: bool,
+    ) -> torch.Tensor:
+        """Source-contract indexer (SGLANG_TPU_DSA_BF16_INDEXER): store, score, top-k.
+
+        Same row format as ``index_topk`` (sequence-local positions, ``-1``
+        padded). The op runs the migrated source key store, query tail and
+        scorer on the bf16 ``[P, 128, 128]`` cache (dsa_bf16_indexer.py). No
+        indexer token split yet: with attention TP > 1 every rank scores every
+        row.
+        """
+        from sglang_tpu.dsa_bf16_indexer_op import build_dsa_bf16_indexer_op
+
+        # The source's Sylvester H128 * 128**-0.5, f32; built with torch ops like
+        # the fused-key params, so it traces into the graph.
+        hadamard = torch.ones((1, 1), dtype=torch.float32, device=query.device)
+        while hadamard.shape[0] < 128:
+            hadamard = torch.cat(
+                [torch.cat([hadamard, hadamard], 1), torch.cat([hadamard, -hadamard], 1)], 0
+            )
+        hadamard = hadamard * 128**-0.5
+        metadata = self.forward_metadata
+        return build_dsa_bf16_indexer_op()(
+            self.token_to_kv_pool.get_index_key_cache(layer_id),
+            hidden.contiguous(),
+            params["wk"],
+            params["wk_scale"],
+            params["norm_weight"],
+            params["norm_bias"],
+            query.contiguous(),
+            rope_cos,
+            rope_sin,
+            head_weights.contiguous(),
+            self._kv_lens(forward_batch),
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            hadamard,
+            self._topk,
+            prefill,
+            decode,
+        )
 
     def _index_topk_token_split(
         self,

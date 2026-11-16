@@ -1355,6 +1355,13 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         layer_bytes = cls.NOPE_BYTES + cls.LANE_BYTES
         return len(index_key_layers) * layer_bytes + sum(index_key_layers) * index_bytes
 
+    @staticmethod
+    def bf16_index_keys() -> bool:
+        """Whether index keys are the source indexer's bf16 rows (SGLANG_TPU_DSA_BF16_INDEXER)."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        return tpu_envs.SGLANG_TPU_DSA_BF16_INDEXER.get()
+
     @classmethod
     def index_key_record_bytes(cls, index_head_dim: int) -> int:
         """Bytes one token's index key takes in the cache.
@@ -1382,12 +1389,32 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             self.TOKENS_PER_ROW,
             self.LANE_BYTES,
         )
-        index_key_shape = (
-            self.num_pages,
-            rows_per_page // self._index_kpool,
-            self.TOKENS_PER_ROW,
-            self.index_key_record_bytes(self._index_head_dim),
-        )
+        if self.bf16_index_keys():
+            # SGLANG_TPU_DSA_BF16_INDEXER: the source indexer's bf16 keys,
+            # [num_pages, page_size, index_head_dim] (dsa_bf16_indexer.py views
+            # a 128-token page as two 64-token pages). 256 bytes per token, the
+            # same as an FP8 record, so bytes_per_token is unchanged.
+            if (
+                self._index_kpool != 1
+                or self._index_head_dim != 128
+                or self.page_size != 128
+            ):
+                raise ValueError(
+                    "SGLANG_TPU_DSA_BF16_INDEXER supports index_kpool 1, "
+                    "index_head_dim 128 and page_size 128 only; got "
+                    f"kpool={self._index_kpool}, head_dim={self._index_head_dim}, "
+                    f"page_size={self.page_size}."
+                )
+            index_key_shape = (self.num_pages, self.page_size, self._index_head_dim)
+            index_key_dtype = torch.bfloat16
+        else:
+            index_key_shape = (
+                self.num_pages,
+                rows_per_page // self._index_kpool,
+                self.TOKENS_PER_ROW,
+                self.index_key_record_bytes(self._index_head_dim),
+            )
+            index_key_dtype = torch.uint8
         logger.info(
             "Allocating split TPU MLA KV buffers: layers=%d, nope=%s, rope=%s, "
             "index keys=%s on %d layers",
@@ -1409,7 +1436,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         ]
         self.index_key_buffer = [
             (
-                _zeros_kv_buffer(index_key_shape, torch.uint8, self.device)
+                _zeros_kv_buffer(index_key_shape, index_key_dtype, self.device)
                 if has_indexer
                 else None
             )

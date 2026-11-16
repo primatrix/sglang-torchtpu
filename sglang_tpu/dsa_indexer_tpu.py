@@ -16,6 +16,7 @@ them to the op. This module keeps no state except the registered op.
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang_tpu.attention_pallas_mla_sparse import TpuPallasSparseMlaAttnBackend
+
+logger = logging.getLogger(__name__)
 
 _PALLAS_DSA_INDEX_TOPK_OP = None
 _PALLAS_DSA_KPOOL_TOPK_OP = None
@@ -554,6 +557,81 @@ def fused_key_rope_tables(indexer: "Indexer", positions: torch.Tensor):
     return cos.to(torch.bfloat16).contiguous(), sin.to(torch.bfloat16).contiguous()
 
 
+_SOURCE_K_NORM_EPS = 1e-5  # fused_fp8_k_projection_scatter.py, GlmNorm
+_BF16_PARAMS_ATTR = "_sglang_tpu_bf16_indexer_params"
+
+
+def bf16_indexer_params(indexer: "Indexer"):
+    """The source-contract indexer's weights for ``indexer``, or None (switch off).
+
+    A trace-time check, cached on the indexer. With SGLANG_TPU_DSA_BF16_INDEXER
+    the index-key cache is bf16 for every batch, so a model the source chain
+    does not cover is an error, not a fallback to the FP8 chain.
+    """
+    from sglang.srt.layers.layernorm import LayerNorm
+    from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
+
+    if not TpuSplitMLATokenToKVPool.bf16_index_keys():
+        return None
+    wk = indexer.wk
+    weight = getattr(wk, "weight", None)
+    scale = getattr(wk, "weight_scale", None)
+    problems = [
+        name
+        for name, bad in (
+            ("skip_rope", indexer.skip_rope),
+            ("neox rope", indexer.is_neox_style),
+            ("head_dim != 128", indexer.head_dim != 128),
+            ("n_heads != 32", indexer.n_heads != 32),
+            ("rope_head_dim != 64", indexer.rope_head_dim != 64),
+            ("fused wk_weights_proj", getattr(indexer, "use_dsa_indexer_fusion", False)),
+            ("k_norm is not LayerNorm", not isinstance(indexer.k_norm, LayerNorm)),
+            ("wk is not FP8", weight is None or weight.dtype != torch.float8_e4m3fn),
+            ("wk has a bias", getattr(wk, "bias", None) is not None),
+            ("wk scale not per channel", scale is None or scale.numel() != indexer.head_dim),
+            ("no cos_sin_cache", not hasattr(indexer.rotary_emb, "cos_sin_cache")),
+        )
+        if bad
+    ]
+    if problems:
+        raise ValueError(
+            "SGLANG_TPU_DSA_BF16_INDEXER covers GLM-5.2's indexer only: " + ", ".join(problems)
+        )
+    eps = float(indexer.k_norm.variance_epsilon)
+    if eps != _SOURCE_K_NORM_EPS:
+        logger.warning(
+            "SGLANG_TPU_DSA_BF16_INDEXER: k_norm eps is %g, the source kernel uses %g.",
+            eps, _SOURCE_K_NORM_EPS,
+        )
+    params = dict(
+        # The source kernel takes wk as [128, hidden]; transposed once, here.
+        wk=weight.t().contiguous(),
+        wk_scale=scale.reshape(-1).float().contiguous(),
+        # The source keeps the LayerNorm parameters in bf16.
+        norm_weight=indexer.k_norm.weight.to(torch.bfloat16).contiguous(),
+        norm_bias=indexer.k_norm.bias.to(torch.bfloat16).contiguous(),
+    )
+    setattr(indexer, _BF16_PARAMS_ATTR, params)
+    return params
+
+
+def bf16_indexer_modes(mode) -> tuple[bool, bool]:
+    """``(prefill, decode)`` of the source-contract indexer op for a forward mode.
+
+    ``prefill`` is the source's ``is_dsa_prefill`` (glm5_moe / dsa_config): an
+    extend that is not draft extend, target verify or mixed. It selects the
+    fused query tail. ``decode`` selects the one-token-per-request key store and
+    scorer; every other mode (verify, mixed, draft extend) runs as extend.
+    """
+    prefill = (
+        mode.is_extend()
+        and not mode.is_draft_extend_v2()
+        and not mode.is_target_verify()
+        and not mode.is_mixed()
+    )
+    return prefill, mode.is_decode()
+
+
 def indexer_forward(
     indexer: "Indexer",
     *,
@@ -574,6 +652,27 @@ def indexer_forward(
     """
     query, _ = indexer.wq_b(q_lora)
     query = query.view(-1, indexer.n_heads, indexer.head_dim)
+
+    # Source-contract indexer (SGLANG_TPU_DSA_BF16_INDEXER): the index-key
+    # cache is bf16 for every batch, so every forward mode takes this op.
+    bf16_params = bf16_indexer_params(indexer)
+    if bf16_params is not None:
+        prefill, decode = bf16_indexer_modes(forward_batch.forward_mode)
+        rope_cos, rope_sin = fused_key_rope_tables(indexer, positions)
+        # Head weights as weights_proj produces them: the source applies no factor.
+        head_weights, _ = indexer.weights_proj(x)
+        return backend.index_topk_bf16(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            query=query,
+            hidden=x,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            head_weights=head_weights,
+            params=bf16_params,
+            prefill=prefill,
+            decode=decode,
+        )
 
     # Fused key prologue (SGLANG_TPU_DSA_FUSED_KEY_PROLOGUE): extend batches
     # compute and store the index keys inside the op. Decode and verify keep

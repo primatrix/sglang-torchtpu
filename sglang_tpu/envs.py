@@ -304,6 +304,13 @@ class TpuEnvs:
     # dsa_key_prologue.py), others the same chain in XLA. Not bit-exact with the
     # torch chain (FP8 dot rounding); see test_dsa_key_prologue.py.
     SGLANG_TPU_DSA_FUSED_KEY_PROLOGUE = EnvBool(False)
+    # DSA indexer: run the migrated source indexer (sglang-jax-private c948bdd;
+    # attention/pallas/dsa_bf16_indexer.py): bf16 index keys with Hadamard,
+    # W8A16 wk, radix top-k, on 128-token pages split into the source's 64.
+    # The pool then stores bf16 [P, 128, 128] index keys instead of FP8
+    # records, so every forward mode runs this op. GLM-5.2 layout only
+    # (kpool 1, head_dim 128, page 128); other models fail at startup.
+    SGLANG_TPU_DSA_BF16_INDEXER = EnvBool(False)
     # SparseCore top-k (dsv4/sparsecore_topk.py): when every row's valid prefix fits
     # one slice, run a single pass over the narrowest 4096-wide bucket instead of the
     # partitioned top-k; long-context pools pad rows to the max context. Selects the
