@@ -1,4 +1,4 @@
-name: glm52-dsa-wiring-PINSHA-c2
+name: glm52-dsa-fwd-PINSHA-c2
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: gke-tpu-train-us-central1-2-prod
@@ -100,6 +100,12 @@ role_to_task_spec:
         $PY $B --stage jax --npz-dir "$OUT/b" > "$OUT/b_jax.log" 2>&1 || rc=1
       fi
       echo "==== B (rc=$rc)"; grep '^BJAX ' "$OUT/b_jax.log" 2>/dev/null || tail -n 40 "$OUT/b_jax.log" 2>/dev/null
+      FW=benchmark/tpu/dsa_k_prologue/check_bf16_indexer_forward.py
+      frc=0
+      SGLANG_TPU_DSA_BF16_INDEXER=1 $PY $FW > "$OUT/fwd.log" 2>&1 || frc=1
+      echo "==== FWD (rc=$frc)"; grep -E '^(FWD|REJECT)' "$OUT/fwd.log" | cut -c1-1500
+      [ $frc = 0 ] || tail -n 40 "$OUT/fwd.log"
+      [ $frc = 0 ] || rc=1
       echo "==== TESTS (rc=$trc)"
       [ $trc = 0 ] || rc=1
       exit $rc

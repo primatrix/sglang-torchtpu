@@ -44,3 +44,10 @@ S5 行格式绑定 expand/gather/attention；page 64 绑定 S1 fused kernel 与 
 ### S1–S4 串联：extend 2048 下 torch op 多约 634 µs `radix_topk_v2` 等待
 
 - torch op 的 profile 多一个 `radix_topk_v2.call-done.2`（约 634 µs），JAX 侧没有这段等待。推测是异步 SparseCore 调用和下一块打分的重叠在 torch op 里丢了。留到性能优化阶段处理。
+
+## 多机模型端到端（推迟到整个 DSA 迁完并完成整体对比之后）
+
+- 资源：GLM-5.2 FP8（约 762 GB）需要 2 台 tpu7x 主机、tp16（`benchmark/tpu/recipe/configs/glm_5_2/server.py`）。目前所有 Falcon manifest 都是单 pod（`2x2x1`），需要一个 2 主机 job。
+- 权重：`gs://inference-model-storage-sgl/model_scope/GLM5.2-fp8-channel-wise`。Falcon pod 读同一 bucket 里的 wheel 时一直回退到 `falcon exp cp`，大概率也读不了权重；`falcon exp cp` 不适合 762 GB。需要给 Falcon job 的身份开该 bucket 的读权限（类似 `iam_grant_request.md`）。
+- 对比方式：同一 recipe 分别以 `SGLANG_TPU_DSA_BF16_INDEXER=1` 和关闭运行，比较输出质量和吞吐。
+- 在此之前用单层或小模型验证 `indexer_forward` 的真实调用路径。
