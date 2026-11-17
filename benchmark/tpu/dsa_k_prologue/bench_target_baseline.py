@@ -30,6 +30,19 @@ from check_physical_topk import to_physical  # noqa: E402
 
 FP = att.FP = 64  # the PR 2198 baseline page size
 CASES = ("pr2198_extend_c1", "pr2198_extend_c2", "pr2198_verify_b4", "pr2198_decode_b4")
+# Op categories of the Target attention step (first match wins; the rest is
+# "other", whose largest ops are listed so nothing hides in it).
+CATEGORIES = [
+    ("tc_attention", ("MLA-tensorcore",)),
+    ("sc_gather", ("sc_dsa_gather", "sparse-core-data-format")),
+    ("page_lookup", ("gather_page_ids",)),
+    ("kv_store", ("scatter",)),
+    ("q_prep", ("q_hbm_ref", "concatenate")),
+    ("out_slice", ("slice",)),
+    ("copy", ("copy",)),
+]
+
+from xplane_summary import breakdown  # noqa: E402
 
 
 def stage_prep(a):
@@ -108,6 +121,11 @@ def stage_torch(a):
                                     f"{a.xprof_dir}/base_{side}_{name}")
                     r["module_us"] = round(sum(u for _, u in prof.get("modules", [])), 1)
                     r["top_ops"] = [(n[:60], round(u, 1)) for n, u in prof.get("ops", [])[:8]]
+                    try:
+                        r["breakdown"] = breakdown(f"{a.xprof_dir}/base_{side}_{name}",
+                                                   a.iters, CATEGORIES)
+                    except Exception as e:  # report, do not hide
+                        r["breakdown"] = {"error": repr(e)[:500]}
             except Exception as e:  # report, do not hide; the other variants still run
                 r = {"error": repr(e)[:2000]}
             row[side] = r

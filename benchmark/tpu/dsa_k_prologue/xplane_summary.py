@@ -127,6 +127,71 @@ def _self_times(events):
     return out
 
 
+def _union_ps(events):
+    """Busy time of a line: the union of its events' [offset, offset + duration)."""
+    total, end = 0, None
+    for _, off, dur in sorted(events, key=lambda e: e[1]):
+        if end is None or off > end:
+            total += dur
+            end = off + dur
+        elif off + dur > end:
+            total += off + dur - end
+            end = off + dur
+    return total
+
+
+def breakdown(trace_dir: str, calls: int, categories) -> dict:
+    """Device time split by op category, plus every TPU line's busy time.
+
+    ``categories`` is ``[(label, substrings)]``; an op goes to the first label
+    whose substring its name contains, else ``other``. Per call:
+
+    * ``categories``: self time on "XLA Ops" per label, and the 12 largest ops
+      of ``other`` so unmatched ops show up instead of hiding in the total.
+    * ``lines``: busy time (union of events) of every line of every TPU plane,
+      so SparseCore lines are visible next to the TensorCore ones.
+    * ``module_span_us``: busy time of "XLA Modules"; ``ops_busy_us``: busy time
+      of "XLA Ops". ``module_span_us - ops_busy_us`` is device time with no op on
+      the TensorCore op line (waits on async SparseCore work, gaps).
+    """
+    files = glob.glob(os.path.join(trace_dir, "**", "*.xplane.pb"), recursive=True)
+    if not files:
+        return {"error": f"no .xplane.pb under {trace_dir}"}
+    cats = collections.Counter()
+    other = collections.Counter()
+    lines = collections.Counter()
+    module_ps = ops_busy_ps = 0
+    for path in files:
+        with open(path, "rb") as f:
+            data = memoryview(f.read())
+        for plane_name, names, plane_lines in _planes(data):
+            if not plane_name.startswith("/device:TPU"):
+                continue
+            for line_name, events in plane_lines:
+                busy = _union_ps(events)
+                lines[f"{plane_name} | {line_name}"] += busy
+                if line_name == "XLA Modules":
+                    module_ps += busy
+                if line_name != "XLA Ops":
+                    continue
+                ops_busy_ps += busy
+                for mid, dur in _self_times(events):
+                    name = names.get(mid, "?")
+                    label = next((lb for lb, subs in categories
+                                  if any(s in name for s in subs)), "other")
+                    cats[label] += dur
+                    if label == "other":
+                        other[name[:70]] += dur
+    us = lambda ps: round(ps / 1e6 / calls, 1)
+    return {
+        "categories": {k: us(v) for k, v in cats.most_common()},
+        "other_top": [(n, us(v)) for n, v in other.most_common(12)],
+        "lines": {k: us(v) for k, v in lines.most_common() if v},
+        "module_span_us": us(module_ps),
+        "ops_busy_us": us(ops_busy_ps),
+    }
+
+
 def summarize(trace_dir: str, calls: int, top: int = 25) -> dict:
     """``{"ops": [(name, self_us_per_call), ...], "modules": [...], "device_us": total}``."""
     files = glob.glob(os.path.join(trace_dir, "**", "*.xplane.pb"), recursive=True)

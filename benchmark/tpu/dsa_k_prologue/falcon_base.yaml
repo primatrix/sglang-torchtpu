@@ -76,7 +76,7 @@ role_to_task_spec:
       echo "==== PREP (rc=$rc)"; grep '^PREP' "$OUT/att_prep.log"
       [ $rc = 0 ] || { tail -n 60 "$OUT/att_prep.log"; exit 1; }
       $PY $A --stage torch --npz-dir "$OUT/att" --xprof-dir "$OUT/xprof" > "$OUT/att_torch.log" 2>&1 || rc=1
-      echo "==== BASE (rc=$rc)"; grep -E '^BASE' "$OUT/att_torch.log" | cut -c1-4000
+      echo "==== BASE (rc=$rc)"; grep -E '^BASE' "$OUT/att_torch.log" | cut -c1-8000
       [ $rc = 0 ] || tail -n 60 "$OUT/att_torch.log"
       exit $rc
     replica: 1
