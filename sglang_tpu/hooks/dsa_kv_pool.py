@@ -38,6 +38,7 @@ def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
         ],
         index_kpool=kpool,
         raw_ring=kpool_raw_ring_pages(page_size=1, kpool=kpool) > 0,
+        page_size=kvc.pool_page_size,
     )
 
 
