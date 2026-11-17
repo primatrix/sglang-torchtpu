@@ -168,6 +168,74 @@ device module 时间，µs：
 - 选择偏差（对各自 indexer 的 f64 精确分，最大值）：Ported-S 0.11%-0.24%，超过 2% 的比例 0；Target 1.9%-2.3%，超过 2% 的比例 0-22%。Target 与 Ported-S 选中行的重合度 3%-9%（随机输入，长 context 下分数更平）。
 - attention 中位相对误差（对未量化 K/V 的 f64 参考）：Ported-S 6.7%-7.6%，Target 5.2%-6.6%。
 
+## 只比 attention（S5–S6），PR 2198 形状，page 64
+
+分工：indexer 由同事负责，这里只比 attention。两边喂同一份 top-k（固定种子，每个 query 2048 个合法位置；Ported-S 拿物理 slot，Target 拿对应的序列内位置），计时包含本步 KV 写入和 sparse attention，device module 时间。page 64 与基线一致。Target 是 per-query `sparse_mla_attention_fused`（基线未开 q-block），用它自己的 per-tensor FP8 writer 存同一份 bf16 KV。精度是对未量化 K/V 的 f64 参考（中位 / 最大相对误差）。
+
+与同事约定的接口（待确认）：indexer 输出物理 slot，`int32[T, 2048]`，合法位置在前，-1 补齐；selected_counts 由 attention 用 `sum(slot >= 0)` 自己算。
+
+### Ported-S torch op 对 Target（exp-n36aegubhd，提交 c7abac3）
+
+| 用例 | Ported-S torch op | Target | 差距 |
+|---|---|---|---|
+| extend_c1 | 8650 | 4324 | 慢 2.0x |
+| extend_c2 | 8650 | 4329 | 慢 2.0x |
+| verify_b4 | 170 | 138 | 慢 1.23x |
+| decode_b4 | 82 | 65 | 慢 1.27x |
+
+- 整层对比里 verify 快 2.9x 的优势来自 indexer，attention 本身四个形状都慢。
+- 时间几乎都在 TensorCore 的 `dsa_tensor_core_attention_fp8_qkv`：extend 8 个 microbatch × 约 967 us；verify 2 × 44 us；decode 2 × 17.5 us。SparseCore gather 和 KV scatter 都很小。
+- 精度：中位 Ported-S 6.7%-7.4%，Target 5.0%-7.1%；最大 Ported-S 11%-16%，Target 6%-11%。
+
+### Ported-S tile 扫参（exp-jjvj9ehmuc，提交 d0d2616，JAX）
+
+默认 tile 一组与上一轮一致（8640 / 171 / 81 us）。所有 tile 的误差不变。
+
+| 用例 | 默认 tile → us | 最优 tile → us | Target |
+|---|---|---|---|
+| extend_c1 | (256,16,256) → 8640 | (128,8,1024) → 7445 | 4324 |
+| verify_b4 | (12,12,256) → 171 | (8,8,1024) → 160 | 138 |
+| decode_b4 | (2,1,256) → 81 | (4,4,1024) → 62 | 65 |
+
+- `b_topk` 512 / 1024 普遍比 256 快约 10%（`bq=8, b_topk=512` 例外）。
+- extend 下 `bq_sparse` 128 时 gather 15-20 us，256 时约 126 us，512 时约 714 us，后两者不再被 TensorCore 盖住。
+- decode 把 4 行合成一批后 TensorCore 从 38 降到 14 us。
+- extend 最优 tile 下 TensorCore 仍约 6.66 ms，调 tile 只省约 14%。
+- 默认 tile 未改。
+
+### Source 三种 attention 精度模式对 Target（exp-8k6uuavutl，提交 569f382）
+
+Source 原生路径（`DsaConfig.resolve` + `_run_exact`，默认 tile），同一份 split FP8 KV（per-token scale）、同样的 Q / KV / slot。bf16 extend 先 `expand_fp8_cache_pallas` 展开再走 HLO-overlap，展开耗时计入；bf16 verify / decode 直接读 packed FP8 在 kernel 里反量化。cache 页数为对齐 bf16 展开补了一页。
+
+耗时（us）：
+
+| 用例 | fp8-qk-pv | fp8-qk | bf16 | Target |
+|---|---|---|---|---|
+| extend_c1 | 8628 | 9195 | 8068 | 4293 |
+| extend_c2 | 8628 | 9196 | 8092 | 4290 |
+| verify_b4 | 156 | 164 | 287 | 115 |
+| decode_b4 | 81.5 | 81.3 | 102 | 57.6 |
+
+精度（中位 / 最大）：
+
+| 用例 | fp8-qk-pv | fp8-qk | bf16 | Target |
+|---|---|---|---|---|
+| extend_c1 | 6.9% / 16.5% | 7.0% / 17.0% | 5.8% / 8.3% | 7.1% / 10.4% |
+| extend_c2 | 7.4% / 13.4% | 7.4% / 13.4% | 6.6% / 11.5% | 5.6% / 11.1% |
+| verify_b4 | 7.3% / 15.3% | 7.2% / 14.6% | 5.4% / 9.8% | 6.0% / 8.5% |
+| decode_b4 | 6.7% / 11.2% | 6.7% / 11.2% | 5.7% / 7.1% | 5.0% / 5.7% |
+
+- 三种模式在四个形状上都比 Target 慢。
+- fp8-qk 比 fp8-qk-pv 慢约 7%（extend 每个 microbatch 1037 对 966 us），精度相同，排除。
+- bf16 在 extend 上是 Source 里最快、最准的：展开 267-277 us，TensorCore 三次调用约 3345 + 2511 + 565 us ≈ 6.4 ms（fp8-qk-pv 约 7.7 ms），gather 约 480 us。最大误差约为 FP8 模式的一半。
+- bf16 在 verify / decode 上 TensorCore 比 fp8-qk-pv 慢约 2.5x。
+- 本轮 Target 的 verify / decode（115 / 57.6）低于上一轮（138 / 65），原因未查（补页或运行间波动）。所以上一节"decode 最优 tile 快于 Target"不再成立。
+- 路线建议（未定）：extend 以 bf16 路径为起点；verify / decode 用 fp8-qk-pv 加最优 tile。两条都要进 kernel 内部，下一步用 `exact_attention.py` 里已有的 named scope（`fp8_decode`、`qk`、`softmax`、`pv`、`cache_dma` 等）在 pod 里出每段耗时，与 Target 的 `MLA-tensorcore` kernel 对比。
+
+### trace 下载
+
+xprof trace 在 `gs://tpu-for-training-falcon-logs/experiments/<exp>/artifacts/<art>/xprof/`，当前账号 403（缺 `storage.objects.get`），需申请该 bucket 的 `roles/storage.objectViewer`。
+
 ## 多机模型端到端（推迟到整个 DSA 迁完并完成整体对比之后）
 
 - 资源：GLM-5.2 FP8（约 762 GB）需要 2 台 tpu7x 主机、tp16（`benchmark/tpu/recipe/configs/glm_5_2/server.py`）。目前所有 Falcon manifest 都是单 pod（`2x2x1`），需要一个 2 主机 job。
