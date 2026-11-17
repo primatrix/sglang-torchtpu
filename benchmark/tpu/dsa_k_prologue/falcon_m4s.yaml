@@ -149,6 +149,16 @@ role_to_task_spec:
       $PY $L --stage torch --npz-dir "$OUT/layer" --xprof-dir "$OUT/xprof" > "$OUT/layer_torch.log" 2>&1 || ltrc=1
       echo "==== LAYERTORCH (rc=$ltrc)"; grep -E '^LAYER' "$OUT/layer_torch.log" | cut -c1-3000
       [ $ltrc = 0 ] || { tail -n 60 "$OUT/layer_torch.log"; rc=1; }
+      # 6. Whole layer at the PR #2198 baseline shapes (per attention-DP rank).
+      prc6=0
+      mkdir -p "$OUT/layer2198"
+      $PY $L --stage jax --pr2198 --npz-dir "$OUT/layer2198" --xprof-dir "$OUT/xprof2198" > "$OUT/layer2198.log" 2>&1 || prc6=1
+      echo "==== LAYER2198 (rc=$prc6)"; grep -E '^LAYER' "$OUT/layer2198.log" | cut -c1-4000
+      [ $prc6 = 0 ] || { tail -n 60 "$OUT/layer2198.log"; rc=1; }
+      prc7=0
+      $PY $L --stage torch --pr2198 --npz-dir "$OUT/layer2198" --xprof-dir "$OUT/xprof2198" > "$OUT/layer2198_torch.log" 2>&1 || prc7=1
+      echo "==== LAYER2198TORCH (rc=$prc7)"; grep -E '^LAYER' "$OUT/layer2198_torch.log" | cut -c1-3000
+      [ $prc7 = 0 ] || { tail -n 60 "$OUT/layer2198_torch.log"; rc=1; }
       exit $rc
     replica: 1
     image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1

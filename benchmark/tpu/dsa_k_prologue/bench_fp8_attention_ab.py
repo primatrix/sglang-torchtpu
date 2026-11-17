@@ -32,12 +32,18 @@ sys.path.insert(0, HERE)
 
 H, LAT, ROPE, K, FP = 64, 512, 64, 2048, 128
 
-# name -> (q_lens, prefixes, mode); mode: prefill | decode
+# name -> (q_lens, prefixes, mode); mode: prefill | decode | verify
 CASES = {
     "extend_2048": ([2048], [8192], "prefill"),
     "extend_unaligned": ([2000], [8200], "prefill"),
     "decode_b64": ([1] * 64, [8191 + 37 * s for s in range(64)], "decode"),
+    # Same requests as bench_indexer_chain's pr2198_* cases (PR #2198 baseline, per rank).
+    "pr2198_extend_c1": ([2048], [49152], "prefill"),
+    "pr2198_extend_c2": ([2048], [51200], "prefill"),
+    "pr2198_verify_b4": ([6] * 4, [90000 + 37 * s for s in range(4)], "verify"),
+    "pr2198_decode_b4": ([1] * 4, [90005 + 37 * s for s in range(4)], "decode"),
 }
+DEFAULT_CASES = ["extend_2048", "extend_unaligned", "decode_b64"]
 
 
 def case(name, seed=0):
@@ -478,7 +484,7 @@ def stage_torch(a):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", choices=("jax", "torch"), default="jax")
-    p.add_argument("--cases", nargs="+", default=list(CASES))
+    p.add_argument("--cases", nargs="+", default=DEFAULT_CASES)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--xprof-dir", default="")

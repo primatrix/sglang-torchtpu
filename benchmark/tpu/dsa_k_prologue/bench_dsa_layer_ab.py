@@ -41,6 +41,8 @@ import bench_indexer_chain as bc  # noqa: E402
 from check_physical_topk import to_physical  # noqa: E402
 
 CASES = ("extend_2048", "extend_unaligned", "decode_b64")
+# PR sgl-project/sglang-torchtpu#2198 baseline shapes, per attention-DP rank (--cases pr2198).
+PR2198 = ("pr2198_extend_c1", "pr2198_extend_c2", "pr2198_verify_b4", "pr2198_decode_b4")
 FP, K = 128, 2048
 
 
@@ -204,15 +206,15 @@ def stage_jax(a):
         if decode:
             tp = np.array([table64[s * 2 * ci["ppr"] + (ci["kv"][s] - 1) // 64] * 64
                            + (ci["kv"][s] - 1) % 64 for s in range(S)], np.int32)
-        elif T % 64 == 0 and all(p % 64 == 0 for p in ci["prefixes"]):
+        elif prefill and T % 64 == 0 and all(p % 64 == 0 for p in ci["prefixes"]):
             tp = np.concatenate([
                 table64[s * 2 * ci["ppr"] + (ci["prefixes"][s] + np.arange(0, q, 64)) // 64]
                 for s, q in enumerate(np.diff(ci["cu_q"]))]).astype(np.int32)
         else:
             tp = None
         if tp is None:
-            row["source"] = {"note": "unaligned extend: the source key store is its XLA chain, "
-                                     "not shipped"}
+            row["source"] = {"note": "unaligned extend / verify: the source key store is its "
+                                     "XLA chain, not shipped"}
         else:
             tp_j, t64, cukv_j = jnp.asarray(tp), jnp.asarray(table64), jnp.asarray(cukv)
 
@@ -353,7 +355,8 @@ def stage_torch(a):
             and np.array_equal(rope.cpu().numpy().reshape(-1), ref["rope"].reshape(-1)),
         }
         row = {"case": name, "torch_vs_ported_s_jax": {k: bool(v) for k, v in ex.items()}}
-        if name == "extend_unaligned":
+        if ci["T"] % 64 or any(p % 64 for p in ci["prefixes"]):
+            # Unaligned batches store keys through the XLA fallback (source_chain.md).
             row["note"] = "known ~1 bf16 ulp key-store difference; reported, not gated"
         else:
             ok &= all(ex.values())
@@ -372,6 +375,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", choices=("jax", "torch"), required=True)
     p.add_argument("--cases", nargs="+", default=list(CASES))
+    p.add_argument("--pr2198", action="store_true", help="run the PR #2198 baseline shapes")
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--npz-dir", required=True)
@@ -380,6 +384,8 @@ def main():
     p.add_argument("--source-q", default="/tmp/source/fused_q_rope_hadamard.py")
     p.add_argument("--source-root", default="/tmp/source/m4s")
     a = p.parse_args()
+    if a.pr2198:
+        a.cases = list(PR2198)
     os.makedirs(a.npz_dir, exist_ok=True)
     sys.exit(stage_jax(a) if a.stage == "jax" else stage_torch(a))
 

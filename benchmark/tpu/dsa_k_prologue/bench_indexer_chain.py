@@ -33,13 +33,21 @@ sys.path.insert(0, HERE)
 
 HIDDEN, D, HEADS, K, FP = 6144, 128, 32, 2048, 128
 
-# name -> (q_lens, prefixes, decode)
+# name -> (q_lens, prefixes, mode); mode: extend | decode | verify (False / True = extend / decode)
 CASES = {
     "extend_2048": ([2048], [8192], False),
     "extend_4x2048": ([2048] * 4, [8192] * 4, False),
     "extend_unaligned": ([2000], [8200], False),
     "decode_b64": ([1] * 64, [8191 + 37 * s for s in range(64)], True),
+    # PR sgl-project/sglang-torchtpu#2198 baseline (exp-6mtkc6t2qi), per attention-DP rank
+    # (TP16 / attn-DP16): C16 extend 4096 on a 49,152 cache in 2048 chunks, one request per
+    # rank; C64 decode on ~90K context, four requests per rank, NEXTN 6 draft tokens.
+    "pr2198_extend_c1": ([2048], [49152], "extend"),
+    "pr2198_extend_c2": ([2048], [51200], "extend"),
+    "pr2198_verify_b4": ([6] * 4, [90000 + 37 * s for s in range(4)], "verify"),
+    "pr2198_decode_b4": ([1] * 4, [90005 + 37 * s for s in range(4)], "decode"),
 }
+DEFAULT_CASES = ["extend_2048", "extend_4x2048", "extend_unaligned", "decode_b64"]
 
 
 def _bf16(a):
@@ -51,7 +59,9 @@ def _bf16(a):
 def case(name, seed=0):
     import ml_dtypes
 
-    q_lens, prefixes, decode = CASES[name]
+    q_lens, prefixes, mode = CASES[name]
+    mode = {False: "extend", True: "decode"}.get(mode, mode)
+    decode = mode == "decode"
     w = np.random.default_rng(seed)
     r = np.random.default_rng(seed + 1 + sum(q_lens) + len(q_lens))
     S, T = len(q_lens), int(sum(q_lens))
@@ -62,7 +72,7 @@ def case(name, seed=0):
     pos = np.concatenate([np.arange(p, p + q) for p, q in zip(prefixes, q_lens)])
     ang = r.uniform(0, 2 * np.pi, (T, 32))
     return dict(
-        name=name, decode=decode, prefill=not decode, S=S, T=T, ppr=ppr,
+        name=name, mode=mode, decode=decode, prefill=mode == "extend", S=S, T=T, ppr=ppr,
         kv=kv, pi=pi.astype(np.int32), pos=pos, prefixes=np.asarray(prefixes),
         cu_q=np.r_[0, np.cumsum(q_lens)].astype(np.int32),
         dist=np.array([S] * 3 if decode else [0, 0, S], np.int32),
@@ -371,7 +381,7 @@ def _summary(row):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", choices=("torch", "jax"), required=True)
-    p.add_argument("--cases", nargs="+", default=list(CASES))
+    p.add_argument("--cases", nargs="+", default=DEFAULT_CASES)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--npz-dir", default="/tmp/chain")
