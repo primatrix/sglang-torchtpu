@@ -30,7 +30,7 @@ import bench_fp8_attention_ab as att  # noqa: E402
 from check_physical_topk import to_physical  # noqa: E402
 
 FP = att.FP = 64
-CASES = ("pr2198_extend_c1", "pr2198_verify_b4", "pr2198_decode_b4")
+CASES = ("pr2198_extend_c1", "pr2198_extend_c2", "pr2198_verify_b4", "pr2198_decode_b4")
 PRECISIONS = ("fp8-qk-pv", "fp8-qk", "bf16")
 
 
