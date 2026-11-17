@@ -33,8 +33,8 @@ CASES = ("pr2198_extend_c1", "pr2198_extend_c2", "pr2198_verify_b4", "pr2198_dec
 # Op categories of the Target attention step (first match wins; the rest is
 # "other", whose largest ops are listed so nothing hides in it).
 CATEGORIES = [
-    ("tc_attention", ("MLA-tensorcore",)),
-    ("sc_gather", ("sc_dsa_gather", "sparse-core-data-format")),
+    ("tc_attention", ("MLA-tensorcore", "MLA-sparsecore")),
+    ("sc_gather", ("sc_dsa_gather", "dsa_gather", "native_sc", "sparse-core-data-format")),
     ("page_lookup", ("gather_page_ids",)),
     ("kv_store", ("scatter",)),
     ("q_prep", ("q_hbm_ref", "concatenate")),
@@ -58,8 +58,23 @@ def stage_prep(a):
             jnp.zeros((P, FP, 4, 128), jnp.uint8), jnp.zeros((P, FP // 4, 4, 128), jnp.uint8),
             jnp.asarray(c["prefix_kv"]), jnp.asarray(c["prefix_pe"]), n,
             jnp.arange(P, dtype=jnp.int32))
+        # The same rows in the SparseCore layout (uint32), as the pool allocates it
+        # under SGLANG_TPU_DSA_SPARSECORE_KV_CACHE; written with the same FP8 cast.
+        from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils as kcu
+
+        lay = kcu.KVCacheLayout.SPARSECORE
+        ns = kcu.SparseMLAKVCacheSpec.create(kcu.KVCacheType.NOPE, lay, P, FP, 512)
+        rs = kcu.SparseMLAKVCacheSpec.create(kcu.KVCacheType.ROPE, lay, P, FP, 64)
+        f8 = jnp.float8_e4m3fn
+        fmax = float(jnp.finfo(f8).max)
+        q8 = lambda x: jnp.clip(x.astype(jnp.float32), -fmax, fmax).astype(f8)
+        sn, sr = jax.jit(lambda no, ro, kv_, pe_: kcu.update_sparse_mla_kv_cache_jax(
+            no, ro, q8(kv_), q8(pe_), jnp.array([n], jnp.int32), jnp.arange(P, dtype=jnp.int32),
+            jnp.array([0, n], jnp.int32), nope_spec=ns, rope_spec=rs))(
+            jnp.zeros(ns.shape, ns.jax_dtype), jnp.zeros(rs.shape, rs.jax_dtype),
+            jnp.asarray(c["prefix_kv"]), jnp.asarray(c["prefix_pe"]))
         np.savez(os.path.join(a.npz_dir, f"base_{name}.npz"), nope=np.asarray(tn),
-                 rope=np.asarray(tr))
+                 rope=np.asarray(tr), sc_nope=np.asarray(sn), sc_rope=np.asarray(sr))
         print(f"PREP {name} pages={P}", flush=True)
     return 0
 
@@ -74,8 +89,14 @@ def stage_torch(a):
     from sglang_tpu.attention_pallas_rpa_base import _quantize_kv_to_fp8
 
     # Registered outside torch.compile: Dynamo cannot trace op registration.
+    phys_op = _build_pallas_sparse_mla_kernel_op(topk_is_physical=True)
+    # target_sc_phys: the same op on a uint32 SparseCore-layout cache; the op picks
+    # the layout from the cache dtype (mla_sparse_fused.cache_layout_of).
     ops = {"target": _build_pallas_sparse_mla_kernel_op(),
-           "target_phys": _build_pallas_sparse_mla_kernel_op(topk_is_physical=True)}
+           "target_phys": phys_op,
+           "target_sc_phys": phys_op}
+    cache_keys = {"target": ("nope", "rope"), "target_phys": ("nope", "rope"),
+                  "target_sc_phys": ("sc_nope", "sc_rope")}
     sync = torch.accelerator.synchronize
     dev = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to("tpu")
     bf = lambda x: torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).view(
@@ -91,8 +112,8 @@ def stage_torch(a):
         rows_bf = att.bf16_rows(c)
         ql, qr, kvc, kpe = (bf(c[k]) for k in ("q_latent", "q_rope", "kv_c", "k_pe"))
         kv, pi, cuq = dev(c["kv"]), dev(c["pi"]), dev(c["cu_q"])
-        rows = {"target": dev(c["topk"]),
-                "target_phys": dev(to_physical(c["topk"], c["pi"], c["ppr"], c["cu_q"], page=FP))}
+        phys = dev(to_physical(c["topk"], c["pi"], c["ppr"], c["cu_q"], page=FP))
+        rows = {"target": dev(c["topk"]), "target_phys": phys, "target_sc_phys": phys}
         cukv = dev((np.arange(S + 1) * c["ppr"] * FP).astype(np.int32))
         dist = dev(np.array([S] * 3 if c["mode"] == "decode" else [0, 0, S], np.int32))
         row = {"case": name, "T": c["T"], "mode": c["mode"]}
@@ -107,7 +128,7 @@ def stage_torch(a):
 
             try:
                 cf = comp(fn)
-                fresh = lambda: (dev(ref["nope"]), dev(ref["rope"]))
+                fresh = lambda _k=cache_keys[side]: (dev(ref[_k[0]]), dev(ref[_k[1]]))
                 out = cf(*fresh(), ql, qr, kvc, kpe).cpu().view(torch.int16).numpy()
                 outs[side] = out
                 r = {"accuracy_vs_bf16": att.error_vs_bf16(c, _as_f64(out.view(np.uint16)),
@@ -129,9 +150,10 @@ def stage_torch(a):
             except Exception as e:  # report, do not hide; the other variants still run
                 r = {"error": repr(e)[:2000]}
             row[side] = r
-        if "target" in outs and "target_phys" in outs:
-            # Same rows, same cache: the variant must not change the output.
-            row["target_phys_out_exact"] = bool(np.array_equal(outs["target"], outs["target_phys"]))
+        # Same rows, same FP8 values: no variant may change the output.
+        for side in ("target_phys", "target_sc_phys"):
+            if "target" in outs and side in outs:
+                row[f"{side}_out_exact"] = bool(np.array_equal(outs["target"], outs[side]))
         print("BASE " + json.dumps(row), flush=True)
     print("BASE_DONE", flush=True)
     return 0
