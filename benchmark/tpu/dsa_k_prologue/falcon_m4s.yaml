@@ -138,6 +138,17 @@ role_to_task_spec:
       $PY $DT -v > "$OUT/fp8_dispatch.log" 2>&1 || rc=1
       echo "==== test_dsa_fp8_attention_dispatch"; grep -E '(ok|FAIL|ERROR)$|^Ran |^OK|^FAILED' "$OUT/fp8_dispatch.log" | tail -n 8
       grep -E 'Traceback|Error' "$OUT/fp8_dispatch.log" | head -n 10
+      # 5. Whole layer S1-S6: Source / Ported-S JAX / torch ops / Target.
+      L=benchmark/tpu/dsa_k_prologue/bench_dsa_layer_ab.py
+      lrc=0
+      mkdir -p "$OUT/layer"
+      $PY $L --stage jax --npz-dir "$OUT/layer" --xprof-dir "$OUT/xprof" > "$OUT/layer.log" 2>&1 || lrc=1
+      echo "==== LAYER (rc=$lrc)"; grep -E '^LAYER' "$OUT/layer.log" | cut -c1-4000
+      [ $lrc = 0 ] || { tail -n 60 "$OUT/layer.log"; rc=1; }
+      ltrc=0
+      $PY $L --stage torch --npz-dir "$OUT/layer" --xprof-dir "$OUT/xprof" > "$OUT/layer_torch.log" 2>&1 || ltrc=1
+      echo "==== LAYERTORCH (rc=$ltrc)"; grep -E '^LAYER' "$OUT/layer_torch.log" | cut -c1-3000
+      [ $ltrc = 0 ] || { tail -n 60 "$OUT/layer_torch.log"; rc=1; }
       exit $rc
     replica: 1
     image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
