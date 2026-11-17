@@ -272,6 +272,22 @@ GLM-5.2 kpool=1，走 `mla_sparse_qblock_tokens`，要求 page size 为 128 的�
 - SparseCore 布局：`atoms_per_batch` 16 最好，`overlap_rope` 比 `before_rope` 快 2%-4%，chunk 64 / 128 接近，256 变慢。verify 上 a16 不能整除（24 x 2048 行），失败。
 - 路线：extend 换 SparseCore 布局 + native gather（KV cache 改 u32，写入与 pool 分配随之改）；verify 用物理 slot + b4；decode 只能靠合并 kernel 外的小 op。
 
+### SparseCore 布局接入 torch op（exp-vx111hhabc，提交 16dd48b）
+
+`SGLANG_TPU_DSA_SPARSECORE_KV_CACHE=1` 时 KV pool 分配 u32 cache，Target 走 native SparseCore gather。最初经 torch op 跑 extend 要 23.2 ms：torch_tpu 图里 XLA 把各 chunk 的 `lax.empty` 输出合并成同一块 buffer，每次 gather 前都要复制一遍（16 x 约 1046 us）。修法：chunk i 复用 chunk i-2 已读完的 gather 输出作为写入 buffer（`out_init`），前两个 chunk 用各自独立的 buffer。修后 HLO 只剩 `q_rope` 一个大 copy。
+
+`bench_target_baseline.py` 四形状，wall time 中位数，us；三列输出都与原版逐字节一致：
+
+| 用例 | 原版 Target | 物理 slot | SparseCore + 物理 slot |
+|---|---|---|---|
+| extend_c1 | 4422.6 | 4226.4（-4.4%） | **3650.8（-17.5%）** |
+| extend_c2 | 4409.1 | 4228.5（-4.1%） | **3664.6（-16.9%）** |
+| verify_b4 | 178.0 | 167.8（-5.7%） | 165.2（-7.2%） |
+| decode_b4 | 128.5 | 126.3 | 119.4（波动 116.7-133.3，持平） |
+
+- extend 与扫参里直接 JAX 调用的 3577 us 差约 2%。
+- verify / decode 没有变慢；这两个形状的瓶颈仍是 kernel 外的小 op。
+
 ## 多机模型端到端（推迟到整个 DSA 迁完并完成整体对比之后）
 
 - 资源：GLM-5.2 FP8（约 762 GB）需要 2 台 tpu7x 主机、tp16（`benchmark/tpu/recipe/configs/glm_5_2/server.py`）。目前所有 Falcon manifest 都是单 pod（`2x2x1`），需要一个 2 主机 job。
