@@ -233,8 +233,18 @@ def dsa_gather_native_sc(
     serve_pipelined: bool = True,
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
+    out_init: tuple[jax.Array, jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
+
+    ``out_init`` (optional): ``(nope_out, rope_out)`` buffers of the output
+    shapes the gather writes into instead of fresh ones. Pass buffers that are
+    dead after the call (an earlier chunk's gather output the attention has
+    already read): XLA then writes them in place. Under torch_tpu the fresh
+    outputs of all chunks are one shared uninitialized buffer, so every call
+    copies it first (16 x ~1 ms per extend 2048, exp-qyuatjpneb). Rows the
+    gather does not write (past ``num_live_indices``) keep the buffer's values;
+    the attention never reads them.
 
     ``nope_cache`` has one 128-word row per token. ``rope_cache`` has one
     128-word row per group of four tokens; each token owns a consecutive
@@ -338,12 +348,24 @@ def dsa_gather_native_sc(
         def body(nope, rope, idx, live_hbm, nope_o, rope_o, **scr):
             return inner(nope, rope, idx, nope_o, rope_o, live_hbm_ref=live_hbm, **scr)
 
+    out_types = (
+        jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
+        jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
+    )
+    call_args = list(operands)
+    if out_init is not None:
+        init = tuple(out_init)
+        for buf, t in zip(init, out_types):
+            if buf.shape != t.shape or buf.dtype != t.dtype:
+                raise ValueError(
+                    f"out_init buffer {buf.shape} {buf.dtype} does not match the "
+                    f"gather output {t.shape} {t.dtype}"
+                )
+        call_args = [init, *call_args]
     return core_map_helper.kernel(
         body,
-        out_type=(
-            jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
-            jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
-        ),
+        out_type=out_types,
+        with_out_init=out_init is not None,
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=False,
             needs_layout_passes=True,
@@ -351,11 +373,8 @@ def dsa_gather_native_sc(
         ),
         scratch_types=scratch_types,
         mesh=mesh,
-        # One gather per attention chunk: without this, the chunks' outputs
-        # share one buffer under torch_tpu and each call copies it first.
-        distinct_outputs=True,
         name=(
             f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
         ),
-    )(*operands)
+    )(*call_args)
