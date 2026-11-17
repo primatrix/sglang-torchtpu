@@ -216,8 +216,11 @@ def stage_jax(a):
         else:
             tp_j, t64, cukv_j = jnp.asarray(tp), jnp.asarray(table64), jnp.asarray(cukv)
 
+            # Page tables as runtime arguments, as deployed: closed-over jnp arrays
+            # become HLO constants, and with them the radix top-k SparseCore lowering
+            # failed (RET_CHECK buffer_found, exp-eugdo5kysz).
             def source(icache, lat, rope, hidden, wk, ws, nw, nb, query, cos, sin, w, kv, pi,
-                       cu_q, dist, ql, qr, kvc, kpe, sm_):
+                       cu_q, dist, ql, qr, kvc, kpe, sm_, tp_j, t64, cukv_j):
                 del pi
                 view = src_k(hidden, wk, ws, nw, nb, cos, sin, H, icache, tp_j, page_size=64,
                              token_slots=decode)
@@ -235,9 +238,15 @@ def stage_jax(a):
                 return out, view, cc.latent, cc.rope, slots
 
             s_args = (jnp.asarray(ci["cache"]).reshape(-1, 64, bc.D), jnp.asarray(lat0),
-                      jnp.asarray(rope0), *idx_args, *att_args, sm)
-            (so, sic, slat, srope, sslots), row["source"] = timed(source, s_args, (0, 1, 2),
-                                                                  f"{name}_source")
+                      jnp.asarray(rope0), *idx_args, *att_args, sm, tp_j, t64, cukv_j)
+            try:
+                (so, sic, slat, srope, sslots), row["source"] = timed(
+                    source, s_args, (0, 1, 2), f"{name}_source")
+            except Exception as e:  # report, do not hide; other sides still run
+                row["source"] = {"error": repr(e)[:1500]}
+                ok = False
+                tp = None
+        if tp is not None:
             so, sic, slat, srope, sslots = map(np.asarray, (so, sic, slat, srope, sslots))
             row["source"]["attention"] = attention_error(ca, so, sslots, rows_bf)
             ex = {
