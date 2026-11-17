@@ -17,8 +17,10 @@ def run(command=None, *, seconds=None, poll_seconds=2):
     control = root / "allocation"
     control.mkdir(parents=True, exist_ok=True)
     status_file = control / f"rank-{rank}.json"
-    deadline = time.monotonic() + (seconds or 6900)
-    expires_at = time.time() + (seconds or 6900)
+    # Test only: GLM52_ALLOCATION_SECONDS shortens how long a failed run holds the hosts.
+    seconds = seconds or int(os.environ.get("GLM52_ALLOCATION_SECONDS", "6900"))
+    deadline = time.monotonic() + seconds
+    expires_at = time.time() + seconds
     command = command or ["bash", str(Path(__file__).with_name("falcon_runner.sh"))]
     generation = 1
     source = os.environ["SOURCE_COMMIT"]
