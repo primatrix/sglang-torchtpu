@@ -351,6 +351,9 @@ def dsa_gather_native_sc(
         ),
         scratch_types=scratch_types,
         mesh=mesh,
+        # One gather per attention chunk: without this, the chunks' outputs
+        # share one buffer under torch_tpu and each call copies it first.
+        distinct_outputs=True,
         name=(
             f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"

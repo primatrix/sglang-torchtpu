@@ -16,7 +16,7 @@ from jax._src import lax, tree_util
 from jax._src.pallas import core as pl_core
 
 
-def _empty_out_ref(out_type):
+def _empty_out_ref(out_type, dep=None):
     aval = pl_core._convert_out_shape_to_aval(out_type)
     memory_space = (
         None
@@ -24,6 +24,16 @@ def _empty_out_ref(out_type):
         else aval.memory_space
     )
     value = lax.empty(aval.shape, aval.dtype, out_sharding=aval.sharding)
+    if dep is not None:
+        # Tie this call's output buffer to its own operands. `empty` has no
+        # operands, so XLA merges the identical ones of repeated calls in one
+        # graph into a single buffer; every call then writes that shared buffer
+        # in place and XLA copies it first (16 x ~1 ms per extend for the native
+        # SparseCore gather under torch_tpu, exp-qyuatjpneb). The barrier makes
+        # each call's buffer a distinct value; it moves no data.
+        import jax
+
+        value, _ = jax.lax.optimization_barrier((value, dep))
     return jax_core.new_ref(value, memory_space=memory_space)
 
 
@@ -39,15 +49,22 @@ def kernel(
     debug=False,
     name=None,
     metadata=None,
+    distinct_outputs=False,
 ):
-    """Drop-in replacement for ``pl.kernel`` that lowers via ``core_map``."""
+    """Drop-in replacement for ``pl.kernel`` that lowers via ``core_map``.
+
+    ``distinct_outputs`` makes each call's output buffers depend on its
+    operands, so repeated calls in one graph never share (and copy) one
+    uninitialized buffer (see ``_empty_out_ref``).
+    """
     single_output = not isinstance(out_type, (tuple, list))
     out_types = (out_type,) if single_output else out_type
 
     @api.jit
     def run(*operands):
         arg_refs = tree_util.tree_map(jax_core.new_ref, operands)
-        out_refs = tree_util.tree_map(_empty_out_ref, out_types)
+        dep = operands if distinct_outputs else None
+        out_refs = tree_util.tree_map(lambda t: _empty_out_ref(t, dep), out_types)
 
         @pl_core.core_map(
             mesh,
