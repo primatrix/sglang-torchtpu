@@ -94,8 +94,10 @@ def stage_torch(a):
     # the layout from the cache dtype (mla_sparse_fused.cache_layout_of).
     ops = {"target": _build_pallas_sparse_mla_kernel_op(),
            "target_phys": phys_op,
+           "target_sc": _build_pallas_sparse_mla_kernel_op(),
            "target_sc_phys": phys_op}
     cache_keys = {"target": ("nope", "rope"), "target_phys": ("nope", "rope"),
+                  "target_sc": ("sc_nope", "sc_rope"),
                   "target_sc_phys": ("sc_nope", "sc_rope")}
     sync = torch.accelerator.synchronize
     dev = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to("tpu")
@@ -120,7 +122,8 @@ def stage_torch(a):
         ql, qr, kvc, kpe = (bf(c[k]) for k in ("q_latent", "q_rope", "kv_c", "k_pe"))
         kv, pi, cuq = dev(c["kv"]), dev(c["pi"]), dev(c["cu_q"])
         phys = dev(to_physical(c["topk"], c["pi"], c["ppr"], c["cu_q"], page=FP))
-        rows = {"target": dev(c["topk"]), "target_phys": phys, "target_sc_phys": phys}
+        rows = {"target": dev(c["topk"]), "target_phys": phys, "target_sc": dev(c["topk"]),
+                "target_sc_phys": phys}
         cukv = dev((np.arange(S + 1) * c["ppr"] * FP).astype(np.int32))
         dist = dev(np.array([S] * 3 if c["mode"] == "decode" else [0, 0, S], np.int32))
         row = {"case": name, "T": c["T"], "mode": c["mode"]}
@@ -159,7 +162,7 @@ def stage_torch(a):
                 r = {"error": repr(e)[:2000]}
             row[side] = r
         # Same rows, same FP8 values: no variant may change the output.
-        for side in ("target_phys", "target_sc_phys"):
+        for side in ("target_phys", "target_sc", "target_sc_phys"):
             if "target" in outs and side in outs:
                 row[f"{side}_out_exact"] = bool(np.array_equal(outs["target"], outs[side]))
         # Full row (profile breakdown included) to a file; one short line per
