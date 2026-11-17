@@ -103,6 +103,13 @@ def stage_torch(a):
         torch.bfloat16).to("tpu")
     comp = lambda f: torch.compile(f, backend="tpu", fullgraph=True, dynamic=False)
     f8 = torch.float8_e4m3fn
+    # Each (case, variant) compiles its own graph: 4 cases x 3 variants exceeded
+    # Dynamo's default recompile limit (8) and failed every later compile with
+    # FailOnRecompileLimitHit (exp-2fovl1hgf6). Raise it and reset per variant.
+    import torch._dynamo
+
+    torch._dynamo.config.cache_size_limit = 64
+    torch._dynamo.config.accumulated_cache_size_limit = 512
 
     for name in a.cases:
         c = att.case(name)
@@ -127,6 +134,7 @@ def stage_torch(a):
                            dist, sm, 1.0, 1.0, _topk)
 
             try:
+                torch._dynamo.reset()
                 cf = comp(fn)
                 fresh = lambda _k=cache_keys[side]: (dev(ref[_k[0]]), dev(ref[_k[1]]))
                 out = cf(*fresh(), ql, qr, kvc, kpe).cpu().view(torch.int16).numpy()
@@ -154,7 +162,21 @@ def stage_torch(a):
         for side in ("target_phys", "target_sc_phys"):
             if "target" in outs and side in outs:
                 row[f"{side}_out_exact"] = bool(np.array_equal(outs["target"], outs[side]))
-        print("BASE " + json.dumps(row), flush=True)
+        # Full row (profile breakdown included) to a file; one short line per
+        # variant to stdout, so the pod log is never truncated mid-row.
+        with open(os.path.join(a.npz_dir, f"base_{name}.json"), "w") as f:
+            json.dump(row, f)
+        for side in ops:
+            r = row[side]
+            cats = r.get("breakdown", {}).get("categories", {}) if isinstance(r, dict) else {}
+            print("BASEROW " + json.dumps({
+                "case": name, "variant": side, "us": r.get("us"), "us_range": r.get("us_range"),
+                "module_us": r.get("module_us"),
+                "exact_vs_target": row.get(f"{side}_out_exact", side == "target" or None),
+                "max_rel": r.get("accuracy_vs_bf16", {}).get("max_rel"),
+                "median_rel": r.get("accuracy_vs_bf16", {}).get("median_rel"),
+                "tc": cats.get("tc_attention"), "sc": cats.get("sc_gather"),
+                "error": r.get("error", "")[:300]}), flush=True)
     print("BASE_DONE", flush=True)
     return 0
 
