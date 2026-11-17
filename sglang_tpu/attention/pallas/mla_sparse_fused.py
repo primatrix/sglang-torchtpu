@@ -184,12 +184,18 @@ def sparse_mla_attention_fused(
     qblock_kpool: int = 0,
     gather_chunk_tokens: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
     zero_rope: bool = False,
+    topk_is_physical: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run one step: store the new tokens in the cache, then attend.
 
     Each row of ``topk_indices`` lists the key positions one query token may
     attend to, counted from the start of its own sequence. The valid positions
     come first and the rest of the row is ``-1``.
+
+    ``topk_is_physical``: the rows are flat cache slots (``page * page_size +
+    offset``) instead, as a physical-slot indexer emits them. The attention then
+    skips the page-table lookup (``gather_page_ids``). Same layout otherwise:
+    valid slots first, ``-1`` padded. The query-blocked prefill is not taken.
 
     ``zero_rope`` is for a model without rope, whose rope lane (``q_pe`` and
     ``new_k_pe``) is identically zero. The rope cache is allocated zeroed, so
@@ -226,6 +232,7 @@ def sparse_mla_attention_fused(
     )
     if (
         qblock_kpool
+        and not topk_is_physical
         and query_block is not None
         and ql_nope.shape[0] >= QBLOCK_MIN_TOKENS
         and pages_per_seq <= QBLOCK_MAX_PAGES_PER_SEQ
@@ -259,7 +266,8 @@ def sparse_mla_attention_fused(
         cache_nope,
         cache_rope,
         topk_indices,
-        page_indices,
+        # None: the rows are already flat cache slots (prepare_gather_indices).
+        None if topk_is_physical else page_indices,
         cu_q_lens,
         distribution,
         sm_scale=sm_scale,

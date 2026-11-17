@@ -69,6 +69,7 @@ def _build_pallas_sparse_mla_kernel_op(
     qblock_kpool: int = 0,
     gather_chunk_tokens: Optional[int] = None,
     zero_rope: bool = False,
+    topk_is_physical: bool = False,
 ):
     """Register the sparse MLA step as a torch custom op, once per process.
 
@@ -80,8 +81,15 @@ def _build_pallas_sparse_mla_kernel_op(
 
     ``zero_rope`` neither writes nor reads the rope cache, for a model whose
     rope lane is identically zero (see ``sparse_mla_attention_fused``).
+
+    ``topk_is_physical`` takes the top-k rows as flat cache slots (a
+    physical-slot indexer) and skips the page-table lookup; off by default.
     """
-    key = (qblock_kpool, gather_chunk_tokens, zero_rope)
+    if topk_is_physical and qblock_kpool == 1:
+        # The head-major prefill op (sparse_mla_prefill_fused_tokens) reads
+        # sequence-local rows only.
+        raise ValueError("topk_is_physical is not supported with qblock_kpool=1")
+    key = (qblock_kpool, gather_chunk_tokens, zero_rope, topk_is_physical)
     if key in _PALLAS_SPARSE_MLA_OPS:
         return _PALLAS_SPARSE_MLA_OPS[key]
 
@@ -109,6 +117,10 @@ def _build_pallas_sparse_mla_kernel_op(
         # No rope cache write or read: a different body, so a different name.
         op_name += "_zero_rope"
         chunk_kwargs["zero_rope"] = True
+    if topk_is_physical:
+        # Flat-slot rows, no page-table lookup: a different body, so a different name.
+        op_name += "_phys"
+        chunk_kwargs["topk_is_physical"] = True
 
     # custom_jax_kernel reads this function's signature: every tensor has to
     # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
