@@ -933,6 +933,14 @@ def sparse_ragged_paged_attention(
             # A shorter last chunk has smaller outputs: start it fresh.
             if old is not None and old[0].shape[0] == (end_pos - start_pos) * topk:
                 out_init = old
+        elif reuse_gather and len(gather_ring) == 1 and gather_ring[0] is not None:
+            # Chunk 1 has no dead buffer yet. A fresh one is the same shared
+            # `empty` as chunk 0's under torch_tpu, so it would be copied
+            # (~1.3 ms, exp-33hbkanalb); a zero fill is a distinct buffer and
+            # only writes it once.
+            first = gather_ring[0]
+            if first[0].shape[0] == (end_pos - start_pos) * topk:
+                out_init = tuple(jnp.zeros(b.shape, b.dtype) for b in first)
         result = sparse_attention_chunk(
             q,
             cache_kv_nope,
