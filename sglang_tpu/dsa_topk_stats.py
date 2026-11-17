@@ -25,6 +25,7 @@ BLOCK = 128
 _lock = threading.Lock()
 _calls = [0]
 _raw = [0]
+_logged: set = set()
 
 
 def enabled(layer_id: int) -> bool:
@@ -98,7 +99,16 @@ def record(layer_id: int, topk: torch.Tensor) -> None:
     from sglang_tpu.compilation.direct_compile import insert_callback
 
     cb = lambda t, _l=layer_id: _consume(_l, t)  # noqa: E731
-    if insert_callback(topk, cb):
+    registered = insert_callback(topk, cb)
+    if _rank() == 0 and layer_id not in _logged:
+        _logged.add(layer_id)
+        import logging
+
+        logging.getLogger(__name__).info(
+            "[dsa_topk_stats] layer %d: callback registered=%s compiling=%s dir=%s",
+            layer_id, registered, torch.compiler.is_compiling(),
+            os.environ.get("SGLANG_TPU_DSA_TOPK_STATS_DIR"))
+    if registered:
         return
     if not torch.compiler.is_compiling():
         _consume(layer_id, topk)
