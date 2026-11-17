@@ -99,6 +99,14 @@ Ported-S 在 page 128 上用 2×64 页视图调用迁移的 Source 代码（`dsa
   - attention op `topk_is_physical=True` 的输出和 cache 与逻辑路径的 Ported-S JAX 逐字节一致。torch op module 时间：extend 2048 34502 → 8669 µs，unaligned 33900 → 8752 µs，decode b64 1519 → 791 µs（torch op 无 cache copy；Target decode 去掉 copy 约 240 µs，I）。
 - 单独跑映射比融在 attention 里还慢（44 ms 对 25.7 ms），原因未查；部署不走这一步，所以不再追。
 
+### 接入 sparse MLA backend（`SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION`）
+
+- 开关默认关。打开后 bf16 indexer 输出物理 slot（`physical=True`），`_forward_mla` 走 `sglang_tpu_pallas::dsa_fp8_attention`（`topk_is_physical=True`），只做 `PhysicalTopKValidation`。
+- 启动时拒绝未验证的配置：未开 `SGLANG_TPU_DSA_BF16_INDEXER`、kpool≠1、KV 不是 `fp8_e4m3`、投机解码、无 rope、attention TP>1。MIXED batch 在 trace 时报 `NotImplementedError`（Source 的 MIXED 走 bf16 QK + HLO overlap，未迁移）。
+- op 在 backend `__init__` 里建好：在 `torch.compile` 图里第一次建 op 会因 `inspect.signature` 的 `id()` 报 Dynamo `Unsupported`（exp-ysc3sht8pz，提交 03a94d2 修复）。
+- 验证（V，exp-s8jck2ktyv，提交 03a94d2）：`check_source_attention_backend.py` 经 `_forward_mla`（编译）跑 extend 2048、unaligned extend、decode b64，输出和 split cache 与 Ported-S JAX 逐字节一致；MIXED 报错；`test_dsa_bf16_indexer_wiring.py` 8/8 通过。
+- 未做：attention TP>1 的 token split，MIXED / 投机解码路径，真实模型层上的端到端。
+
 ## 多机模型端到端（推迟到整个 DSA 迁完并完成整体对比之后）
 
 - 资源：GLM-5.2 FP8（约 762 GB）需要 2 台 tpu7x 主机、tp16（`benchmark/tpu/recipe/configs/glm_5_2/server.py`）。目前所有 Falcon manifest 都是单 pod（`2x2x1`），需要一个 2 主机 job。
