@@ -922,7 +922,7 @@ def sparse_ragged_paged_attention(
     # still be read while i gathers). Fresh outputs of every chunk are one
     # shared uninitialized buffer under torch_tpu, copied before each call
     # (16 x ~1 ms at extend 2048, exp-qyuatjpneb); reused dead buffers are not.
-    reuse_gather = sparsecore_layout and topk_cap is None
+    reuse_gather = False  # A/B branch: PR 2070 alone must remove the copies
     gather_ring = []  # raw gather outputs of the last two chunks, oldest first
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
