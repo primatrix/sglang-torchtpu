@@ -299,6 +299,8 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
             _prefill_op=None,
             # A model with rope: the op gets both caches.
             _zero_rope=False,
+            # The Target op path, not SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION.
+            _source_fp8_attention=False,
             # _mla_kernel_args passes these through, so names stand in for them.
             forward_metadata=SimpleNamespace(
                 kv_lens="kv_lens",
