@@ -148,6 +148,26 @@ FP8 UE8M0 indexer + per-query sparse MLA（64 head 下 q-block 的 VMEM 不够�
   `RET_CHECK ... Could not find buffer`（radix_topk_v2）。把 page table、token slot、`cu_kv_lens`
   从 jit 闭包常量改成 jit 参数后通过。是常量折进 SparseCore 调用导致的推断（I），未确认。
 
+## PR 2198 基线形状下的整层对比（exp-jgbl4d045u，提交 bb6a055）
+
+形状按 PR sgl-project/sglang-torchtpu#2198（exp-6mtkc6t2qi，TP16 / attn-DP16 / EP16）每个 attention-DP rank 推算（I）：H=64，attention TP 1，随机输入，单芯片，不起服务。Ported-S / Target page 128，Source page 64（基线本身是 page 64）。
+
+device module 时间，µs：
+
+| 用例 | 形状 | Source | Ported-S JAX | Ported-S torch op | Target |
+|---|---|---|---|---|---|
+| extend_c1 | 1 x 2048，prefix 49,152 | 12981 | 13016 | 12865 | 9012 |
+| extend_c2 | 1 x 2048，prefix 51,200 | 12970 | 13003 | 12855 | 9085 |
+| verify_b4 | 4 x 6，context 约 90K | 不可跑 | 445 | 440 | 1288 |
+| decode_b4 | 4 x 1，context 约 90K | 208 | 216 | 228 | 211 |
+
+- 正确性：extend_c1 / c2、decode_b4 上 Ported-S JAX 对 Source 四项（index cache、slot、split KV、输出）逐字节一致；torch op 对 JAX 在 extend 两个用例、decode_b4 上逐字节一致。verify_b4 的 prefix 不是 64 的倍数，key store 走 XLA fallback，torch op 的 index cache 和输出与 JAX 不一致（已知约 1 bf16 ulp，split KV 一致），只报告。verify 下 Source 的 key store 是未随包的 XLA chain，不可跑。
+- extend：Ported-S 比 Target 慢约 1.44x（小形状下是约 2x）。Ported-S 的大头是 `dsa_paged_extend_score_block_paged`（每块约 1.7 ms）和 attention；Target 的大头是 indexer：`StreamIdxTC` 2.3-2.4 ms + SparseCore top-k 1.6 ms。
+- verify：Ported-S 比 Target 快约 2.9x。Target 的 `StreamIdxTC-m-bq_128` 对 24 行占 1025 us，推测是 128 行 query block 的填充（I，未查）。
+- decode：三方持平（208-228 us）。
+- 选择偏差（对各自 indexer 的 f64 精确分，最大值）：Ported-S 0.11%-0.24%，超过 2% 的比例 0；Target 1.9%-2.3%，超过 2% 的比例 0-22%。Target 与 Ported-S 选中行的重合度 3%-9%（随机输入，长 context 下分数更平）。
+- attention 中位相对误差（对未量化 K/V 的 f64 参考）：Ported-S 6.7%-7.6%，Target 5.2%-6.6%。
+
 ## 多机模型端到端（推迟到整个 DSA 迁完并完成整体对比之后）
 
 - 资源：GLM-5.2 FP8（约 762 GB）需要 2 台 tpu7x 主机、tp16（`benchmark/tpu/recipe/configs/glm_5_2/server.py`）。目前所有 Falcon manifest 都是单 pod（`2x2x1`），需要一个 2 主机 job。
