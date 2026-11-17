@@ -82,8 +82,7 @@ role_to_task_spec:
       R=benchmark/tpu/dsa_k_prologue/hlo_copy_report.py
       for V in jax_sc torch_sc; do
         H=/tmp/hlo_$V; rm -rf "$H"; mkdir -p "$H"
-        XLA_FLAGS="--xla_dump_to=$H --xla_dump_hlo_as_text" \
-        LIBTPU_INIT_ARGS="--xla_dump_to=$H --xla_dump_hlo_as_text" \
+        HLO_OUT="$H" XLA_FLAGS="--xla_dump_to=$H --xla_dump_hlo_as_text" \
           $PY $D --variant $V --npz-dir "$OUT/att" --xprof-dir "$OUT/xprof" > "$OUT/diag_$V.log" 2>&1 || rc=1
         grep '^DIAG' "$OUT/diag_$V.log" | cut -c1-1500
         grep -q '^DIAG' "$OUT/diag_$V.log" || tail -n 40 "$OUT/diag_$V.log"

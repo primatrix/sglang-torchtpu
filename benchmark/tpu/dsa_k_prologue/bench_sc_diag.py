@@ -71,6 +71,16 @@ def run_jax(a, c, ref, layout):
         st["c"] = (no, ro)
         return out
 
+    hlo_out = os.environ.get("HLO_OUT")
+    if hlo_out:
+        # Fallback to XLA_FLAGS dumps: the compiled (after optimizations) module text.
+        try:
+            text = jf.lower(*st["c"], *ins).compile().as_text()
+            os.makedirs(hlo_out, exist_ok=True)
+            with open(os.path.join(hlo_out, "jax_step.after_optimizations.txt"), "w") as f:
+                f.write(text)
+        except Exception as e:  # report, do not hide
+            print(f"HLO_TEXT_ERROR {e!r}"[:500], flush=True)
     out = np.asarray(call())
     sync = lambda: jax.block_until_ready(st["c"][0])
     r = {"us": round(att._median_time(call, sync, a.iters, a.repeats)[0], 1)}
