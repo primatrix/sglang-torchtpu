@@ -14,6 +14,10 @@ role_to_task_spec:
       OUT="${ARTIFACT_LOCAL_DIR:-/tmp/m1-out}"
       mkdir -p "$OUT" /tmp/tpu_logs/tmp /tmp/tpu_logs/uv-cache /tmp/wheels /tmp/source
       export TMPDIR=/tmp/tpu_logs/tmp UV_CACHE_DIR=/tmp/tpu_logs/uv-cache PYTHONUNBUFFERED=1
+      # Two runs hit ENOSPC extracting wheels into the uv cache (exp-zqigrykir9,
+      # exp-zwd5kd10b4): no cache copy, and log free space per mount.
+      export UV_NO_CACHE=1
+      df -h /tmp /workspace /dev/shm 2>/dev/null | sed "s/^/DISK /"
       git clone --filter=blob:none https://github.com/primatrix/sglang-torchtpu.git /workspace/sglang-torchtpu
       cd /workspace/sglang-torchtpu
       git checkout --detach 5e054a6cb8fbe28a683a523b523394799cc7ddaa
@@ -59,6 +63,7 @@ role_to_task_spec:
       git checkout -- python/pyproject.toml 2>/dev/null || true
       echo "torch_tpu install rc=$INSTALL_RC" | tee -a "$OUT/torch_install.log"
       if [ "$INSTALL_RC" != 0 ]; then tail -n 30 "$OUT/torch_install.log"; exit 2; fi
+      rm -rf /tmp/tpu_logs/uv-cache/* /tmp/tpu_logs/tmp/* 2>/dev/null; df -h /tmp | sed "s/^/DISK after install /"
       PY=/tmp/venv-torch/bin/python
       export PYTHONPATH="/workspace/sglang-torchtpu/python:/workspace/sglang-torchtpu"
 
