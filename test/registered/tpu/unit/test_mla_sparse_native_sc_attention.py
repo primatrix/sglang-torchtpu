@@ -252,10 +252,10 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             atol=2e-2,
         )
 
-    def test_sparsecore_layout_reuses_gather_buffers_across_chunks(self):
-        """Four chunks (128, 128, 128, 64 tokens): chunks 1 and 2 gather into a
-        zero-filled and chunk 0's buffer, and the shorter last chunk into a
-        fresh one. Every chunk must still attend to its own gathered rows."""
+    def test_sparsecore_layout_matches_across_chunks(self):
+        """Four chunks (128, 128, 128, 64 tokens) of native SparseCore gathers in
+        one program, the last one shorter. Every chunk must attend to its own
+        gathered rows, not an earlier chunk's output buffer."""
         if jax.devices()[0].platform != "tpu":
             self.skipTest("SparseCore cache-layout attention requires a TPU")
         problem = _build_problem(

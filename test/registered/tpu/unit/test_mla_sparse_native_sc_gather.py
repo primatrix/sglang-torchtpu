@@ -149,66 +149,6 @@ class NativeScGatherTest(absltest.TestCase):
                     np.asarray(gathered_rope)[:groups], expected_rope[:groups]
                 )
 
-    def test_out_init_buffers_receive_the_gather(self):
-        """With ``out_init`` the gather writes the given buffers: live rows hold
-        the gathered rows and rows past ``num_live_indices`` keep the buffer's
-        values. sparse_ragged_paged_attention relies on this to reuse an
-        earlier chunk's dead outputs instead of a shared fresh buffer."""
-        if jax.devices()[0].platform != "tpu":
-            self.skipTest("native-SC gather requires a TPU SparseCore")
-
-        pages, page_size = 64, 1024
-        cache_tokens = pages * page_size
-        query_tokens, topk = 16, 2048
-        count = query_tokens * topk
-        rng = np.random.default_rng(20261117)
-        nope_u8 = rng.integers(0, 256, (pages, page_size, 4, 128), np.uint8)
-        rope_u8 = rng.integers(0, 0x7E, (pages, page_size // 4, 4, 128), np.uint8)
-        rope_u8[..., 64:] = 0
-        nope_i32 = native_sc_cache_layout.pack_nope(nope_u8)
-        rope_i32 = native_sc_cache_layout.pack_rope_banded(rope_u8)
-        flat_nope = native_sc_cache_layout.flatten_nope_rows(nope_i32)
-        flat_rope_u8 = rope_u8.reshape(-1, 128)
-        flat_indices = rng.integers(0, cache_tokens, count, dtype=np.int32)
-        indices = jnp.asarray(flat_indices.reshape(query_tokens, topk))
-        # Values no gathered row can hold in these positions: rope bytes are < 0x7E.
-        nope_fill = np.full((count, 128), 0xDEADBEEF, np.uint32)
-        rope_fill = np.full((count // 4, 128), 0xFFFFFFFF, np.uint32)
-        num_live = 5 * topk
-
-        gathered_nope, gathered_rope = native_sc_gather.dsa_gather_native_sc(
-            jnp.asarray(nope_i32),
-            jnp.asarray(rope_i32),
-            indices,
-            out_size=count,
-            atoms_per_batch=1,
-            num_live_indices=jnp.int32(num_live),
-            live_multiple=topk,
-            out_init=(jnp.asarray(nope_fill), jnp.asarray(rope_fill)),
-        )
-        gathered_nope = np.asarray(jax.block_until_ready(gathered_nope))
-        gathered_rope = np.asarray(gathered_rope)
-
-        live = flat_indices[:num_live]
-        groups = num_live // native_sc_gather.ROPE_PACKING
-        np.testing.assert_array_equal(gathered_nope[:num_live], flat_nope[live])
-        np.testing.assert_array_equal(
-            gathered_rope[:groups],
-            native_sc_cache_layout.pack_selected_rope_for_tc(flat_rope_u8[live]),
-        )
-        np.testing.assert_array_equal(gathered_nope[num_live:], nope_fill[num_live:])
-        np.testing.assert_array_equal(gathered_rope[groups:], rope_fill[groups:])
-
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            native_sc_gather.dsa_gather_native_sc(
-                jnp.asarray(nope_i32),
-                jnp.asarray(rope_i32),
-                indices,
-                out_size=count,
-                atoms_per_batch=1,
-                out_init=(jnp.asarray(nope_fill[:-1]), jnp.asarray(rope_fill)),
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

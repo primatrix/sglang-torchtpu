@@ -917,30 +917,9 @@ def sparse_ragged_paged_attention(
         else None
     )
 
-    # SparseCore layout: chunk i's native gather writes into chunk i - 2's gather
-    # outputs, which that chunk's attention has finished reading (i - 1's may
-    # still be read while i gathers). Fresh outputs of every chunk are one
-    # shared uninitialized buffer under torch_tpu, copied before each call
-    # (16 x ~1 ms at extend 2048, exp-qyuatjpneb); reused dead buffers are not.
-    reuse_gather = sparsecore_layout and topk_cap is None
-    gather_ring = []  # raw gather outputs of the last two chunks, oldest first
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
-        out_init = None
-        if reuse_gather and len(gather_ring) == 2:
-            old = gather_ring[0]
-            # A shorter last chunk has smaller outputs: start it fresh.
-            if old is not None and old[0].shape[0] == (end_pos - start_pos) * topk:
-                out_init = old
-        elif reuse_gather and len(gather_ring) == 1 and gather_ring[0] is not None:
-            # Chunk 1 has no dead buffer yet. A fresh one is the same shared
-            # `empty` as chunk 0's under torch_tpu, so it would be copied
-            # (~1.3 ms, exp-33hbkanalb); a zero fill is a distinct buffer and
-            # only writes it once.
-            first = gather_ring[0]
-            if first[0].shape[0] == (end_pos - start_pos) * topk:
-                out_init = tuple(jnp.zeros(b.shape, b.dtype) for b in first)
         result = sparse_attention_chunk(
             q,
             cache_kv_nope,
@@ -967,12 +946,7 @@ def sparse_ragged_paged_attention(
             topk_cap=topk_cap,
             topk_override=topk,
             gather_rope=gather_rope,
-            gather_out_init=out_init,
-            return_gather=reuse_gather,
         )
-        if reuse_gather:
-            result, raw = result
-            gather_ring = (gather_ring + [raw])[-2:]
         if return_lse:
             q, lse = result
         else:
@@ -1079,14 +1053,8 @@ def sparse_attention_chunk(
     topk_cap: int | None = None,
     topk_override: int | None = None,
     gather_rope: bool = True,
-    gather_out_init: tuple[jax.Array, jax.Array] | None = None,
-    return_gather: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
-
-    `gather_out_init` / `return_gather` (SparseCore layout, no `topk_cap`): reuse
-    an earlier chunk's native gather outputs as this chunk's output buffers, and
-    return `(result, gather_outputs)` so a later chunk can reuse this one's.
 
     The output aliases `q`. Returns the updated `q`, or `(q, lse)` when `lse`
     is given. The attention grid is rounded up to its kernel batch size, so
@@ -1287,7 +1255,6 @@ def sparse_attention_chunk(
     # based on their lengths. For the sequences-segment below certain length,
     # we use a different kernel (dense attention and mask), for the rest of
     # sequences, we use this gather-and-attention kernel.
-    gathered_raw = None  # set by the native SparseCore gather below
     if topk_cap is not None:
         # Window-major: window w of the chunk's top-k is rows [w*C, (w+1)*C)
         # of a [W*C, topk_cap] index array; window 0 is the plain `topk_cap`
@@ -1355,11 +1322,9 @@ def sparse_attention_chunk(
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
-                out_init=gather_out_init,
                 **live_kwargs,
             )
         )
-        gathered_raw = (gathered_nope_buffer, gathered_rope_buffer)
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
@@ -1382,7 +1347,7 @@ def sparse_attention_chunk(
     # We treat each query token as a one independent sequence, attend to their
     # respective gathered kv tokens in the `gathered_kv_buffer`.
     # -1 in topk_indices is padded elements at the end of each row.
-    result = run_mla_kernel(
+    return run_mla_kernel(
         q,
         gathered_nope_buffer,
         gathered_rope_buffer,
@@ -1392,8 +1357,3 @@ def sparse_attention_chunk(
         kernel_batch_size=kernel_batch_size,
         lse=lse,
     )
-    if return_gather:
-        # The native SparseCore gather's raw outputs, for a later chunk to
-        # reuse as its output buffers (None on the other gather paths).
-        return result, gathered_raw
-    return result
