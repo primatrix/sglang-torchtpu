@@ -16,9 +16,9 @@ Chains the migrated source modules (``source_dsa``) the way the source
    SparseCore microbatch and run ``sparse_core_tensor_core_dsa``.
 
 The source computation is unchanged. Framework adaptation (not in the source):
-the cache arrives at page 128 and is viewed as page 64 (framework page ``p`` =
-source pages ``2p``, ``2p + 1``), as ``dsa_bf16_indexer`` does for the index
-cache. Split latent ``[P, 128, 4, 128]`` and RoPE ``[P, 32, 4, 128]`` are
+at page 64 (the PR 2198 baseline) the cache is the source's own layout; at
+page 128 it is viewed as page 64 (framework page ``p`` = source pages ``2p``,
+``2p + 1``), as ``dsa_bf16_indexer`` does for the index cache. At page 128, Split latent ``[P, 128, 4, 128]`` and RoPE ``[P, 32, 4, 128]`` are
 ``[2P, 64, 4, 128]`` and ``[2P, 16, 4, 128]`` in the same memory.
 """
 
@@ -83,32 +83,38 @@ def source_step(
     return out[: q_latent.shape[0]], cache
 
 
-def source_page_table(page_indices):
-    """Framework pages ``[p, ...]`` -> source pages ``[2p, 2p + 1, ...]``."""
+def source_page_table(page_indices, split=SPLIT):
+    """Framework pages ``[p, ...]`` -> source pages ``[2p, 2p + 1, ...]`` (page 128)."""
     p = page_indices.astype(jnp.int32)
-    return jnp.stack([p * SPLIT + j for j in range(SPLIT)], axis=-1).reshape(-1)
+    if split == 1:
+        return p
+    return jnp.stack([p * split + j for j in range(split)], axis=-1).reshape(-1)
 
 
 def fp8_attention_step(
     latent, rope, q_latent, q_rope, kv_c, k_pe, topk, kv_lens, page_indices, cu_q_lens,
     sm_scale, *, allow_fp8_q, is_prefill, topk_is_physical=False,
 ):
-    """Page-128 framework entry: split u8 latent ``[P,128,4,128]`` + RoPE ``[P,32,4,128]``.
+    """Framework entry: split u8 latent ``[P, page, 4, 128]`` + RoPE ``[P, page // 4, 4, 128]``.
 
-    ``topk`` is the indexer's sequence-local rows (-1 padded), or its flat
-    cache slots when ``topk_is_physical``; the page table
+    ``page`` is 64 (the source's own page, run as is) or 128 (viewed as two
+    64-token source pages). ``topk`` is the indexer's sequence-local rows (-1
+    padded), or its flat cache slots when ``topk_is_physical``; the page table
     has a fixed number of pages per request row. Returns ``(out, latent, rope)``.
     """
-    if latent.shape[1:] != (FRAMEWORK_PAGE, 4, 128) or rope.shape[1:] != (FRAMEWORK_PAGE // 4, 4, 128):
-        raise ValueError(f"expected split FP8 KV at page 128, got {latent.shape} {rope.shape}")
+    page = latent.shape[1]
+    if page not in (SOURCE_PAGE, FRAMEWORK_PAGE) or latent.shape[2:] != (4, 128) \
+            or rope.shape[1:] != (page // 4, 4, 128):
+        raise ValueError(f"expected split FP8 KV at page 64 or 128, got {latent.shape} {rope.shape}")
+    split = page // SOURCE_PAGE
     num_seqs = kv_lens.shape[0]
     pages_per_row = page_indices.shape[0] // num_seqs
-    cu_kv_lens = jnp.arange(num_seqs + 1, dtype=jnp.int32) * (pages_per_row * FRAMEWORK_PAGE)
+    cu_kv_lens = jnp.arange(num_seqs + 1, dtype=jnp.int32) * (pages_per_row * page)
     view = SplitFP8KVCache(
         latent.reshape(-1, SOURCE_PAGE, 4, 128), rope.reshape(-1, SOURCE_PAGE // 4, 4, 128)
     )
     out, view = source_step(
-        view, q_latent, q_rope, kv_c, k_pe, topk, kv_lens, source_page_table(page_indices),
+        view, q_latent, q_rope, kv_c, k_pe, topk, kv_lens, source_page_table(page_indices, split),
         cu_q_lens, cu_kv_lens, sm_scale, allow_fp8_q=allow_fp8_q, is_prefill=is_prefill,
         topk_is_physical=topk_is_physical,
     )

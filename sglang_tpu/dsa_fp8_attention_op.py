@@ -3,8 +3,8 @@
 
 ``sglang_tpu_pallas::dsa_fp8_attention`` runs
 ``dsa_fp8_attention.fp8_attention_step``: quantize this step's latent + k_rope
-into the split FP8 cache (u8 latent ``[P, 128, 4, 128]`` and RoPE
-``[P, 32, 4, 128]``, both donated and aliased), map the indexer's
+into the split FP8 cache (u8 latent ``[P, page, 4, 128]`` and RoPE
+``[P, page // 4, 4, 128]``, page 64 or 128, both donated and aliased), map the indexer's
 sequence-local top-k to physical rows (or, with ``topk_is_physical``, only
 validate the indexer's flat cache slots), and run the source's
 ``sparse_core_tensor_core_dsa`` (SparseCore gather + TensorCore FP8 attention).

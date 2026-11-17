@@ -6,9 +6,9 @@ indexer emits. Each timed call is the side's whole attention step as the backend
 runs it: write this step's KV into the FP8 cache, then attend over the picked rows.
 
 * ported_s: ``sglang_tpu_pallas::dsa_fp8_attention`` (split FP8, per-token f32
-  scale, fp8-qk-pv), page 128.
+  scale, fp8-qk-pv), page 64.
 * target: ``sglang_tpu_pallas::sparse_mla_attention_fused`` (per-query kernel, FP8
-  per-tensor k_scale=1, the torch-side ``_quantize_kv_to_fp8`` in the graph). The
+  per-tensor k_scale=1, page 64, the torch-side ``_quantize_kv_to_fp8`` in the graph). The
   PR 2198 baseline does not set SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL.
 
 Shapes: PR sgl-project/sglang-torchtpu#2198 baseline, per attention-DP rank (H=64).
@@ -30,7 +30,9 @@ import bench_fp8_attention_ab as att  # noqa: E402
 from check_physical_topk import to_physical  # noqa: E402
 
 CASES = ("pr2198_extend_c1", "pr2198_extend_c2", "pr2198_verify_b4", "pr2198_decode_b4")
-FP = att.FP
+# The PR 2198 baseline serves at page 64. att's case builder and f64 references read
+# the module-level page size at call time, so both sides and the references follow it.
+FP = att.FP = 64
 
 
 def stage_prep(a):
@@ -48,10 +50,10 @@ def stage_prep(a):
         P, n = c["P"], c["P"] * FP
         kv, pe = jnp.asarray(c["prefix_kv"]), jnp.asarray(c["prefix_pe"])
         # Ported-S: every slot holds a per-token-scaled prefix row, as the source writer stores it.
-        empty = SplitFP8KVCache(jnp.zeros((2 * P, 64, 4, 128), jnp.uint8),
-                                jnp.zeros((2 * P, 16, 4, 128), jnp.uint8))
+        empty = SplitFP8KVCache(jnp.zeros((P, FP, 4, 128), jnp.uint8),
+                                jnp.zeros((P, FP // 4, 4, 128), jnp.uint8))
         split = jax.jit(lambda cc, kv_, pe_: _scatter_fused_kv_paged(
-            cc, kv_, pe_, jnp.array([n], jnp.int32), jnp.arange(2 * P, dtype=jnp.int32),
+            cc, kv_, pe_, jnp.array([n], jnp.int32), jnp.arange(P, dtype=jnp.int32),
             jnp.array([0, n], jnp.int32), jnp.array([0, n], jnp.int32),
             kv_lora_rank=att.LAT, fp8_dtype=jnp.float8_e4m3fn))(empty, kv, pe)
         # Target: the same rows through its own writer (per-tensor k_scale=1).
@@ -94,7 +96,7 @@ def stage_torch(a):
         rows_bf = att.bf16_rows(c)
         ql, qr, kvc, kpe = (bf(c[k]) for k in ("q_latent", "q_rope", "kv_c", "k_pe"))
         kv, pi, cuq = dev(c["kv"]), dev(c["pi"]), dev(c["cu_q"])
-        slots = dev(to_physical(c["topk"], c["pi"], c["ppr"], c["cu_q"]))
+        slots = dev(to_physical(c["topk"], c["pi"], c["ppr"], c["cu_q"], page=FP))
         logical = dev(c["topk"])
         cukv = dev((np.arange(S + 1) * c["ppr"] * FP).astype(np.int32))
         dist = dev(np.array([S] * 3 if c["mode"] == "decode" else [0, 0, S], np.int32))
@@ -116,7 +118,7 @@ def stage_torch(a):
                 fresh = lambda: tuple(dev(ref[k]) for k in caches)
                 out = cf(*fresh(), ql, qr, kvc, kpe)
                 out = out.cpu().view(torch.int16).numpy().view(np.uint16)
-                r ={"accuracy_vs_bf16": att.error_vs_bf16(c, _as_f64(out), rows_bf)}
+                r = {"accuracy_vs_bf16": att.error_vs_bf16(c, _as_f64(out), rows_bf)}
                 bargs = (*fresh(), ql, qr, kvc, kpe)
                 r["us"], _ = att._median_time(lambda: cf(*bargs), sync, a.iters, a.repeats)
                 if a.xprof_dir:
