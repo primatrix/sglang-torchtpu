@@ -50,6 +50,7 @@ FP8 = jnp.float8_e4m3fn
 def source_step(
     cache, q_latent, q_rope, kv_c, k_pe, topk, seq_lens, page_indices, cu_q_lens, cu_kv_lens,
     sm_scale, *, allow_fp8_q, is_prefill, topk_is_physical=False, precision="fp8-qk-pv",
+    tiles=None,
 ):
     """The source ``_run`` body at page 64: returns ``(out [T, H, 512], cache)``."""
     page_size = cache_primary(cache).shape[1]
@@ -71,7 +72,8 @@ def source_step(
     )
     if plan.cache_read_mode != "packed":
         raise ValueError(f"expanded cache reads are not migrated (plan {plan})")
-    bq_sparse, bq, b_topk = plan.tiles
+    # ``tiles`` (bq_sparse, bq, b_topk) overrides the plan's tiles; for tuning only.
+    bq_sparse, bq, b_topk = tiles if tiles is not None else plan.tiles
     flat = map_cache_parts(lambda part: part.reshape(-1, *part.shape[2:]), cache)
     out = sparse_core_tensor_core_dsa(
         _pad_first_axis(q_latent, bq_sparse), _pad_first_axis(q_rope, bq_sparse), flat,
@@ -93,7 +95,7 @@ def source_page_table(page_indices, split=SPLIT):
 
 def fp8_attention_step(
     latent, rope, q_latent, q_rope, kv_c, k_pe, topk, kv_lens, page_indices, cu_q_lens,
-    sm_scale, *, allow_fp8_q, is_prefill, topk_is_physical=False,
+    sm_scale, *, allow_fp8_q, is_prefill, topk_is_physical=False, tiles=None,
 ):
     """Framework entry: split u8 latent ``[P, page, 4, 128]`` + RoPE ``[P, page // 4, 4, 128]``.
 
@@ -116,7 +118,7 @@ def fp8_attention_step(
     out, view = source_step(
         view, q_latent, q_rope, kv_c, k_pe, topk, kv_lens, source_page_table(page_indices, split),
         cu_q_lens, cu_kv_lens, sm_scale, allow_fp8_q=allow_fp8_q, is_prefill=is_prefill,
-        topk_is_physical=topk_is_physical,
+        topk_is_physical=topk_is_physical, tiles=tiles,
     )
     return out, view.latent.reshape(latent.shape), view.rope.reshape(rope.shape)
 
