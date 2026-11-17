@@ -107,6 +107,47 @@ Ported-S 在 page 128 上用 2×64 页视图调用迁移的 Source 代码（`dsa
 - 验证（V，exp-s8jck2ktyv，提交 03a94d2）：`check_source_attention_backend.py` 经 `_forward_mla`（编译）跑 extend 2048、unaligned extend、decode b64，输出和 split cache 与 Ported-S JAX 逐字节一致；MIXED 报错；`test_dsa_bf16_indexer_wiring.py` 8/8 通过。
 - 未做：attention TP>1 的 token split，MIXED / 投机解码路径，真实模型层上的端到端。
 
+## 整层 S1–S6 三方对比
+
+配置：单芯片 v7x，64 head，K=2048，bench `bench_dsa_layer_ab.py`（提交 5dd9d33，exp-rii7xivn5y）。
+一层 = index key 写入、打分、top-k，然后 split FP8 KV 写入和 attention。各方按部署方式跑：
+Source 用物理 slot（`output_physical_slots=True` + `PhysicalTopKValidation`）；Ported-S 用
+`physical=True` / `topk_is_physical=True`（torch 版是两个 op 放在一张编译图里，等于 backend
+同时开 `SGLANG_TPU_DSA_BF16_INDEXER=1` 和 `SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION=1`）；Target 是
+FP8 UE8M0 indexer + per-query sparse MLA（64 head 下 q-block 的 VMEM 不够）。
+
+正确性（V）：
+- Ported-S JAX 对 Source：extend 2048 和 decode b64 的 index cache、slot、split KV、输出都逐字节一致。
+  unaligned extend 没有 Source 数（Source 的 key store 在这里走未随包提供的 XLA chain）。
+- torch op 对 Ported-S JAX：extend 2048 和 decode b64 逐字节一致；unaligned 的 index cache 和输出不一致，
+  是已知的约 1 bf16 ulp key-store 差异（见"已知差异"），split KV 一致。
+
+耗时（module µs）与质量：
+
+| 用例 | Source | Ported-S JAX | Ported-S torch | Target |
+|---|---|---|---|---|
+| extend 2048 | 10739 | 10749 | 10723 | 5449 |
+| unaligned extend | — | 11298 | 11267 | 4905 |
+| decode b64 | 1286 | 1233 | 1217 | 446 |
+
+| 用例 | 选择偏差 max / 超 2% 的比例（Ported-S） | 同（Target，对自己的 FP8 key） | attention 中位 / 最大相对误差（Ported-S / Target） | Target 与 Ported-S 选中行重合 |
+|---|---|---|---|---|
+| extend 2048 | 0.0024 / 0 | 0.024 / 28% | 7.8% / 13.0%，6.6% / 9.3% | 34% |
+| unaligned extend | 0.0017 / 0 | 0.027 / 31% | 7.5% / 10.5%，5.9% / 8.8% | 34% |
+| decode b64 | 0.0027 / 0 | 0.023 / 16% | 7.7% / 13.9%，7.0% / 12.2% | 25% |
+
+说明：
+- 选择偏差 = 1 − 选中的最低精确分 / 第 k 大精确分（f64，各方对自己存的 key 和 query）。attention 误差是对
+  未量化 K/V 在各自选中行上的 f64 attention。
+- 迁移的整层与 Source 一致，且 torch op 没有额外开销（10723 对 10739 µs）。
+- 整层上 Ported-S 比 Target 慢约 2×（prefill）和约 2.7×（decode）。Ported-S 的选择质量明显更好
+  （超 2% 偏差的比例为 0，Target 为 16–31%）；attention 精度两边相近，Target 略好。
+- 两边选中的行只重合 25–34%：key 链不同（Target W8A8、eps 1e-6、无 Hadamard、FP8 UE8M0 存储），
+  所以 Target 的 attention 是在另一组行上算的。随机输入下这个数只说明两边选择差得多，不代表模型质量。
+- 第一轮（exp-eugdo5kysz，6825f63）Source 那一方在 extend 2048 编译时 SparseCore lowering 报
+  `RET_CHECK ... Could not find buffer`（radix_topk_v2）。把 page table、token slot、`cu_kv_lens`
+  从 jit 闭包常量改成 jit 参数后通过。是常量折进 SparseCore 调用导致的推断（I），未确认。
+
 ## 多机模型端到端（推迟到整个 DSA 迁完并完成整体对比之后）
 
 - 资源：GLM-5.2 FP8（约 762 GB）需要 2 台 tpu7x 主机、tp16（`benchmark/tpu/recipe/configs/glm_5_2/server.py`）。目前所有 Falcon manifest 都是单 pod（`2x2x1`），需要一个 2 主机 job。
