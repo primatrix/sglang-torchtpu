@@ -35,10 +35,32 @@ def _summ(d, iters):
     from xplane_summary import summarize
 
     x = summarize(d, iters, top=15)
-    return {"module_us": round(sum(u for _, u in x.get("modules", [])), 1),
-            "modules": [(n[:50], round(u, 1)) for n, u in x.get("modules", [])[:6]],
-            "top_ops": [(n[:70], round(u, 1)) for n, u in x.get("ops", [])[:15]],
-            "summary_error": x.get("error", "")}
+    r = {"module_us": round(sum(u for _, u in x.get("modules", [])), 1),
+         "modules": [(n[:50], round(u, 1)) for n, u in x.get("modules", [])[:6]],
+         "top_ops": [(n[:70], round(u, 1)) for n, u in x.get("ops", [])[:15]],
+         "summary_error": x.get("error", "")}
+    # Category split and per-line busy time (bench_target_baseline's categories);
+    # SparseCore TEC lines are folded to min / max so the row stays short.
+    try:
+        from bench_target_baseline import CATEGORIES
+        from xplane_summary import breakdown
+
+        b = breakdown(d, iters, CATEGORIES)
+        lines = b.get("lines", {})
+        tec = [round(v, 1) for k, v in lines.items() if "TEC" in k or "SparseCore" in k]
+        r["breakdown"] = {
+            "categories": b.get("categories", {}),
+            "module_span_us": b.get("module_span_us"),
+            "ops_busy_us": b.get("ops_busy_us"),
+            "tc_lines": {k.split("|")[-1].strip(): round(v, 1) for k, v in lines.items()
+                         if "TEC" not in k and "SparseCore" not in k and v > 1},
+            "sc_lines": {"n": len(tec), "min": min(tec, default=None),
+                         "max": max(tec, default=None)},
+            "error": b.get("error", ""),
+        }
+    except Exception as e:  # report, do not hide
+        r["breakdown"] = {"error": repr(e)[:500]}
+    return r
 
 
 def run_jax(a, c, ref, layout):
@@ -104,17 +126,21 @@ def run_torch(a, c, ref, layout):
     from sglang_tpu.attention_pallas_mla_sparse import _build_pallas_sparse_mla_kernel_op
     from sglang_tpu.attention_pallas_rpa_base import _quantize_kv_to_fp8
 
-    op = _build_pallas_sparse_mla_kernel_op(topk_is_physical=True)
+    # "sclog": SparseCore layout with logical top-k rows and the page table (the
+    # PR path when no physical-slot indexer is wired).
+    logical = layout == "sclog"
+    op = _build_pallas_sparse_mla_kernel_op(topk_is_physical=not logical)
     sync = torch.accelerator.synchronize
     dev = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to("tpu")
     bf = lambda x: torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).view(
         torch.bfloat16).to("tpu")
     f8 = torch.float8_e4m3fn
     S = c["S"]
-    keys = ("sc_nope", "sc_rope") if layout == "sc" else ("nope", "rope")
+    keys = ("sc_nope", "sc_rope") if layout in ("sc", "sclog") else ("nope", "rope")
     ql, qr, kvc, kpe = (bf(c[k]) for k in ("q_latent", "q_rope", "kv_c", "k_pe"))
     kv, pi, cuq = dev(c["kv"]), dev(c["pi"]), dev(c["cu_q"])
-    phys = dev(to_physical(c["topk"], c["pi"], c["ppr"], c["cu_q"], page=FP))
+    phys = dev(c["topk"]) if logical else dev(
+        to_physical(c["topk"], c["pi"], c["ppr"], c["cu_q"], page=FP))
     cukv = dev((np.arange(S + 1) * c["ppr"] * FP).astype(np.int32))
     dist = dev(np.array([S] * 3 if c["mode"] == "decode" else [0, 0, S], np.int32))
     sm = float(c["sm_scale"])
@@ -149,7 +175,7 @@ def run_torch(a, c, ref, layout):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--variant", choices=("jax_tc", "jax_sc", "torch_tc", "torch_sc"),
+    p.add_argument("--variant", choices=("jax_tc", "jax_sc", "torch_tc", "torch_sc", "torch_sclog"),
                    required=True)
     p.add_argument("--case", default="pr2198_extend_c1")
     p.add_argument("--iters", type=int, default=10)
