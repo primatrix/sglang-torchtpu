@@ -234,7 +234,43 @@ Source 原生路径（`DsaConfig.resolve` + `_run_exact`，默认 tile），同�
 
 ### trace 下载
 
-xprof trace 在 `gs://tpu-for-training-falcon-logs/experiments/<exp>/artifacts/<art>/xprof/`，当前账号 403（缺 `storage.objects.get`），需申请该 bucket 的 `roles/storage.objectViewer`。
+xprof trace 在 `gs://tpu-for-training-falcon-logs/experiments/<exp>/artifacts/<art>/xprof/`，当前账号 403（缺 `storage.objects.get`）。mentor 建议在线看；要下载可用 Falcon CPU 任务把文件转到 infer 的桶。运行中的实验可用 `falcon exp exec` 读 pod 内的 `/gcs/experiments/<exp>/artifacts/<art>/` 下的日志。
+
+## 以 Target 为基线优化 attention（S5–S6），PR 2198 形状，page 64
+
+Source 三种模式都慢于 Target，attention 改以 Target 为基线。接口约定（与 indexer 同事）：page 64，indexer 输出物理 slot，`int32[T, 2048]`，合法位置在前、-1 补齐，counts 由 attention 自算。
+
+### Target 接收物理 slot（exp-c8qjz2gj8f，提交 202a507）
+
+`sparse_mla_attention_fused(topk_is_physical=True)` 向 kernel 传 `page_indices=None`，跳过 `gather_page_ids`；torch op 名加 `_phys`，与 `qblock_kpool=1` 组合时报错。四个形状输出与原版逐字节一致。extend 快约 141-167 us（3.2%-3.8%，即 `gather_page_ids` 的 168 us），verify / decode 在波动内。基线 bench：`bench_target_baseline.py`。
+
+### Target 耗时拆分（exp-0ptaq1t3hy，提交 94181e7）
+
+- extend_c1 共 4330 us：TensorCore（XLA Ops 线）忙约 573 us，SparseCore 每个 TEC 忙约 2.4-2.5 ms；extend_c2 为 1046 us / 约 2.9 ms。extend 的瓶颈是 SparseCore gather。
+- verify_b4 138 us：TC attention 38、SC gather 37、其余小 op 约 45。decode_b4 64 us：11 / 10 / 约 30。
+- 分类里的 `sc_gather` 只计 TensorCore 线上的 `call-done`，extend 的 gather 量以 TEC 线忙碌时间为准。详见 `attention_profile_breakdown.md`。
+
+### q-block prefill 不适用
+
+GLM-5.2 kpool=1，走 `mla_sparse_qblock_tokens`，要求 page size 为 128 的倍数且每请求 ≤ 256 页；基线是 page 64、约 800 页，两条都不满足。按读全部页估算算量约为稀疏的 25 倍（I），长 context 下只会更慢，未实验。
+
+### QK 乘法消融（exp-wj9k1856ow，分支 `feat/qk-mxu-ablation`，提交 9ef1b32）
+
+只做 Q x K^T（G=32，D=512），比纯 FP8、K 反量化、Q 量化、W8A16（MXU 手写 / `dot`）和 BF16 参照。M=128-512 时四种只差 5%-8%；M=1024 时 Q 量化 143.5 对 W8A16 152.4 us，N=4096 时 189.4 对 214.5（Q 量化快约 13%，误差约 3%）。W8A16 与 K 反量化几乎相同，`dot` 与手写 MXU 相同。结论：W8A16 不是 Target 快的原因。LLO 指令计数未核对。
+
+### gather / tile 扫参（exp-cdkg2zm04b，提交 d9dd16a）
+
+`bench_target_gather_sweep.py`，所有能跑的变体输出与原版逐字节一致。wall time 中位数，us：
+
+| 用例 | 原版 Target | TensorCore 最优 | SparseCore 最优 |
+|---|---|---|---|
+| extend_c1 | 4329 | 4181（物理 slot，c128/b16，-3.4%） | **3577**（c128/a16/overlap_rope，-17.4%） |
+| verify_b4 | 141.1 | **129.1**（物理 slot，b4，-8.5%） | 131.2（a4/overlap_rope） |
+| decode_b4 | 82.2 | 80-85，波动内 | 84-93，device 时间约 60 对 57 |
+
+- TensorCore 布局只有 chunk / batch 可调（`sparsecore_*` 参数在此布局下不读）；batch 32 编译失败（VMEM 93.6 MB > 64 MB）；chunk 512 变慢。
+- SparseCore 布局：`atoms_per_batch` 16 最好，`overlap_rope` 比 `before_rope` 快 2%-4%，chunk 64 / 128 接近，256 变慢。verify 上 a16 不能整除（24 x 2048 行），失败。
+- 路线：extend 换 SparseCore 布局 + native gather（KV cache 改 u32，写入与 pool 分配随之改）；verify 用物理 slot + b4；decode 只能靠合并 kernel 外的小 op。
 
 ## 多机模型端到端（推迟到整个 DSA 迁完并完成整体对比之后）
 
