@@ -39,6 +39,7 @@ def main():
     import torch_tpu  # noqa: F401
 
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang_tpu.dsa_fp8_attention_op import build_dsa_fp8_attention_op
     from sglang_tpu.attention_pallas_mla_sparse import TpuPallasSparseMlaAttnBackend
 
     bf = lambda x: torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).view(torch.bfloat16).to("tpu")
@@ -53,6 +54,8 @@ def main():
         nope = dev(ref["lat0"].reshape(P, att.FP, 4, 128))
         rope = dev(ref["rope0"].reshape(P, att.FP // 4, 4, 128))
 
+        # __new__ skips __init__, which registers the op before compiling.
+        build_dsa_fp8_attention_op()
         backend = TpuPallasSparseMlaAttnBackend.__new__(TpuPallasSparseMlaAttnBackend)
         backend._source_fp8_attention = True
         backend._zero_rope = False

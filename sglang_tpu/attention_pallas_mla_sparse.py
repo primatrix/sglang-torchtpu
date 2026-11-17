@@ -347,6 +347,16 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
                 raise ValueError(
                     "SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION: " + "; ".join(problems)
                 )
+        # Register the source ops before the forward is compiled: their first
+        # build calls inspect.signature, which Dynamo cannot trace.
+        if tpu_envs.SGLANG_TPU_DSA_BF16_INDEXER.get():
+            from sglang_tpu.dsa_bf16_indexer_op import build_dsa_bf16_indexer_op
+
+            build_dsa_bf16_indexer_op()
+        if self._source_fp8_attention:
+            from sglang_tpu.dsa_fp8_attention_op import build_dsa_fp8_attention_op
+
+            build_dsa_fp8_attention_op()
 
     def _init_indexer_token_split(self) -> None:
         """Set up the DSA indexer token split (always on with attn-TP > 1)."""
