@@ -12,8 +12,10 @@ role_to_task_spec:
       set -u
       ulimit -c 0
       OUT="${ARTIFACT_LOCAL_DIR:-/tmp/m1-out}"
-      mkdir -p "$OUT" /tmp/tpu_logs/tmp /tmp/tpu_logs/uv-cache /tmp/wheels /tmp/source
-      export TMPDIR=/tmp/tpu_logs/tmp UV_CACHE_DIR=/tmp/tpu_logs/uv-cache PYTHONUNBUFFERED=1
+      # The root overlay had 20G free of 95G on three nodes (ENOSPC in uv extraction);
+      # temp files, uv cache and the venv go to /dev/shm (32G tmpfs) instead.
+      mkdir -p "$OUT" /dev/shm/tpu_logs/tmp /dev/shm/tpu_logs/uv-cache /tmp/wheels /tmp/source
+      export TMPDIR=/dev/shm/tpu_logs/tmp UV_CACHE_DIR=/dev/shm/tpu_logs/uv-cache PYTHONUNBUFFERED=1
       # Two runs hit ENOSPC extracting wheels into the uv cache (exp-zqigrykir9,
       # exp-zwd5kd10b4): no cache copy, and log free space per mount.
       export UV_NO_CACHE=1
@@ -54,7 +56,8 @@ role_to_task_spec:
 
       # As docker/tpu.Dockerfile: the TPU manifest replaces python/pyproject.toml.
       cp python/pyproject_tpu.toml python/pyproject.toml
-      uv venv --python 3.12 /tmp/venv-torch >> "$OUT/torch_install.log" 2>&1
+      uv venv --python 3.12 /dev/shm/venv-torch >> "$OUT/torch_install.log" 2>&1
+      ln -sfn /dev/shm/venv-torch /tmp/venv-torch
       VIRTUAL_ENV=/tmp/venv-torch SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0.dev0 uv pip install \
         --index-strategy unsafe-best-match -f "$LIBTPU_IDX" \
         --extra-index-url https://download.pytorch.org/whl/cpu \
@@ -63,7 +66,7 @@ role_to_task_spec:
       git checkout -- python/pyproject.toml 2>/dev/null || true
       echo "torch_tpu install rc=$INSTALL_RC" | tee -a "$OUT/torch_install.log"
       if [ "$INSTALL_RC" != 0 ]; then tail -n 30 "$OUT/torch_install.log"; exit 2; fi
-      rm -rf /tmp/tpu_logs/uv-cache/* /tmp/tpu_logs/tmp/* 2>/dev/null; df -h /tmp | sed "s/^/DISK after install /"
+      rm -rf /dev/shm/tpu_logs/uv-cache/* /dev/shm/tpu_logs/tmp/* 2>/dev/null; df -h /tmp /dev/shm | sed "s/^/DISK after install /"
       PY=/tmp/venv-torch/bin/python
       export PYTHONPATH="/workspace/sglang-torchtpu/python:/workspace/sglang-torchtpu"
 
@@ -86,7 +89,7 @@ role_to_task_spec:
       # Dumps go to local disk; the report and the largest module go to $OUT.
       R=benchmark/tpu/dsa_k_prologue/hlo_copy_report.py
       for V in jax_sc torch_sc; do
-        H=/tmp/hlo_$V; rm -rf "$H"; mkdir -p "$H"
+        H=/dev/shm/hlo_$V; rm -rf "$H"; mkdir -p "$H"
         HLO_OUT="$H" XLA_FLAGS="--xla_dump_to=$H --xla_dump_hlo_as_text" \
           $PY $D --variant $V --npz-dir "$OUT/att" --xprof-dir "$OUT/xprof" > "$OUT/diag_$V.log" 2>&1 || rc=1
         grep '^DIAG' "$OUT/diag_$V.log" | cut -c1-1500
