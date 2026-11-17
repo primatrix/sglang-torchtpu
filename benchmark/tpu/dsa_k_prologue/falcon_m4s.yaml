@@ -122,6 +122,17 @@ role_to_task_spec:
         echo "==== PHYS (rc=$prc)"; grep -E '^(PHYSIDX|PHYSATT|PHYS_)' "$OUT/phys.log" | cut -c1-3000
         [ $prc = 0 ] || { tail -n 60 "$OUT/phys.log"; rc=1; }
       fi
+      # 3c. Backend: _forward_mla -> source split-FP8 attention on physical slots, byte for byte.
+      if [ $arc = 0 ]; then
+        brc=0
+        $PY benchmark/tpu/dsa_k_prologue/check_source_attention_backend.py --npz-dir "$OUT/att" > "$OUT/backend.log" 2>&1 || brc=1
+        echo "==== BACKEND (rc=$brc)"; grep -E '^BACKEND' "$OUT/backend.log" | cut -c1-1500
+        [ $brc = 0 ] || { tail -n 60 "$OUT/backend.log"; rc=1; }
+      fi
+      # 3d. Gate + mode unit test (pool layout, rejects, MIXED raises).
+      WT=test/registered/unit/hardware_backend/tpu/test_dsa_bf16_indexer_wiring.py
+      $PY $WT -v > "$OUT/wiring.log" 2>&1 || rc=1
+      echo "==== test_dsa_bf16_indexer_wiring"; grep -E '(ok|FAIL|ERROR)$|^Ran |^OK|^FAILED' "$OUT/wiring.log" | tail -n 16
       # 4. Dispatch: the CPU-process export holds the SparseCore gather + FP8 attention.
       DT=test/registered/tpu/unit/test_dsa_fp8_attention_dispatch.py
       $PY $DT -v > "$OUT/fp8_dispatch.log" 2>&1 || rc=1

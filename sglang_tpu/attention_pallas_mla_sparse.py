@@ -33,6 +33,7 @@ from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
 from sglang_tpu.dsa_indexer_tpu import (
+    bf16_indexer_modes,
     build_dsa_index_topk_op,
     build_dsa_index_topk_split_op,
     build_dsa_kpool_expand_op,
@@ -247,6 +248,27 @@ def _has_zero_rope(hf_config) -> bool:
     return rope_dim == 0
 
 
+def source_fp8_attention_problems(
+    *, bf16_indexer, kpool, kv_cache_dtype, spec_enabled, zero_rope, attn_tp_size
+) -> list:
+    """Why SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION cannot serve this config (empty: it can)."""
+    problems = []
+    if not bf16_indexer:
+        problems.append("needs SGLANG_TPU_DSA_BF16_INDEXER=1 (physical top-k slots)")
+    if kpool != 1:
+        problems.append(f"index_kpool {kpool} (GLM-5.2 has 1)")
+    if kv_cache_dtype != torch.float8_e4m3fn:
+        problems.append(f"kv cache dtype {kv_cache_dtype}, needs fp8_e4m3")
+    if spec_enabled:
+        problems.append("speculative decoding (draft extend is not migrated)")
+    if zero_rope:
+        problems.append("model without rope")
+    if attn_tp_size != 1:
+        # Every rank would attend with all heads' token rows; not validated yet.
+        problems.append(f"attention TP {attn_tp_size}, only 1 is validated")
+    return problems
+
+
 def _kpool_query_bound(metadata, *, num_tokens: int) -> int:
     """Static per-request new-token bound for fused kpool pooling.
 
@@ -293,6 +315,8 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
 
     # Set by _build_kernel_op under the q-block opt-in.
     _prefill_op = None
+    # SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION, set in __init__ (tests build the backend without it).
+    _source_fp8_attention = False
 
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
@@ -309,6 +333,20 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         else:
             self._index_topk_op = build_dsa_index_topk_op()
         self._init_indexer_token_split()
+        self._source_fp8_attention = tpu_envs.SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION.get()
+        if self._source_fp8_attention:
+            problems = source_fp8_attention_problems(
+                bf16_indexer=tpu_envs.SGLANG_TPU_DSA_BF16_INDEXER.get(),
+                kpool=self._kpool,
+                kv_cache_dtype=self.kv_cache_quant_dtype,
+                spec_enabled=not model_runner.spec_algorithm.is_none(),
+                zero_rope=self._zero_rope,
+                attn_tp_size=self._idx_split_size,
+            )
+            if problems:
+                raise ValueError(
+                    "SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION: " + "; ".join(problems)
+                )
 
     def _init_indexer_token_split(self) -> None:
         """Set up the DSA indexer token split (always on with attn-TP > 1)."""
@@ -603,6 +641,8 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._topk,
             prefill,
             decode,
+            # Flat cache slots for the source attention, which then only validates them.
+            self._source_fp8_attention,
         )
 
     def _index_topk_token_split(
@@ -797,6 +837,11 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
                 f"layer {layer.layer_id} has rope dims, but the sparse MLA ops "
                 "were built for a model without rope."
             )
+        if self._source_fp8_attention:
+            return self._forward_source_fp8_attention(
+                q, k, layer, forward_batch, q_rope=q_rope, k_rope=k_rope,
+                topk_indices=topk_indices,
+            )
         args = self._mla_kernel_args(
             q=q,
             k=k,
@@ -826,6 +871,50 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             out = self._op(*args, topk_indices)
         # TODO(sglang-torchtpu#1072): avoid this reshape, as in pallas_tpu_mla.
         return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_source_fp8_attention(
+        self, q, k, layer, forward_batch, *, q_rope, k_rope, topk_indices
+    ) -> torch.Tensor:
+        """SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION: source split-FP8 KV write + exact attention.
+
+        ``topk_indices`` are the bf16 indexer's flat cache slots. The op quantizes
+        the bf16 latent / k_rope itself (one f32 scale per token), so they are not
+        quantized here as in ``_mla_kernel_args``.
+        """
+        from sglang_tpu.dsa_fp8_attention_op import build_dsa_fp8_attention_op
+
+        mode = forward_batch.forward_mode
+        if mode.is_mixed():
+            # The source runs MIXED with bf16 QK on its HLO-overlap pipeline,
+            # which is not migrated.
+            raise NotImplementedError(
+                "SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION does not support MIXED batches."
+            )
+        prefill, decode = bf16_indexer_modes(mode)
+        num_tokens = q.shape[0]
+        heads, lora = layer.tp_q_head_num, layer.v_head_dim
+        rope_dim = layer.qk_head_dim - lora
+        md = self.forward_metadata
+        pool = self.token_to_kv_pool
+        out = build_dsa_fp8_attention_op()(
+            pool.get_nope_cache(layer.layer_id),
+            pool.get_rope_cache(layer.layer_id),
+            # Non-contiguous views (see _mla_kernel_args); the op reads raw buffers.
+            q.reshape(num_tokens, heads, lora).contiguous(),
+            q_rope.reshape(num_tokens, heads, rope_dim).contiguous(),
+            k.reshape(num_tokens, lora).contiguous(),
+            k_rope.reshape(num_tokens, rope_dim).contiguous(),
+            topk_indices,
+            self._kv_lens(forward_batch),
+            md.page_indices,
+            md.cu_q_lens,
+            float(layer.scaling),
+            # The source's supports_fp8_attention: decode, verify and DSA prefill.
+            decode or prefill or mode.is_target_verify(),
+            prefill,
+            True,
+        )
+        return out.reshape(num_tokens, heads * lora)
 
     def _kv_cache_buffers(self, layer_id: int) -> tuple:
         # This backend's pool has two buffers per layer where the fused pool

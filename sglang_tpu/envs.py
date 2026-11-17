@@ -311,6 +311,12 @@ class TpuEnvs:
     # records, so every forward mode runs this op. GLM-5.2 layout only
     # (kpool 1, head_dim 128, page 128); other models fail at startup.
     SGLANG_TPU_DSA_BF16_INDEXER = EnvBool(False)
+    # DSA attention: run the migrated source KV write + exact sparse attention
+    # (sglang-jax-private c948bdd FP8 delivery; attention/pallas/dsa_fp8_attention.py):
+    # split FP8 KV with one f32 scale per token, fp8-qk-pv. The indexer then
+    # emits physical slots. Needs SGLANG_TPU_DSA_BF16_INDEXER=1, fp8_e4m3 KV and
+    # no speculative decoding; MIXED batches fail at trace time.
+    SGLANG_TPU_DSA_SOURCE_FP8_ATTENTION = EnvBool(False)
     # SparseCore top-k (dsv4/sparsecore_topk.py): when every row's valid prefix fits
     # one slice, run a single pass over the narrowest 4096-wide bucket instead of the
     # partitioned top-k; long-context pools pad rows to the max context. Selects the
