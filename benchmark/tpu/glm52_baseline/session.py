@@ -47,9 +47,7 @@ def run_client(proc, command, out, art, shared, deadline):
                     timeout=max(1, deadline - time.monotonic()),
                 )
                 summary = json.loads((destination / "summary.json").read_text())
-                smoke = json.loads((destination / "smoke-summary.json").read_text())
-                assert len(summary["rounds"]) == 6 and smoke["status"] == "PASS"
-                assert {row["dp_rank"] for row in smoke["checks"]} == set(range(16))
+                assert summary["status"] == "PASS", summary
                 atomic(
                     shared / "client-attention.json",
                     dict(
@@ -169,7 +167,11 @@ def run():
             + os.pathsep
             + str(Path.cwd()),
             GLM52_RUNTIME_DIR=str(art / "actual-process-runtime"),
+            # Test only: the server records extend top-k stats here once the
+            # top-k client creates <dir>/ENABLE (dsa_topk_stats.py).
+            SGLANG_TPU_DSA_TOPK_STATS_DIR=str(art / "topk-stats"),
         )
+        (art / "topk-stats").mkdir(parents=True, exist_ok=True)
         for key in ("XDG_CACHE_HOME", "TMPDIR", "JAX_COMPILATION_CACHE_DIR"):
             Path(os.environ[key]).mkdir(parents=True, exist_ok=True)
         config = root / "recipe/server.json"
@@ -350,7 +352,9 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     sys.executable,
                     "-u",
                     "-m",
-                    "benchmark.tpu.glm52_baseline.client",
+                    "benchmark.tpu.glm52_baseline.topk_client",
+                    "--stats-dir",
+                    str(art / "topk-stats"),
                     "--base-url",
                     f"http://127.0.0.1:{recipe['port']}",
                     "--model",

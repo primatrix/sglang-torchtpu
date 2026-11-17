@@ -826,6 +826,11 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             q_rope=q_rope,
             k_rope=k_rope,
         )
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            from sglang_tpu import dsa_topk_stats
+
+            if dsa_topk_stats.enabled(layer.layer_id):  # test only: extend top-k duplicate rate
+                dsa_topk_stats.record(layer.layer_id, topk_indices)
         split_rows = self._attention_split_rows(forward_batch, q.shape[0])
         if split_rows:
             out = self._forward_mla_token_split(args, topk_indices, split_rows)
