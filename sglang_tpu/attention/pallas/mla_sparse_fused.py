@@ -315,6 +315,10 @@ def sparse_mla_attention_fused(
         sm_scale=sm_scale,
         k_scale=k_scale,
         gather_rope=not zero_rope,
+        # The kernel writes the 512-wide NoPE output directly, so no
+        # [..., :NOPE_DIM] slice of a 640-wide buffer follows (~84 us at
+        # extend 2048 x 64 heads).
+        narrow_output=True,
         **(
             dict(
                 cache_layout=SPARSECORE_CACHE_LAYOUT,
@@ -336,9 +340,8 @@ def sparse_mla_attention_fused(
             )
         ),
     )
-    # The kernel returns 512 NoPE + 64 RoPE values per head. Only the NoPE part
-    # is the attention output.
-    return out[..., :NOPE_DIM], cache_nope, cache_rope
+    # narrow_output: out is already the 512-wide NoPE part of each head.
+    return out, cache_nope, cache_rope
 
 
 def qblock_tokens_supported(

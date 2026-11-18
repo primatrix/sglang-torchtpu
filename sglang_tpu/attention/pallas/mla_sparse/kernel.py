@@ -35,6 +35,8 @@ TENSORCORE_CACHE_LAYOUT = "tensorcore"
 SPARSECORE_CACHE_LAYOUT = "sparsecore"
 DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
+# narrow_output: width of the attention output (the NoPE part of each head).
+NARROW_OUT_DIM = 512
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
 
@@ -313,7 +315,12 @@ def _attention_kernel(
     return_lse: bool = False,
     sparsecore_layout: bool = False,
     capped_windows: int | None = None,
+    narrow_output: int = 0,
 ):
+    # narrow_output: 0 = the output aliases q (head_dim wide, sliced by the
+    # caller); 1 = a fresh NARROW_OUT_DIM-wide output (first chunk);
+    # 2 = that output passed back in, aliased, so later chunks keep the rows
+    # earlier chunks wrote. Skips the head_dim -> NoPE slice after the call.
     # Capped mode (`capped_windows` = W set, SparseCore layout only): the
     # gathered buffers hold W windows of `bkv_sz` rows per token, window-major
     # (`[W * chunk, bkv_sz, ...]`), and the pipelined body attends window 0
@@ -325,6 +332,8 @@ def _attention_kernel(
         assert sparsecore_layout
         fix_refs = refs[-6:]
         refs = refs[:-6]
+    if narrow_output == 2:
+        refs = refs[1:]
     if return_lse:
         (
             _lse_in_hbm_ref,  # aliased with lse_hbm_ref; never read
@@ -349,10 +358,10 @@ def _attention_kernel(
         lse_hbm_ref = None
         blse_x2_ref = None
 
-    assert q_hbm_ref.shape == o_hbm_ref.shape
+    assert q_hbm_ref.shape[:2] == o_hbm_ref.shape[:2]
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
-    o_dim = head_dim
+    o_dim = o_hbm_ref.shape[-1]
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
     bkv_sz = (
@@ -880,6 +889,7 @@ def prepare_outputs(
         "live_gather_all_chunks",
         "topk_cap",
         "gather_rope",
+        "narrow_output",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -913,6 +923,7 @@ def sparse_ragged_paged_attention(
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
     gather_rope: bool = True,
+    narrow_output: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1079,6 +1090,9 @@ def sparse_ragged_paged_attention(
         else None
     )
 
+    if narrow_output and (return_lse or topk_cap is not None):
+        raise ValueError("narrow_output supports neither return_lse nor topk_cap")
+    o = None
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
@@ -1108,13 +1122,19 @@ def sparse_ragged_paged_attention(
             topk_cap=topk_cap,
             topk_override=topk,
             gather_rope=gather_rope,
+            narrow_output=narrow_output,
+            o=o,
         )
-        if return_lse:
+        if narrow_output:
+            o = result
+        elif return_lse:
             q, lse = result
         else:
             q = result
 
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
+    if narrow_output:
+        return o[:, :actual_num_q_heads]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
     if return_lse:
         return out, lse[:, :actual_num_q_heads, 0]
@@ -1215,6 +1235,8 @@ def sparse_attention_chunk(
     topk_cap: int | None = None,
     topk_override: int | None = None,
     gather_rope: bool = True,
+    narrow_output: bool = False,
+    o: jax.Array | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1259,6 +1281,7 @@ def sparse_attention_chunk(
         end_seq_idx: jax.Array,  # i32
         kernel_batch_size: int,
         lse: jax.Array | None = None,  # f32[max_num_tokens, num_q_heads, 1]
+        o: jax.Array | None = None,  # narrow output carried across chunks
     ):
         batch_size = kernel_batch_size
         end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
@@ -1273,6 +1296,7 @@ def sparse_attention_chunk(
         # Each chunk writes only its own token rows, so -- exactly like `q` --
         # the lse buffer is threaded through as an aliased in/out to carry
         # earlier chunks' rows forward.
+        narrow_output_mode = 0 if not narrow_output else (2 if o is not None else 1)
         if return_lse:
             in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse (in)
             out_specs = [out_specs, pl.BlockSpec(memory_space=pltpu.HBM)]
@@ -1294,7 +1318,13 @@ def sparse_attention_chunk(
             q.dtype,
         )
 
-        bo_double_buf = bq_double_buf
+        bo_double_buf = (
+            pltpu.VMEM((2, batch_size, num_q_heads, NARROW_OUT_DIM), q.dtype)
+            if narrow_output
+            else bq_double_buf
+        )
+        if narrow_output_mode == 2:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # o (in)
 
         scratch_shapes = [
             bkv_nope_double_buf,
@@ -1339,6 +1369,7 @@ def sparse_attention_chunk(
             return_lse=return_lse,
             sparsecore_layout=sparsecore_layout,
             capped_windows=capped_windows,
+            narrow_output=0 if not narrow_output else (2 if o is not None else 1),
         )
 
         scope_name = (
@@ -1369,10 +1400,16 @@ def sparse_attention_chunk(
                         jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype),
                     ]
                     if return_lse
+                    else jax.ShapeDtypeStruct(
+                        shape=(q.shape[0], q.shape[1], NARROW_OUT_DIM), dtype=q.dtype
+                    )
+                    if narrow_output
                     else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
                 ),
                 input_output_aliases=(
-                    {
+                    ({num_prefetch + 3: 0} if narrow_output_mode == 2 else {})
+                    if narrow_output
+                    else {
                         num_prefetch: 0,
                         num_prefetch + 3: 1,
                     }
@@ -1387,6 +1424,8 @@ def sparse_attention_chunk(
             )
         )
         operands = [q, cache_kv_nope, cache_kv_rope]
+        if narrow_output_mode == 2:
+            operands.append(o)
         if return_lse:
             operands.append(lse)
         return kernel(*scalar_prefetches, *operands)
@@ -1518,4 +1557,5 @@ def sparse_attention_chunk(
         end_seq_idx=batch_end,
         kernel_batch_size=kernel_batch_size,
         lse=lse,
+        o=o,
     )
