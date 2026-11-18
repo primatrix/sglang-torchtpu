@@ -16,6 +16,7 @@ with ``xplane_summary.breakdown``: ``PROF`` lines per file.
 
 import argparse
 import asyncio
+import collections
 import glob
 import json
 import os
@@ -60,6 +61,27 @@ def summarise(out_dir):
         lines = b.get("lines", {})
         sc = {k: v for k, v in lines.items() if "SparseCore" in k}
         tc = {k: v for k, v in lines.items() if "SparseCore" not in k}
+        # Window stats (no dropped time). The runner's log tail cuts lines at
+        # 300 chars, so one short line per number group; the full rows go to a file.
+        try:
+            rows = windowed(f)
+        except Exception as e:  # report, do not hide
+            rows = []
+            print("WIN " + json.dumps({"error": repr(e)[:250]}), flush=True)
+        tag = f.split("-TP-")[-1].split("/")[0][:20]
+        with open(f"{out_dir}/window-{tag}.json", "w") as fh:
+            json.dump(rows, fh)
+        for r in rows:
+            p = r["plane"][-6:]
+            print("WIN " + json.dumps({k: r[k] for k in (
+                "window_us", "window_frac_of_module", "tc_busy_us", "tc_idle_us",
+                "sc_busy_us", "tc_idle_while_sc_busy_us", "attn_kernels_in_window")}
+                | {"r": tag, "p": p}), flush=True)
+            print("WINC " + json.dumps({"r": tag, "p": p, "c": r["categories"]})[:290],
+                  flush=True)
+            for i in range(0, 15, 3):
+                print("WINO " + json.dumps({"r": tag, "p": p,
+                                            "o": r["other_top"][i:i + 3]})[:290], flush=True)
         print("PROF " + json.dumps({
             "file": f[-90:], "dropped": dropped,
             "module_span_us": b["module_span_us"], "tc_ops_busy_us": b["ops_busy_us"],
@@ -70,6 +92,146 @@ def summarise(out_dir):
             "sc_line_median_us": sorted(sc.values())[len(sc) // 2] if sc else None,
             "tc_lines": dict(list(tc.items())[:6]),
         }), flush=True)
+
+
+def _abs_lines(path):
+    """``[(plane, line, [(name, start_ps, end_ps)])]`` with absolute line times.
+
+    XLine.timestamp_ns (field 3) is each line's base; event offsets are relative
+    to it, so lines are put on one clock before comparing them.
+    """
+    from xplane_summary import _fields
+
+    data = memoryview(open(path, "rb").read())
+    out = []
+    for f, plane in _fields(data):
+        if f != 1:
+            continue
+        pname, names, raw = "", {}, []
+        for pf, pv in _fields(plane):
+            if pf == 2:
+                pname = pv.decode("utf-8", "replace")
+            elif pf == 4:
+                key, meta = 0, b""
+                for ef, ev in _fields(pv):
+                    if ef == 1:
+                        key = ev
+                    elif ef == 2:
+                        meta = ev
+                nm = b"?"
+                for mf, mv in _fields(meta):
+                    if mf == 2:
+                        nm = mv
+                        break
+                names[key] = nm.decode("utf-8", "replace")
+            elif pf == 3:
+                lname, ts, evs = "", 0, []
+                for lf, lv in _fields(pv):
+                    if lf == 2:
+                        lname = lv.decode("utf-8", "replace")
+                    elif lf == 3:
+                        ts = lv
+                    elif lf == 4:
+                        mid = off = dur = 0
+                        for xf, xv in _fields(lv):
+                            if xf == 1:
+                                mid = xv
+                            elif xf == 2:
+                                off = xv
+                            elif xf == 3:
+                                dur = xv
+                        evs.append((mid, off, dur))
+                raw.append((lname, ts, evs))
+        if not pname.startswith("/device:TPU"):
+            continue
+        for lname, ts, evs in raw:
+            base = ts * 1000
+            out.append((pname, lname, [(names.get(m, "?"), base + o, base + o + d)
+                                       for m, o, d in evs]))
+    return out
+
+
+def _union(iv):
+    tot, end = 0, None
+    for s, e in sorted(iv):
+        if end is None or s > end:
+            tot += e - s
+            end = e
+        elif e > end:
+            tot += e - end
+            end = e
+    return tot
+
+
+def _clip(iv, w0, w1):
+    return [(max(s, w0), min(e, w1)) for s, e in iv if e > w0 and s < w1]
+
+
+def windowed(path):
+    """Statistics over the part of one device file that every line still covers.
+
+    A capture over the size limit drops the tail, and dropped time reads as idle.
+    Window: from the first module start to the earliest "last event end" over the
+    TensorCore op line and every SparseCore line, so nothing in it was dropped.
+    Inside it: TensorCore op busy / idle, SparseCore busy (union of all SC lines),
+    TC idle while SC is busy (waiting on the gather), op self time by category,
+    and the largest uncategorised ops by name.
+    """
+    lines = _abs_lines(path)
+    tc_planes = sorted({p for p, l, ev in lines if l == "XLA Ops" and ev})
+    rows = []
+    for tp in tc_planes:
+        ops = [x for p, l, ev in lines if p == tp and l == "XLA Ops" for x in ev]
+        mods = [x for p, l, ev in lines if p == tp and l == "XLA Modules" for x in ev]
+        # SparseCore planes on this chip: any SC plane (they are per chip, not per TC).
+        sc_lines = [(p, l, ev) for p, l, ev in lines if "SparseCore" in p and ev]
+        if not ops or not mods:
+            continue
+        w0 = min(s for _, s, _ in mods)
+        ends = [max(e for _, _, e in ops)] + [max(e for _, _, e in ev) for _, _, ev in sc_lines]
+        w1 = min(ends)
+        if w1 <= w0:
+            continue
+        op_iv = _clip([(s, e) for _, s, e in ops], w0, w1)
+        sc_iv = _clip([(s, e) for _, _, ev in sc_lines for _, s, e in ev], w0, w1)
+        win = w1 - w0
+        tc_busy = _union(op_iv)
+        sc_busy = _union(sc_iv)
+        both = tc_busy + sc_busy - _union(op_iv + sc_iv)
+        sc_only = sc_busy - both  # SC busy, TC op line empty
+        # Self time by name inside the window (top-level approximation: events
+        # minus nested children on the TC op line).
+        evs = sorted(((n, max(s, w0), min(e, w1)) for n, s, e in ops if e > w0 and s < w1),
+                     key=lambda x: (x[1], -(x[2] - x[1])))
+        self_t = collections.Counter()
+        stack = []
+        for n, s, e in evs:
+            while stack and stack[-1][2] <= s:
+                stack.pop()
+            if stack:
+                self_t[stack[-1][0]] -= min(e, stack[-1][2]) - s
+            self_t[n] += e - s
+            stack.append((n, s, e))
+        cats, other = collections.Counter(), collections.Counter()
+        for n, t in self_t.items():
+            low = n.lower()
+            lab = next((lb for lb, subs in CATEGORIES if any(x.lower() in low for x in subs)),
+                       "other")
+            cats[lab] += t
+            if lab == "other":
+                other[n[:60]] += t
+        us = lambda ps: round(ps / 1e6, 1)
+        n_attn = sum(1 for n, s, e in ops if "MLA-" in n and w0 <= s < w1)
+        rows.append(dict(
+            plane=tp, window_us=us(win), window_frac_of_module=round(
+                win / max(1, max(e for _, _, e in mods) - w0), 3),
+            tc_busy_us=us(tc_busy), tc_idle_us=us(win - tc_busy),
+            sc_busy_us=us(sc_busy), tc_idle_while_sc_busy_us=us(sc_only),
+            attn_kernels_in_window=n_attn,
+            categories={k: us(v) for k, v in cats.most_common()},
+            other_top=[(k, us(v)) for k, v in other.most_common(15)],
+        ))
+    return rows
 
 
 async def post_text(session, base, endpoint, payload=None):
