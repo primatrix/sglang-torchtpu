@@ -48,7 +48,7 @@ def _reduce(buf, o_ref, qi):
 def _vld_kernel(idx_ref, k_ref, o_ref, buf, *, qb, unroll):
     for qi in range(qb):
         def body(r, c, qi=qi):
-            buf[pl.ds(r, 1), :] = k_ref[pl.ds(idx_ref[qi, r], 1), :]
+            buf[pl.ds(r, 1), :] = k_ref[pl.ds(idx_ref[qi * TOPK + r], 1), :]
             return c
         lax.fori_loop(0, TOPK, body, 0, unroll=unroll)
         _reduce(buf, o_ref, qi)
@@ -57,7 +57,7 @@ def _vld_kernel(idx_ref, k_ref, o_ref, buf, *, qb, unroll):
 def _dma_kernel(idx_ref, k_ref, o_ref, buf, sem, *, qb):
     for qi in range(qb):
         def start(r, c, qi=qi):
-            pltpu.make_async_copy(k_ref.at[pl.ds(idx_ref[qi, r], 1)],
+            pltpu.make_async_copy(k_ref.at[pl.ds(idx_ref[qi * TOPK + r], 1)],
                                   buf.at[pl.ds(r, 1)], sem).start()
             return c
         lax.fori_loop(0, TOPK, start, 0, unroll=8)
@@ -71,7 +71,7 @@ def _dma_kernel(idx_ref, k_ref, o_ref, buf, sem, *, qb):
 
 def _contig_kernel(idx_ref, k_ref, o_ref, buf, *, qb):
     for qi in range(qb):
-        s = pl.multiple_of(jnp.minimum(idx_ref[qi, 0], k_ref.shape[0] - TOPK) // 8 * 8, 8)
+        s = pl.multiple_of(jnp.minimum(idx_ref[qi * TOPK], k_ref.shape[0] - TOPK) // 8 * 8, 8)
         buf[...] = k_ref[pl.ds(s, TOPK), :]
         _reduce(buf, o_ref, qi)
 
@@ -79,7 +79,9 @@ def _contig_kernel(idx_ref, k_ref, o_ref, buf, *, qb):
 @functools.partial(jax.jit, static_argnames=("variant", "qb", "unroll"))
 def gather(k, idx, *, variant, qb, unroll=8):
     d = k.shape[0]
-    idx_spec = pl.BlockSpec((qb, TOPK), lambda i: (i, 0), memory_space=pltpu.SMEM)
+    # 1D blocks of qb * 2048 indices: a (qb, 2048) SMEM block with qb < 8 fails
+    # the TPU block-shape rule (last two dims divisible by 8 and 128).
+    idx_spec = pl.BlockSpec((qb * TOPK,), lambda i: (i,), memory_space=pltpu.SMEM)
     if variant == "dma_hbm":
         k_spec = pl.BlockSpec(memory_space=pl.ANY)
     else:
@@ -102,7 +104,7 @@ def gather(k, idx, *, variant, qb, unroll=8):
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",), vmem_limit_bytes=56 * 1024 * 1024),
         name=f"tc_vmem_gather_{variant}_d{d}_qb{qb}",
-    )(idx, k)
+    )(idx.reshape(-1), k)
 
 
 def reference(k, idx):
