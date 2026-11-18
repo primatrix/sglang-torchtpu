@@ -12,7 +12,7 @@ PR：sgl-project/sglang-torchtpu#2246（Draft，头提交 e8be99e，分支 `feat
 - verify / decode 持平，在波动范围内。
 - 四个形状、所有变体的输出都和原版 Target 逐字节一致。
 - 每 token 字节数不变，KV 容量不受影响。
-- 后续（2026-11-18，见文末“top-k 去重”一节）：extend 剩下的约 2.9 ms 是 SC gather 的每行开销。真实 GLM-5.2 top-k 在 128 query 内去重后只剩约 4%，SC 标记表去重 16 个 chunk 只要约 270 us，但 dense-over-distinct 的 attention（不分组和分组都试过）比现在每 chunk 约 220 us 的 gather + attention 更慢。VMEM 内按行 sparse 读取也测了（exp-85fudprrt4）：TensorCore 最快 1.46 ns/行，是 SC 从 HBM gather（0.547 ns/行）的 2.7 倍；LLO bundle（exp-7uv7xzb1cp）显示 Pallas 写法每行一条标量 `sld` 取行号，完美流水下限约 0.57-0.63 ns/行，仍高于 SC gather。硬件有 8 行一条的 `vld.iar`，但 Pallas indexer、`lax.gather` 和直接发 `tpu.vector_load_idx`（exp-q8ui3ppzti，Mosaic TC layout pass 未实现）都到不了，KV 加载的去重路线暂停。在现有编译器能力下，extend gather 这条线的收益就是上面的 −16%～−21%。
+- 后续（2026-11-18，见文末“top-k 去重”一节）：extend 剩下的约 2.9 ms 是 SC gather 的每行开销。真实 GLM-5.2 top-k 在 128 query 内去重后只剩约 4%，SC 标记表去重 16 个 chunk 只要约 270 us，但 dense-over-distinct 的 attention（不分组和分组都试过）比现在每 chunk 约 220 us 的 gather + attention 更慢。VMEM 内按行 sparse 读取也测了（exp-85fudprrt4）：TensorCore 最快 1.46 ns/行，是 SC 从 HBM gather（0.547 ns/行）的 2.7 倍；LLO bundle（exp-7uv7xzb1cp）显示 Pallas 写法每行一条标量 `sld` 取行号，完美流水下限约 0.57-0.63 ns/行，仍高于 SC gather。硬件有 8 行一条的 `vld.iar`，但 Pallas indexer、`lax.gather` 和直接发 `tpu.vector_load_idx`（exp-q8ui3ppzti，Mosaic TC layout pass 未实现）都到不了；SC 直接写 TC VMEM 的硬件通路也存在，但 Pallas `mpmd_map` 不支持 TC + SC 组合（exp-si0d8z8396），尚未验证。KV 加载的去重路线暂停，等这两处编译器支持之一打开。在现有编译器能力下，extend gather 这条线的收益就是上面的 −16%～−21%。
 
 ## 背景
 
@@ -328,13 +328,29 @@ TC 逐行读的下限已经超过现在整条 SC gather，更超过去重留出�
 - 对照组正常：`contig` 约 45 us，`vld` 384 us，与之前一致。
 - 第三种写法只在测试分支上，用的是不受支持的内部接口，不进任何 PR。
 
+### SC 直接写 TC VMEM（`mpmd_map`，测试分支 962e28c，`bench_sc_to_tc_vmem_probe.py`）
+
+设想：SC 在自己的 VMEM / SPMEM 里按每个 query 摆好 KV tile，再整块写进 TC VMEM，现有 attention 直接读。SparseCore ISA 文档列有 SC 发起的 `TC VMEM <-> SC SPMEM` 直连 DMA，硬件有这条路。仓库和本地其他 checkout 里没找到同事的 SC→TC VMEM 代码；Pallas 里唯一可能的写法是 `mpmd_map` 把 TC mesh 和 SC vector-subcore mesh 放进同一个 kernel。在 TPU 上跑了三轮（exp-3vdm2r6rlc、exp-jav563w8md、exp-si0d8z8396），前两轮停在 harness 问题上（多 mesh 的 scratch 要标 core；TC 默认内存空间 `ANY`、SC 默认 `HBM`，输入输出要显式写 `HBM`），第三轮结果：
+
+| 用例 | 停在 | 结果 |
+|---|---|---|
+| `sc_only`（对照，SC 单独 `mpmd_map`） | run | 通过，与 numpy 逐值一致 |
+| `tc_sc`：SC 带索引 gather 直接写 TC VMEM | lower | `Scatter/gather via pltpu.async_copy from HBM to VMEM@TC is not supported`：带索引的 DMA 只能写 SC 自己的 VMEM |
+| `tc_sc_plain`：SC 先 gather 进自己的 VMEM，再普通拷贝整块写 TC VMEM | lower | **`mpmd_map does not support TC kernels yet.`** |
+| `sc_plain_tc_ref`：单独 SC kernel 分配 `VMEM@TC` scratch | compile | `E3000 CompileTimeSparseCoreAllocationFailure`：SC 编译器把它当自己的 vmem 分配，可用空间为 0 |
+
+- `tc_sc_plain` 是关键用例：它对应“SC 摆好 tile、一次普通拷贝送过去”的方案，卡在 `_mpmd_map_tpu_lowering` 的显式检查上（只要 mesh 里有 TC 且不只 TC 就拒绝），与源码一致；`TensorCoreMesh.check_is_compatible_with` 里也有 `TODO: Add support for mpmd with SparseCore meshes`。0.11.2 和 0.12.0.1 相同。
+- TC VMEM 只能由 TC 侧分配，所以这条路必须走 TC + SC 合在一个 kernel，目前 Pallas 前端不支持。
+- 结论：这条路**在 Pallas 前端被挡住，硬件通路存在，未验证**，不算走不通。没有测到搬运时间，也没做正确性以外的测试。若同事的实现不经过 Pallas `mpmd_map`（XLA 自己的 SC offload、custom call 或内部构建），可能是第三个入口。
+- probe 只在测试分支上，用了未导出的 `jax._src.pallas.mpmd`，不进任何 PR。
+
 ### 结论
 
 extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense 都比现在慢；复用现有 attention、只改 KV 加载的去重方案，卡在 TensorCore 逐行摆放：Pallas 能写出的只有标量 `sld` 加单 sublane `vld`，每行至少一个 bundle（0.57-0.63 ns/行）；硬件的 `vld.iar` 能做到 8 行一条指令，但 Pallas 和 Mosaic 在 TensorCore 上都没有实现。这条路线暂停。在现有编译器能力下，extend 的收益就是 SparseCore 布局的 −16%～−21%。
 
 重新打开的条件（都要 Pallas / Mosaic 侧改动，我们这边绕不过去）：
 - Mosaic 给 TensorCore 实现 `tpu.vector_load_idx` 的 lowering（到 `vsetiar` + `vld.iar`），或 Pallas 让 `ref[vec_idx, :]` 走这条路；
-- SC 能把去重后的行按每个 query 的顺序直接写进 TC VMEM（ISA 里的 `TC VMEM <-> SC SPMEM` 直连 DMA），且每行开销明显低于 0.547 ns。
+- SC 能把去重后的行按每个 query 的顺序直接写进 TC VMEM（ISA 里的 `TC VMEM <-> SC SPMEM` 直连 DMA），且每行开销明显低于 0.547 ns。硬件有这条路，但 Pallas `mpmd_map` 目前拒绝 TC + SC 组合（`mpmd_map does not support TC kernels yet.`，exp-si0d8z8396），未验证；需要 Pallas 支持，或找到不经 `mpmd_map` 的接口（同事的实现）。
 
 微基准 manifest 从这次起改为挂载 GCS 上的 torch_tpu wheel（`/wheels/torch-tpu`，与 GLM-5.2 e2e runner 相同，SHA256 `6e12816e…` 校验通过），不再分片传输；pod 启动到出结果不到 1 分钟。
 
