@@ -1,4 +1,4 @@
-name: glm52-dsa-base-PINSHA_c2
+name: glm52-dsa-base-pr2070-fcba0af_c2
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: gke-tpu-train-us-central1-2-prod
@@ -22,7 +22,7 @@ role_to_task_spec:
       df -h /tmp /workspace /dev/shm 2>/dev/null | sed "s/^/DISK /"
       git clone --filter=blob:none https://github.com/primatrix/sglang-torchtpu.git /workspace/sglang-torchtpu
       cd /workspace/sglang-torchtpu
-      git checkout --detach 5e054a6cb8fbe28a683a523b523394799cc7ddaa
+      git checkout --detach fcba0afe6e7ff1edd16b2e95dded61095e1b19a3
       git rev-parse HEAD | tee "$OUT/source-revision.txt"
       python3 -m pip install -q uv
       LIBTPU_IDX=https://storage.googleapis.com/jax-releases/libtpu_releases.html

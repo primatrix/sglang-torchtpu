@@ -1,10 +1,10 @@
-name: glm52-dsa-m1-k-prologue-numerics-47eacce-jaxai
+name: glm52-dsa-m1-k-prologue-numerics-9e6c86f-jaxai-shafix
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: gke-tpu-train-us-central1-1-prod
 priority: 0
 tags: [glm52, dsa, m1-k-prologue, numerics, v7x8]
-config: '{"module":"M1 K projection fusion","stage":"correctness+torch-contract","target_sha":"47eacce36f05fe6ca8783e0dcc34c62e6e83f987","image":"jax-ai-image + pinned pyproject_tpu stack"}'
+config: '{"module":"M1 K projection fusion","stage":"correctness+torch-contract","target_sha":"20b9e574a30272eb82f60f7eb48a087cb4765d39","image":"jax-ai-image + pinned pyproject_tpu stack"}'
 role_to_task_spec:
   worker:
     command: |
@@ -15,7 +15,7 @@ role_to_task_spec:
       export TMPDIR=/tmp/tpu_logs/tmp UV_CACHE_DIR=/tmp/tpu_logs/uv-cache PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache PYTHONUNBUFFERED=1
       git clone --filter=blob:none https://github.com/primatrix/sglang-torchtpu.git /workspace/sglang-torchtpu
       cd /workspace/sglang-torchtpu
-      git checkout --detach 47eacce36f05fe6ca8783e0dcc34c62e6e83f987
+      git checkout --detach 9e6c86f4f6a40f46799254f81c2f970ae569f9f6
       git rev-parse HEAD | tee "$OUT/source-revision.txt"
       python3 -m pip install -q uv
       LIBTPU_IDX=https://storage.googleapis.com/jax-releases/libtpu_releases.html
@@ -43,20 +43,36 @@ role_to_task_spec:
         --out "$OUT/dots.json" > "$OUT/stage_dots.log" 2>&1 || rc=1
       cat "$OUT/dots.json" 2>/dev/null || tail -n 30 "$OUT/stage_dots.log"
 
-      # Env B: the pinned TPU stack. The pod cannot read the torch_tpu registry (403),
-      # so the verified wheel is copied in with `falcon exp cp` once the pod runs.
+      # Env B: the pinned TPU stack. The pod cannot read the torch_tpu registry (403).
+      # The wheel comes from GCS if the pod may read it, otherwise via `falcon exp cp`
+      # (a READY file appears once the copy is complete). Either way SHA256 is checked.
       WHL=/tmp/wheels/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl
-      SHA=47eacce36f05fe6ca8783e0dcc34c62e6e83f987e5b6a74434dbf2141757fd82
-      i=0
-      while [ ! -f /tmp/wheels/READY ] && [ $i -lt 360 ]; do sleep 5; i=$((i + 1)); done
+      # Literal SHA256 of the verified wheel; never rewrite with commit-pinning seds.
+      SHA=6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82
+      OBJ=dsa-migration%2Fwheels%2Ftorch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl
+      MD=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default
+      mkdir -p /tmp/wheels
+      TOKEN=$(curl -s -H Metadata-Flavor:Google "$MD/token" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)
+      CODE=$(curl -s -H "Authorization: Bearer $TOKEN" -o "$WHL.gcs" -w '%{http_code}' \
+        "https://storage.googleapis.com/storage/v1/b/inference-model-storage-sgl/o/$OBJ?alt=media")
+      echo "gcs download http=$CODE" > "$OUT/torch_install.log"
+      if [ "$CODE" = 200 ]; then
+        mv "$WHL.gcs" "$WHL"; echo "wheel source=gcs" >> "$OUT/torch_install.log"
+      else
+        rm -f "$WHL.gcs"; echo "wheel source=falcon-exp-cp (waiting up to 30 min for READY)" >> "$OUT/torch_install.log"
+        i=0
+        while [ ! -f /tmp/wheels/READY ] && [ $i -lt 360 ]; do sleep 5; i=$((i + 1)); done
+      fi
       TORCH_OK=1
-      if [ ! -f /tmp/wheels/READY ] || [ "$(sha256sum "$WHL" | cut -d' ' -f1)" != "$SHA" ]; then
-        echo "torch_tpu wheel missing or SHA256 mismatch" > "$OUT/torch_install.log"; TORCH_OK=0
+      GOT=$(sha256sum "$WHL" 2>/dev/null | cut -d' ' -f1)
+      echo "wheel sha256=${GOT:-missing} expected=$SHA" >> "$OUT/torch_install.log"
+      if [ "$GOT" != "$SHA" ]; then
+        echo "torch_tpu wheel missing or SHA256 mismatch" >> "$OUT/torch_install.log"; TORCH_OK=0
       fi
       if [ "$TORCH_OK" = 1 ]; then
         # As docker/tpu.Dockerfile: the TPU manifest replaces python/pyproject.toml.
         cp python/pyproject_tpu.toml python/pyproject.toml
-        uv venv --python 3.12 /tmp/venv-torch > "$OUT/torch_install.log" 2>&1
+        uv venv --python 3.12 /tmp/venv-torch >> "$OUT/torch_install.log" 2>&1
         VIRTUAL_ENV=/tmp/venv-torch SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0.dev0 uv pip install \
           --index-strategy unsafe-best-match -f "$LIBTPU_IDX" \
           --extra-index-url https://download.pytorch.org/whl/cpu \
