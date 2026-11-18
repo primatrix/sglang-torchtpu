@@ -92,6 +92,8 @@ def _kernel(
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
     rope_words: int = ROPE_WORDS,
+    phase_stride: int = 0,
+    query_batch_shift: int = 0,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
@@ -113,8 +115,16 @@ def _kernel(
         logical_batch = owner + owner_batch * num_owners
         occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
 
+        def scheduled_atom(atom):
+            # Stagger owners serving different queries without rearranging indices
+            # in HBM. Apply the same permutation to input and output addresses.
+            if not phase_stride:
+                return atom
+            query = logical_batch >> query_batch_shift
+            return (atom + query * phase_stride) & (atoms_per_batch - 1)
+
         def values(atom, stream):
-            return indices_ref[0, atom, stream, :]
+            return indices_ref[0, scheduled_atom(atom), stream, :]
 
         def destinations(atom, stream):
             return pl.ds(
@@ -123,7 +133,7 @@ def _kernel(
             )
 
         def body(*refs):
-            atom = pl.program_id(0)
+            atom = scheduled_atom(pl.program_id(0))
             nope_inputs = refs[:ROPE_PACKING]
             rope_inputs = refs[ROPE_PACKING : 2 * ROPE_PACKING]
             rope_output = refs[-1]
@@ -188,7 +198,7 @@ def _kernel(
         )
         rope_out_spec = pl.BlockSpec(
             (QUADS_PER_ATOM, 128),
-            lambda atom: (logical_batch * atoms_per_batch + atom, 0),
+            lambda atom: (logical_batch * atoms_per_batch + scheduled_atom(atom), 0),
         )
 
         def run_inner():
@@ -249,6 +259,7 @@ def _kernel(
         "wait_mode",
         "serve_pipelined",
         "live_multiple",
+        "phase_stride",
     ),
 )
 def dsa_gather_native_sc(
@@ -262,6 +273,7 @@ def dsa_gather_native_sc(
     serve_pipelined: bool = True,
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
+    phase_stride: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -277,6 +289,10 @@ def dsa_gather_native_sc(
     unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
     is a multiple of it; when that multiple covers whole owner rounds the
     per-owner tail guard is dropped.
+
+    A nonzero ``phase_stride`` rotates each query's atom issue order, retaining
+    the original output order for both caches. The experiment requires a power
+    of two atoms per owner batch and a power of two owner batches per query.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -325,6 +341,21 @@ def dsa_gather_native_sc(
         )
 
     occurrences_per_batch = atoms_per_batch * OCCURRENCES_PER_ATOM
+    query_batch_shift = 0
+    if phase_stride:
+        batches_per_query, tail = divmod(indices.shape[1], occurrences_per_batch)
+        if (
+            phase_stride < 0
+            or atoms_per_batch & (atoms_per_batch - 1)
+            or tail
+            or batches_per_query < 1
+            or batches_per_query & (batches_per_query - 1)
+        ):
+            raise ValueError(
+                "phase rotation requires a nonnegative stride, power-of-two "
+                "atoms and full power-of-two batches per query"
+            )
+        query_batch_shift = batches_per_query.bit_length() - 1
     owner_batch_size = num_owners * occurrences_per_batch
     if out_size % owner_batch_size != 0:
         raise ValueError(
@@ -383,6 +414,8 @@ def dsa_gather_native_sc(
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
         rope_words=rope_words,
+        phase_stride=phase_stride,
+        query_batch_shift=query_batch_shift,
     )
     if live:
         inner = body
@@ -406,5 +439,6 @@ def dsa_gather_native_sc(
         name=(
             f"sc_native_sc_gather_a{atoms_per_batch}_rw{rope_words}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
+            + (f"_phase{phase_stride}" if phase_stride else "")
         ),
     )(*operands)

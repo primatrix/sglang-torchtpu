@@ -871,6 +871,7 @@ def prepare_outputs(
         "return_lse",
         "cache_layout",
         "sparsecore_atoms_per_batch",
+        "sparsecore_phase_stride",
         "sparsecore_gather_wait_mode",
         "sparsecore_gather_pipelined",
         "small_chunk_tokens",
@@ -904,6 +905,7 @@ def sparse_ragged_paged_attention(
     return_lse: bool = False,
     cache_layout: str = TENSORCORE_CACHE_LAYOUT,
     sparsecore_atoms_per_batch: int = 16,
+    sparsecore_phase_stride: int = 0,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
     small_chunk_tokens: int = 16,
@@ -939,6 +941,8 @@ def sparse_ragged_paged_attention(
         the same sparse attention computation.
       sparsecore_atoms_per_batch: Native SparseCore gather pipeline atoms per
         owner batch.
+      sparsecore_phase_stride: Optional query-dependent atom issue rotation
+        for uncapped SparseCore gather. Zero preserves the original schedule.
       sparsecore_gather_wait_mode: Whether native SparseCore NOPE output DMA
         overlaps ROPE work.
       sparsecore_gather_pipelined: Whether to pipeline native SparseCore gather
@@ -981,6 +985,8 @@ def sparse_ragged_paged_attention(
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    if sparsecore_phase_stride and (not sparsecore_layout or topk_cap is not None):
+        raise ValueError("phase rotation currently requires uncapped SparseCore gather")
     if sparsecore_layout:
         if (
             cache_kv_nope.dtype != jnp.uint32
@@ -1117,6 +1123,7 @@ def sparse_ragged_paged_attention(
             vmem_limit_bytes=vmem_limit_bytes,
             cache_layout=cache_layout,
             sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
+            sparsecore_phase_stride=sparsecore_phase_stride,
             sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
             sparsecore_gather_pipelined=sparsecore_gather_pipelined,
             small_chunk_tokens=small_chunk_tokens,
@@ -1224,6 +1231,7 @@ def sparse_attention_chunk(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     cache_layout: str = TENSORCORE_CACHE_LAYOUT,
     sparsecore_atoms_per_batch: int = 16,
+    sparsecore_phase_stride: int = 0,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
     small_chunk_tokens: int = 0,
@@ -1503,6 +1511,7 @@ def sparse_attention_chunk(
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                phase_stride=sparsecore_phase_stride,
                 **live_kwargs,
             )
         )

@@ -83,7 +83,7 @@ def reference(c, raw):
     quantized, unquantized = [], []
     prefix = int(c['prefixes'][0])
     for i in sample:
-        pos = raw[i]
+        pos = raw[i][raw[i] >= 0]
         slots = c['pi'][pos // PAGE] * PAGE + pos % PAGE
         lat = c['prefix_kv'][slots].astype(np.float64)
         rope = c['prefix_pe'][slots].astype(np.float64)
@@ -108,6 +108,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--raw-dir', required=True)
     p.add_argument('--out-dir', required=True)
+    p.add_argument('--gather-phase', action='store_true', help='Compare SC atom schedules with unchanged output order')
     p.add_argument('--files', default='synthetic,raw-0096-layer0,raw-0097-layer10,raw-0099-layer40')
     p.add_argument('--groups', default='2,4,8,16')
     p.add_argument('--iters', type=int, default=20)
@@ -119,7 +120,8 @@ def main():
     import jax.numpy as jnp
     from jax.experimental.layout import Format, Layout
     from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils as kcu
-    from sglang_tpu.attention.pallas.mla_sparse.kernel import sparse_ragged_paged_attention
+    from sglang_tpu.attention.pallas.mla_sparse.kernel import prepare_gather_indices, sparse_ragged_paged_attention
+    from sglang_tpu.attention.pallas.mla_sparse.native_sc_gather import dsa_gather_native_sc
     from xplane_summary import _planes, _union_ps
 
     root = Path(a.out_dir)
@@ -168,6 +170,10 @@ def main():
                     devices=[str(x) for x in jax.devices()], active_device=str(jax.devices()[0]),
                     args=vars(a), acceptance={'max_sampled_error_above_base': 0.01,
                                             'nrmse_sampled_above_base': 0.005})
+    if a.gather_phase:
+        manifest.update(operator_name='dsa_gather_atom_phase', phases=[0, 1, 5], q_layout='split',
+                        acceptance={'full_output_and_cache_bit_exact': True, 'nope_and_rope_gather_bit_exact': True},
+                        gather_scope='repeated isolated 128-query chunk, first/middle/last of 16; not summed')
     (root.parent / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     emit(dict(kind='manifest', **manifest))
     paths = {Path(f).stem: f for f in glob.glob(a.raw_dir + '/**/raw-*.npy', recursive=True)}
@@ -176,7 +182,7 @@ def main():
     def physical(rows):
         return to_physical(rows, c['pi'], c['ppr'], c['cu_q'], page=PAGE)
 
-    def attend(q, no, ro, rows, group=1, lse=False):
+    def attend(q, no, ro, rows, group=1, lse=False, phase=0):
         nt = rows.shape[0]
         return sparse_ragged_paged_attention(
             q, no, ro, rows, None, jnp.array([0, nt], jnp.int32), dist,
@@ -184,15 +190,16 @@ def main():
             gather_and_attention_chunk_size=CHUNK // group,
             attention_kernel_batch_size=BATCH // group,
             sparsecore_atoms_per_batch=atoms_for(CHUNK // group, rows.shape[1]),
-            sparsecore_gather_wait_mode='overlap_rope', return_lse=lse)
+            sparsecore_gather_wait_mode='overlap_rope', return_lse=lse,
+            sparsecore_phase_stride=phase)
 
-    def make_call(layout, rows, tag, group=1):
+    def make_call(layout, rows, tag, group=1, phase=0):
         def step(no, ro, qin, kv, pe, indices):
             no, ro = kcu.update_sparse_mla_kv_cache(
                 no, ro, kv, pe, kvl, pi, cuq, nope_spec=ns, rope_spec=rs)
             q = jnp.concatenate(qin, axis=-1) if layout == 'split' else qin
             if group == 1:
-                out = attend(q, no, ro, indices)[..., :512]
+                out = attend(q, no, ro, indices, phase=phase)[..., :512]
             else:
                 shared, private = indices
                 if private.shape[1] == 0:
@@ -288,20 +295,74 @@ def main():
         return dict(profile_coverage=coverage, expected_module_calls=a.profile_iters,
                     profile_complete=bool(coverage) and all(x['events'] == a.profile_iters for x in coverage))
 
+    def phase_experiment(name, full, base, base_error):
+        phases = (0, 1, 5)
+        calls = {0: base}
+        for phase in phases[1:]:
+            cand = make_call('split', full, f'{name}_phase{phase}', phase=phase)
+            if (not np.array_equal(cand['out'].view(np.uint16), base['out'].view(np.uint16))
+                    or cand['info']['cache_sha256'] != base['info']['cache_sha256']):
+                raise AssertionError(f'phase={phase}: full attention output or written cache mismatch')
+            calls[phase] = cand
+        times = measure(calls)
+        emit(dict(kind='phase_chain', sample=name, phases=phases, paired_timings=times,
+                  output_and_cache_exact=True, fp8_reference=base_error,
+                  output_sha256=base['info']['output_sha256'], cache_sha256=base['info']['cache_sha256'],
+                  physical_topk_sha256=digest(full)))
+
+        # Use exactly the bytes and sanitized physical slots the full step reads.
+        # Take slices after sanitization: the scatter-padding hash uses global row numbers.
+        cache_args = base['state']['cache']
+        _, slots = prepare_gather_indices(put(full), None, cuq, page_size=PAGE, total_num_pages=c['P'])
+        live = put(np.int32(CHUNK * TOPK))
+        def micro(rows, phase):
+            last = [None]
+            def run():
+                last[0] = dsa_gather_native_sc(*cache_args, rows, atoms_per_batch=16,
+                                               out_size=CHUNK * TOPK, wait_mode='overlap_rope',
+                                               num_live_indices=live, live_multiple=BATCH * TOPK,
+                                               phase_stride=phase)
+                return last[0]
+            return {'call': run, 'sync': lambda: jax.block_until_ready(last[0])}
+
+        for chunk in (0, t // CHUNK // 2, t // CHUNK - 1):
+            chunk_rows = slots[chunk * CHUNK:(chunk + 1) * CHUNK]
+            calls = {phase: micro(chunk_rows, phase) for phase in phases}
+            expected = tuple(np.asarray(x) for x in calls[0]['call']())
+            for phase in phases[1:]:
+                actual = calls[phase]['call']()
+                if not all(np.array_equal(np.asarray(x), y) for x, y in zip(actual, expected, strict=True)):
+                    raise AssertionError(f'chunk={chunk}, phase={phase}: gathered bytes mismatch')
+            hashes = [digest(x) for x in expected]
+            del expected, actual
+            times = measure(calls)
+            emit(dict(kind='phase_gather', sample=name, chunk=chunk, phases=phases, paired_timings=times,
+                      nope_and_rope_exact=True, output_sha256=hashes,
+                      physical_slots_sha256=digest(np.asarray(chunk_rows)), scope='one repeated chunk'))
+
     for name in a.files.split(','):
         print('FAIR_PROGRESS ' + name, flush=True)
         try:
-            raw = c['topk'].copy() if name == 'synthetic' else np.load(paths[name]).astype(np.int32)
+            raw = c['topk'].copy() if name == 'synthetic' or (a.gather_phase and name == 'masked') else np.load(paths[name]).astype(np.int32)
             assert raw.shape == (t, TOPK)
             assert (raw >= 0).all() and (raw <= c['prefixes'][0] + np.arange(t)[:, None]).all()
             assert np.all(np.diff(np.sort(raw, axis=1), axis=1) > 0)
+            if name == 'masked' and a.gather_phase:
+                lengths = np.resize([1, 63, 64, 127, 128, 1025, 2047, 2048], t)
+                raw[np.arange(TOPK)[None, :] >= lengths[:, None]] = -1
             full = physical(raw)
             sample, ref_quant, ref_bf = reference(c, raw)
-            base = make_call('rowmajor', full, name + '_base')
+            layout = 'split' if a.gather_phase else 'rowmajor'
+            base = make_call(layout, full, name + '_base')
             base_error = differences(base['out'][sample], ref_quant)
             if (not np.isfinite(base['out']).all() or not base_error['finite']
                     or base_error['max_normalized'] > 0.03):
                 raise AssertionError(f'Baseline FP8-cache reference failed: {base_error}')
+            if a.gather_phase:
+                phase_experiment(name, full, base, base_error)
+                del base
+                gc.collect()
+                continue
             base_row = dict(kind='baseline', sample=name, variant='q_rowmajor',
                             topk_sha256=digest(raw), reference_queries=sample.tolist(),
                             error_vs_quantized=base_error,
