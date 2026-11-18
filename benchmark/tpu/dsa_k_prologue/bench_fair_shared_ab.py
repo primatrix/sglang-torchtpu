@@ -34,6 +34,19 @@ def digest(x):
     return hashlib.sha256(np.ascontiguousarray(x).view(np.uint8)).hexdigest()
 
 
+def unpack_banded_words(words, n):
+    words = np.asarray(words, np.uint32).reshape(n, -1)
+    return np.concatenate([(words >> k).astype(np.uint8) for k in (0, 8, 16, 24)], axis=1)
+
+
+def pack_banded_words(rows, width):
+    bands = np.pad(rows, ((0, 0), (0, width * 4 - rows.shape[-1]))).reshape(len(rows), 4, width)
+    words = bands[:, 0].astype(np.uint32)
+    for b in (1, 2, 3):
+        words |= bands[:, b].astype(np.uint32) << (8 * b)
+    return words
+
+
 def partition(raw, g, quantum=256):
     """Prove a disjoint, lossless partition before sending any rows to TPU."""
     t, k = raw.shape
@@ -109,6 +122,8 @@ def main():
     p.add_argument('--raw-dir', required=True)
     p.add_argument('--out-dir', required=True)
     p.add_argument('--gather-phase', action='store_true', help='Compare SC atom schedules with unchanged output order')
+    p.add_argument('--packed-ab', action='store_true', help='Compare persistent single-row KV against split-cache phase 5')
+    p.add_argument('--packed-variants', default='144:16,160:16,256:8', help='Packed words per row:attention batch per variant')
     p.add_argument('--files', default='synthetic,raw-0096-layer0,raw-0097-layer10,raw-0099-layer40')
     p.add_argument('--groups', default='2,4,8,16')
     p.add_argument('--iters', type=int, default=20)
@@ -174,6 +189,12 @@ def main():
         manifest.update(operator_name='dsa_gather_atom_phase', phases=[0, 1, 5], q_layout='split',
                         acceptance={'full_output_and_cache_bit_exact': True, 'nope_and_rope_gather_bit_exact': True},
                         gather_scope='repeated isolated 128-query chunk, first/middle/last of 16; not summed')
+    if a.packed_ab:
+        manifest.update(operator_name='dsa_packed_cache', q_layout='split', native_phase=5,
+                        variants=a.packed_variants, canonical_cache='exact full logical NoPE+RoPE bytes incl. step writes',
+                        acceptance={'full_bf16_output_bit_exact': True, 'canonical_cache_bit_exact': True},
+                        timing_scope='persistent cache write + gather + attention, full tuple sync, 512 output',
+                        exclusions=['one-time prefix cache initialization','Q/KV projections','indexer','logical Top-K to physical mapping','E2E'])
     (root.parent / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     emit(dict(kind='manifest', **manifest))
     paths = {Path(f).stem: f for f in glob.glob(a.raw_dir + '/**/raw-*.npy', recursive=True)}
@@ -271,6 +292,86 @@ def main():
         return {key: dict(us=statistics.median(values), us_runs=values,
                           us_range=[min(values), max(values)]) for key, values in times.items()}
 
+    def packed_experiment(name, full, base, base_error):
+        from sglang_tpu.attention.pallas.mla_sparse import scatter_utils
+
+        # A u32 word holds byte w from EACH quarter of the whole padded token.
+        # The old split format bands latent and RoPE independently.
+        def native_rows(caches):
+            return np.concatenate([unpack_banded_words(caches[0], n), unpack_banded_words(caches[1], n)[:, :64]], axis=1)
+
+        prefix = native_rows(initial)
+        expected = native_rows(base['state']['cache'])
+        assert prefix.shape == expected.shape == (n, 576)
+        calls = {'split_p5': base}
+        published = {}
+        failed = {}
+        for width, batch in (map(int, v.split(':')) for v in a.packed_variants.split(',')):
+            tag = f'packed_w{width}_b{batch}'
+            stage = 'layout'
+            try:
+                def step(cache, qin, kv, pe, indices, *, width=width, batch=batch):
+                    # Pack and scatter only this step's T rows into the donated cache.
+                    src = kcu.pack_tokens(jnp.concatenate((kv, pe), axis=-1), width * 4)
+                    dest = kcu.get_dst_rows(kv.shape[0], kvl, pi, cuq, PAGE)
+                    cache = scatter_utils.scatter_rows(cache, src, dest, name='write_packed_kv')
+                    q = jnp.concatenate(qin, axis=-1)
+                    out = sparse_ragged_paged_attention(
+                        q, cache, None, indices, None, cuq, dist, sm_scale=float(c['sm_scale']),
+                        k_scale=1.0, cache_layout='sparsecore_packed', gather_and_attention_chunk_size=CHUNK,
+                        attention_kernel_batch_size=batch, sparsecore_atoms_per_batch=16,
+                        sparsecore_phase_stride=5)
+                    return out[..., :512], cache
+
+                packed_initial = pack_banded_words(prefix, width).reshape(c['P'], PAGE, width)
+                jf = jax.jit(step, donate_argnums=(0,), in_shardings=(sh, (fmt, fmt), sh, sh, sh))
+                indices = put(full)
+                state = {'cache': put(packed_initial), 'last': None}
+                inputs = (q_inputs['split'], kvc, kpe, indices)
+                stage = 'compile'
+                start = time.perf_counter()
+                executable = jf.lower(state['cache'], *inputs).compile()
+                compile_s = time.perf_counter() - start
+                (root / f'compiler/hlo/{name}_{tag}.txt').write_text(executable.as_text())
+
+                def call(state=state, jf=jf, inputs=inputs):
+                    state['last'] = jf(state['cache'], *inputs)
+                    state['cache'] = state['last'][1]
+
+                def sync(state=state):
+                    jax.block_until_ready(state['last'])
+
+                stage = 'first_call'
+                call()
+                sync()
+                stage = 'numerics'
+                output, new_cache = map(np.asarray, state['last'])
+                canonical = unpack_banded_words(new_cache, n)
+                same = np.array_equal(output.view(np.uint16), base['out'].view(np.uint16))
+                cache_exact = np.array_equal(canonical[:, :576], expected) and not np.any(canonical[:, 576:])
+                if not same or not cache_exact or not np.isfinite(output).all():
+                    raise AssertionError(f'{same=}, {cache_exact=}, output_error={differences(output, base["out"])}')
+                calls[tag] = dict(call=call, sync=sync)
+                memory = executable.memory_analysis()
+                published[tag] = dict(width_words=width, batch=batch, compile_s=compile_s,
+                                      cache_payload_bytes=n*576, array_shape_bytes=new_cache.nbytes,
+                                      # Whole-step HBM bytes incl Q/indices etc., not cache allocation alone.
+                                      arg_bytes=memory.argument_size_in_bytes if memory else None,
+                                      temp_bytes=memory.temp_size_in_bytes if memory else None,
+                                      bf16_output_exact=True,
+                                      canonical_cache_exact=True, output_sha256=digest(output))
+            except Exception as exc:
+                failed[tag] = dict(stage=stage, error=repr(exc)[:1600])
+                emit(dict(kind='packed_failure', sample=name, variant=tag, **failed[tag]))
+                traceback.print_exc()
+        if len(calls) == 1:
+            raise RuntimeError('No packed variant passed compilation and numerical checks')
+        times = measure(calls)
+        emit(dict(kind='packed_chain', sample=name, status='partial' if failed else 'measured',
+                  paired_timings=times, native_phase=5, fp8_reference=base_error,
+                  canonical_cache_sha256=digest(expected), variants=published, failures=failed,
+                  physical_topk_sha256=digest(full)))
+
     def profile(f, tag):
         if not a.profile_iters:
             return {}
@@ -343,21 +444,26 @@ def main():
     for name in a.files.split(','):
         print('FAIR_PROGRESS ' + name, flush=True)
         try:
-            raw = c['topk'].copy() if name == 'synthetic' or (a.gather_phase and name == 'masked') else np.load(paths[name]).astype(np.int32)
+            raw = c['topk'].copy() if name == 'synthetic' or ((a.gather_phase or a.packed_ab) and name == 'masked') else np.load(paths[name]).astype(np.int32)
             assert raw.shape == (t, TOPK)
             assert (raw >= 0).all() and (raw <= c['prefixes'][0] + np.arange(t)[:, None]).all()
             assert np.all(np.diff(np.sort(raw, axis=1), axis=1) > 0)
-            if name == 'masked' and a.gather_phase:
+            if name == 'masked' and (a.gather_phase or a.packed_ab):
                 lengths = np.resize([1, 63, 64, 127, 128, 1025, 2047, 2048], t)
                 raw[np.arange(TOPK)[None, :] >= lengths[:, None]] = -1
             full = physical(raw)
             sample, ref_quant, ref_bf = reference(c, raw)
-            layout = 'split' if a.gather_phase else 'rowmajor'
-            base = make_call(layout, full, name + '_base')
+            layout = 'split' if a.gather_phase or a.packed_ab else 'rowmajor'
+            base = make_call(layout, full, name + '_base', phase=5 if a.packed_ab else 0)
             base_error = differences(base['out'][sample], ref_quant)
             if (not np.isfinite(base['out']).all() or not base_error['finite']
                     or base_error['max_normalized'] > 0.03):
                 raise AssertionError(f'Baseline FP8-cache reference failed: {base_error}')
+            if a.packed_ab:
+                packed_experiment(name, full, base, base_error)
+                del base
+                gc.collect()
+                continue
             if a.gather_phase:
                 phase_experiment(name, full, base, base_error)
                 del base

@@ -33,6 +33,7 @@ from sglang_tpu.attention.pallas.mla_sparse import (
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
 SPARSECORE_CACHE_LAYOUT = "sparsecore"
+PACKED_CACHE_LAYOUT = "sparsecore_packed"
 DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
@@ -313,6 +314,7 @@ def _attention_kernel(
     return_lse: bool = False,
     sparsecore_layout: bool = False,
     capped_windows: int | None = None,
+    packed: bool = False,
 ):
     # Capped mode (`capped_windows` = W set, SparseCore layout only): the
     # gathered buffers hold W windows of `bkv_sz` rows per token, window-major
@@ -325,7 +327,12 @@ def _attention_kernel(
         assert sparsecore_layout
         fix_refs = refs[-6:]
         refs = refs[:-6]
-    if return_lse:
+    if packed:
+        assert not return_lse and capped_windows is None
+        o_hbm_ref, bkv_nope_x2_ref, bq_x2_ref, bo_x2_ref, sems = refs
+        bkv_rope_x2_ref = None
+        lse_hbm_ref = blse_x2_ref = None
+    elif return_lse:
         (
             _lse_in_hbm_ref,  # aliased with lse_hbm_ref; never read
             o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -441,10 +448,7 @@ def _attention_kernel(
 
     def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
         sem_nope = sems.at[0, bkv_sem_idx]
-        sem_rope = sems.at[3, bkv_sem_idx]
-
         bkv_nope_vmem_ref = bkv_nope_x2_ref.at[bkv_sem_idx, :]
-        bkv_rope_vmem_ref = bkv_rope_x2_ref.at[bkv_sem_idx, :]
 
         # The index into cache_kv_hbm_ref should be relative to the current
         # chunk.
@@ -456,17 +460,13 @@ def _attention_kernel(
                 sem_nope,
                 wait,
             )
-            _async_copy(
-                cache_kv_rope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
-                bkv_rope_vmem_ref,
-                sem_rope,
-                wait,
-            )
         else:
             dst_nope = bkv_nope_vmem_ref
             _async_copy(src=dst_nope, dst=dst_nope, sem=sem_nope, wait=True)
-            dst_rope = bkv_rope_vmem_ref
-            _async_copy(src=dst_rope, dst=dst_rope, sem=sem_rope, wait=True)
+        if not packed:
+            dst_rope = bkv_rope_x2_ref.at[bkv_sem_idx, :]
+            src_rope = dst_rope if wait else cache_kv_rope_hbm_ref.at[pl.ds(page_idx_start, batch_size)]
+            _async_copy(src_rope, dst_rope, sems.at[3, bkv_sem_idx], wait=wait)
 
     def _fetch_bq_batch(seq_idx_start, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
@@ -548,6 +548,14 @@ def _attention_kernel(
         blse_x2_ref.at[bo_sem_idx, batch_idx][...] = lse_col
 
     def load_bkv(bkv_sem_idx, batch_idx):
+        if packed:
+            words = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...]
+            bkv = pltpu.bitcast(words, jnp.uint8).reshape(bkv_sz, -1)
+            bkv = pltpu.bitcast(bkv[:, :head_dim], jnp.float8_e4m3fn)
+            if bkv.shape[-1] < head_dim:
+                bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
+            length = kv_lens_ref[batch_start_seq_idx + batch_idx]
+            return jnp.where(lax.broadcasted_iota(jnp.int32, bkv.shape, 0) < length, bkv, 0)
         return unpack_bkv(
             bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx],
             bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx],
@@ -979,15 +987,21 @@ def sparse_ragged_paged_attention(
       The output of attention, or `(output, lse)` when `return_lse` is set.
       `lse` is f32[max_num_tokens, actual_num_q_heads].
     """
-    if cache_layout not in (TENSORCORE_CACHE_LAYOUT, SPARSECORE_CACHE_LAYOUT):
+    if cache_layout not in (TENSORCORE_CACHE_LAYOUT, SPARSECORE_CACHE_LAYOUT, PACKED_CACHE_LAYOUT):
         raise ValueError(
             f"cache_layout must be {TENSORCORE_CACHE_LAYOUT!r} or "
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
-    sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    packed = cache_layout == PACKED_CACHE_LAYOUT
+    sparsecore_layout = packed or cache_layout == SPARSECORE_CACHE_LAYOUT
     if sparsecore_phase_stride and (not sparsecore_layout or topk_cap is not None):
         raise ValueError("phase rotation currently requires uncapped SparseCore gather")
-    if sparsecore_layout:
+    if packed:
+        if (cache_kv_nope.ndim != 3 or cache_kv_nope.shape[-1] not in (144, 160, 256)
+                or cache_kv_nope.dtype != jnp.uint32 or cache_kv_rope is not None
+                or q.shape[-1] != 576 or topk_cap is not None or return_lse):
+            raise ValueError("packed MLA requires uint32[pages,page,W], no separate ROPE, 576-wide Q and an uncapped local step")
+    elif sparsecore_layout:
         if (
             cache_kv_nope.dtype != jnp.uint32
             or cache_kv_nope.ndim != 3
@@ -1040,12 +1054,12 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
+    if not packed and cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
             f"{rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
         )
-    if (
+    if not packed and (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
         or cache_kv_nope.shape[1] != rope_tokens_per_row * cache_kv_rope.shape[1]
     ):
@@ -1262,7 +1276,8 @@ def sparse_attention_chunk(
     else:
         assert physical_indices is not None
         topk = physical_indices.shape[-1]
-    sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    packed = cache_layout == PACKED_CACHE_LAYOUT
+    sparsecore_layout = packed or cache_layout == SPARSECORE_CACHE_LAYOUT
     if topk_cap is not None and not sparsecore_layout:
         raise ValueError("topk_cap requires the sparsecore cache layout")
     if topk_cap is not None and (topk_cap % GATHER_ATOM_ROWS or topk % topk_cap):
@@ -1293,8 +1308,9 @@ def sparse_attention_chunk(
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_rope
         ]
+        if not packed:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # cache_kv_rope
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
         # Each chunk writes only its own token rows, so -- exactly like `q` --
@@ -1306,14 +1322,9 @@ def sparse_attention_chunk(
 
         # One batch entry's worth of gathered top-k rows, per cache.
         nope_tile = cache_kv_nope.shape[1:]
-        rope_tile = cache_kv_rope.shape[1:]
         bkv_nope_double_buf = pltpu.VMEM(
             (2, batch_size, *nope_tile),
             cache_kv_nope.dtype,
-        )
-        bkv_rope_double_buf = pltpu.VMEM(
-            (2, batch_size, *rope_tile),
-            cache_kv_rope.dtype,
         )
 
         bq_double_buf = pltpu.VMEM(
@@ -1325,10 +1336,12 @@ def sparse_attention_chunk(
 
         scratch_shapes = [
             bkv_nope_double_buf,
-            bkv_rope_double_buf,
             bq_double_buf,
             bo_double_buf,  # Double buffering for output block.
         ]
+        if not packed:
+            rope_tile = cache_kv_rope.shape[1:]
+            scratch_shapes.insert(1, pltpu.VMEM((2, batch_size, *rope_tile), cache_kv_rope.dtype))
         if return_lse:
             scratch_shapes.append(
                 pltpu.VMEM((2, batch_size, num_q_heads, 1), jnp.float32)
@@ -1366,10 +1379,18 @@ def sparse_attention_chunk(
             return_lse=return_lse,
             sparsecore_layout=sparsecore_layout,
             capped_windows=capped_windows,
+            packed=packed,
         )
+        if packed:
+            # Packed gather has no ROPE operand: adapt the ordinary Pallas ABI
+            # at trace time; the kernel sees a single KV tile and one KV DMA.
+            shared_body = kernel_body
+
+            def kernel_body(kvl, bounds, sem_ids, q_ref, rows_ref, *rest):
+                return shared_body(kvl, bounds, sem_ids, q_ref, rows_ref, None, *rest)
 
         scope_name = (
-            f"MLA-{cache_layout}-p_{cache_kv_rope.shape[1]}-"
+            f"MLA-{cache_layout}-p_{cache_kv_nope.shape[1] if packed else cache_kv_rope.shape[1]}-"
             f"bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
         )
         if capped_windows is not None:
@@ -1413,7 +1434,9 @@ def sparse_attention_chunk(
                 name=scope_name,
             )
         )
-        operands = [q, cache_kv_nope, cache_kv_rope]
+        operands = [q, cache_kv_nope]
+        if not packed:
+            operands.append(cache_kv_rope)
         if return_lse:
             operands.append(lse)
         return kernel(*scalar_prefetches, *operands)
@@ -1502,23 +1525,26 @@ def sparse_attention_chunk(
                 num_live_indices=num_valid_indices,
                 live_multiple=kernel_batch_size * topk,
             )
-        gathered_nope_buffer, gathered_rope_buffer = (
-            native_sc_gather.dsa_gather_native_sc(
-                cache_kv_nope,
-                cache_kv_rope,
-                indices,
-                out_size=chunk_size * topk,
-                atoms_per_batch=gather_atoms,
-                wait_mode=sparsecore_gather_wait_mode,
-                serve_pipelined=sparsecore_gather_pipelined,
-                phase_stride=sparsecore_phase_stride,
+        if packed:
+            gathered_nope_buffer = native_sc_gather.dsa_gather_packed_sc(
+                cache_kv_nope, indices, out_size=chunk_size * topk,
+                atoms_per_batch=gather_atoms, phase_stride=sparsecore_phase_stride,
                 **live_kwargs,
+            ).reshape(chunk_size, topk, cache_kv_nope.shape[-1])
+            gathered_rope_buffer = None
+        else:
+            gathered_nope_buffer, gathered_rope_buffer = (
+                native_sc_gather.dsa_gather_native_sc(
+                    cache_kv_nope, cache_kv_rope, indices, out_size=chunk_size * topk,
+                    atoms_per_batch=gather_atoms, wait_mode=sparsecore_gather_wait_mode,
+                    serve_pipelined=sparsecore_gather_pipelined,
+                    phase_stride=sparsecore_phase_stride, **live_kwargs,
+                )
             )
-        )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
-        gathered_rope_buffer = gathered_rope_buffer.reshape(
-            chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
-        )
+            gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
+            gathered_rope_buffer = gathered_rope_buffer.reshape(
+                chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
+            )
     else:
         assert indices is not None
         gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(

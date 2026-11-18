@@ -72,6 +72,23 @@ def transpose_quad(data: list[Any]) -> list[Any]:
     return data
 
 
+def dsa_gather_packed_sc(packed_cache, indices, *, out_size, atoms_per_batch=16,
+                         num_live_indices=None, live_multiple=1, phase_stride=5):
+    """Gather one banded ``u32[pages,page,W]`` record per physical slot.
+
+    For W in (144,160,256), concatenate NoPE[512] and RoPE[64] FP8, pad to
+    4*W bytes, and pack the four W-byte bands into little-endian words:
+    ``word[w] = sum(bytes[b*W+w] << (8*b) for b in range(4))``.
+    The TC consumer restores the bytes with ``pltpu.bitcast(..., uint8)``.
+    Returns one u32[out_size,W] buffer, preserving query and top-k order.
+    """
+    return dsa_gather_native_sc(
+        packed_cache, None, indices, out_size=out_size, atoms_per_batch=atoms_per_batch,
+        num_live_indices=num_live_indices, live_multiple=live_multiple,
+        phase_stride=phase_stride,
+    )
+
+
 def _kernel(
     nope_hbm_ref: Any,
     rope_hbm_ref: Any,
@@ -95,6 +112,7 @@ def _kernel(
     phase_stride: int = 0,
     query_batch_shift: int = 0,
 ):
+    packed = rope_hbm_ref is None
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
     if live_hbm_ref is not None:
@@ -147,6 +165,10 @@ def _kernel(
                 )
                 copy.start()
                 nope_copies.append(copy)
+            if packed:
+                for copy in nope_copies:
+                    copy.wait()
+                return
             if wait_mode == "before_rope":
                 for copy in nope_copies:
                     copy.wait()
@@ -184,7 +206,7 @@ def _kernel(
 
         nope_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(NUM_LANES), 128),
+                (pl.Indirect(NUM_LANES), nope_hbm_ref.shape[-1]),
                 lambda atom, stream=stream: (values(atom, stream), 0),
             )
             for stream in range(ROPE_PACKING)
@@ -202,6 +224,12 @@ def _kernel(
         )
 
         def run_inner():
+            if packed:
+                pltpu.emit_pipeline(
+                    body, grid=(atoms_per_batch,), in_specs=nope_specs,
+                    out_specs=(), no_pipelining=not serve_pipelined,
+                )(*([nope_hbm_ref] * ROPE_PACKING))
+                return
             pltpu.emit_pipeline(
                 body,
                 grid=(atoms_per_batch,),
@@ -264,7 +292,7 @@ def _kernel(
 )
 def dsa_gather_native_sc(
     nope_cache: jax.Array,
-    rope_cache: jax.Array,
+    rope_cache: jax.Array | None,
     indices: jax.Array,
     *,
     out_size: int,
@@ -274,7 +302,7 @@ def dsa_gather_native_sc(
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
     phase_stride: int = 0,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array] | jax.Array:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
     ``nope_cache`` has one 128-word row per token. ``rope_cache`` packs
@@ -296,24 +324,28 @@ def dsa_gather_native_sc(
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
-    if nope_cache.dtype != jnp.uint32 or nope_cache.shape[-1] != 128:
+    packed = rope_cache is None
+    width = nope_cache.shape[-1]
+    if packed and (nope_cache.dtype != jnp.uint32 or width not in (144, 160, 256)):
+        raise ValueError("packed cache must be uint32[...,144|160|256]")
+    if not packed and (nope_cache.dtype != jnp.uint32 or width != 128):
         raise ValueError("native-SC NOPE must be explicit uint32[...,128]")
-    if rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128:
+    if not packed and (rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128):
         raise ValueError("native-SC ROPE must be banded uint32[...,128]")
     if indices.dtype != jnp.int32 or indices.ndim != 2:
         raise ValueError("indices must be int32[query, topk]")
     if indices.size != out_size:
         raise ValueError(f"indices has {indices.size} values, expected {out_size}")
 
-    nope_rows_view = nope_cache.reshape(-1, 128)
+    nope_rows_view = nope_cache.reshape(-1, width)
     num_tokens = nope_rows_view.shape[0]
-    if num_tokens <= 0 or rope_cache.size % num_tokens != 0:
+    if num_tokens <= 0 or (not packed and rope_cache.size % num_tokens != 0):
         raise ValueError(
             f"ROPE cache ({rope_cache.size} words) must divide evenly across "
             f"NOPE tokens ({num_tokens})"
         )
-    rope_words = rope_cache.size // num_tokens
-    if (
+    rope_words = 0 if packed else rope_cache.size // num_tokens
+    if not packed and (
         rope_words <= 0
         or rope_words % NUM_LANES != 0
         or ROPE_PACKING * rope_words > 128
@@ -323,7 +355,6 @@ def dsa_gather_native_sc(
             f"derived rope_words ({rope_words}) must be a positive multiple of "
             f"{NUM_LANES} dividing 128 with {ROPE_PACKING} * rope_words <= 128"
         )
-    rope_rows_view = rope_cache.reshape(-1, rope_words)
 
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core if tpu_info is not None else None
@@ -366,11 +397,10 @@ def dsa_gather_native_sc(
     batches_per_owner = num_batches // num_owners
     live = num_live_indices is not None
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
-    operands = [
-        nope_rows_view,
-        rope_rows_view,
-        indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
-    ]
+    operands = [nope_rows_view]
+    if not packed:
+        operands.append(rope_cache.reshape(-1, rope_words))
+    operands.append(indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES))
     guard_tail = False
     if live:
         # Live logical batches = cdiv(num_live_indices, occurrences/batch),
@@ -417,7 +447,15 @@ def dsa_gather_native_sc(
         phase_stride=phase_stride,
         query_batch_shift=query_batch_shift,
     )
-    if live:
+    if packed:
+        inner = body
+        if live:
+            def body(rows, idx, live_hbm, out, **scr):
+                return inner(rows, None, idx, out, None, live_hbm_ref=live_hbm, **scr)
+        else:
+            def body(rows, idx, out, **scr):
+                return inner(rows, None, idx, out, None, **scr)
+    elif live:
         inner = body
 
         def body(nope, rope, idx, live_hbm, nope_o, rope_o, **scr):
@@ -425,7 +463,7 @@ def dsa_gather_native_sc(
 
     return core_map_helper.kernel(
         body,
-        out_type=(
+        out_type=jax.ShapeDtypeStruct((out_size, width), jnp.uint32) if packed else (
             jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
             jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
         ),
@@ -440,5 +478,6 @@ def dsa_gather_native_sc(
             f"sc_native_sc_gather_a{atoms_per_batch}_rw{rope_words}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
             + (f"_phase{phase_stride}" if phase_stride else "")
+            + (f"_packed{width}" if packed else "")
         ),
     )(*operands)
