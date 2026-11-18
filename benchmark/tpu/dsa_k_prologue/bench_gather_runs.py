@@ -171,7 +171,7 @@ def main():
     raw = sys.argv[1] if len(sys.argv) > 1 else "/old/fj8"
     try:
         if os.environ.get("SKIP_RUN") != "1":
-        run_stats(raw)
+            run_stats(raw)
     except Exception as e:  # report, do not hide
         print("RUN " + json.dumps({"fail": repr(e)[:400]}), flush=True)
     os.environ.setdefault("JAX_PLATFORMS", "tpu")
