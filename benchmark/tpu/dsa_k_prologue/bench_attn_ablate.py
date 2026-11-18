@@ -60,6 +60,8 @@ def main():
                    help="online A/B of the KV mask variants (MAB lines), outputs "
                         "compared bit for bit with online")
     p.add_argument("--passes", type=int, default=2)
+    p.add_argument("--qk-ab", action="store_true",
+                   help="QK lowering A/B on the pre-gathered path (QAB lines)")
     a = p.parse_args()
 
     import jax
@@ -155,6 +157,64 @@ def main():
 
     paths = {os.path.basename(f)[:-4]: f
              for f in glob.glob(f"{a.raw_dir}/**/raw-*.npy", recursive=True)}
+    if a.qk_ab:
+        # QK lowering A/B on the pre-gathered path (attention alone), where the
+        # QK matmul costs ~2x the PV one. Exactness is vs plain pre.
+        variants = (("pre", ()), ("pre+qk_t", ("qk_t",)),
+                    ("pre+qk_kv_bf16", ("qk_kv_bf16",)),
+                    ("pre+qk_q_fp8", ("qk_q_fp8",)),
+                    ("pre+qk_nope_rope", ("qk_nope_rope",)),
+                    ("pre+no_qk", ("no_qk",)), ("pre+no_pv", ("no_pv",)))
+        for name in a.samples.split(","):
+            try:
+                lg = (np.asarray(c["topk"]) if name == "synthetic"
+                      else np.load(paths[name])).astype(np.int32)
+                phys_np = to_physical(lg, c["pi"], c["ppr"], c["cu_q"], page=FP)
+                kv_lens, phys = prepare_gather_indices(
+                    jnp.asarray(phys_np), None, jnp.asarray(c["cu_q"]), page_size=FP,
+                    total_num_pages=P)
+                args = (nope, rope, ql, qr, phys, kv_lens)
+                tiles = jax.block_until_ready(jax.jit(gather)(phys))
+                fs, outs, us, fails = {}, {}, {}, {}
+                for tag, ab in variants:
+                    try:
+                        fs[tag] = jax.jit(lambda *xs, _ab=ab: attend(
+                            *xs[:6], tiles=xs[6], ablate=_ab))
+                        outs[tag] = np.asarray(fs[tag](*args, tiles).view(jnp.uint16))
+                        us[tag] = []
+                    except Exception as e:  # report, do not hide
+                        fails[tag] = repr(e)[:600]
+                live = [v for v in variants if v[0] in fs]
+                for k in range(a.passes):
+                    order = live if k % 2 == 0 else live[::-1]
+                    for tag, _ in order:
+                        us[tag].append(timed(fs[tag], *args, tiles)[0])
+                base = float(np.median(us["pre"])) if "pre" in us else None
+                for tag, _ in variants:
+                    r = dict(sample=name, variant=tag)
+                    if tag in fails:
+                        r["fail"] = fails[tag]
+                    else:
+                        m = float(np.median(us[tag]))
+                        r.update(us=round(m, 1), passes=us[tag])
+                        if base is not None:
+                            r["saved_us"] = round(base - m, 1)
+                            r["exact_vs_pre"] = bool(np.array_equal(outs[tag], outs["pre"]))
+                            if not r["exact_vs_pre"] and "no_" not in tag:
+                                fx = (outs[tag].astype(np.uint32) << 16).view(np.float32)
+                                fy = (outs["pre"].astype(np.uint32) << 16).view(np.float32)
+                                d = np.abs(fx - fy)
+                                r["max_abs"] = float(np.nanmax(d))
+                                r["max_rel"] = float(np.nanmax(d / np.maximum(np.abs(fy), 1e-3)))
+                    print("QAB " + json.dumps(r), flush=True)
+                del tiles
+            except Exception as e:  # report, do not hide
+                import traceback
+
+                traceback.print_exc()
+                print("QAB " + json.dumps(dict(sample=name, fail=repr(e)[:800])), flush=True)
+        print("QAB_DONE", flush=True)
+        return
     if a.mask_ab:
         # online with parts of attention removed (outputs wrong by design): if the
         # step stays ~3.0-3.3 ms, the SC gather / hand-off is the critical path.

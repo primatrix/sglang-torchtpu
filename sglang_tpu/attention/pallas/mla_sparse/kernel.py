@@ -429,6 +429,28 @@ def _attention_kernel(
             s = jnp.broadcast_to(
                 q[:, :1].astype(jnp.float32), (q.shape[0], kv.shape[0])
             )
+        elif "qk_t" in ablate:  # test only: S^T = kv @ q^T, then transpose S
+            s = jnp.einsum(
+                "md,nd->mn", kv, q, preferred_element_type=jnp.float32
+            ).T
+        elif "qk_kv_bf16" in ablate:  # test only: bf16 K (explicit cast) into QK
+            s = jnp.einsum(
+                "nd,md->nm", q, kv.astype(jnp.bfloat16),
+                preferred_element_type=jnp.float32,
+            )
+        elif "qk_q_fp8" in ablate:  # test only: fp8 x fp8 QK (q cast, no scale)
+            s = jnp.einsum(
+                "nd,md->nm", q.astype(kv.dtype), kv,
+                preferred_element_type=jnp.float32,
+            )
+        elif "qk_nope_rope" in ablate:  # test only: 512 NoPE dot + 128 RoPE dot
+            s = jnp.einsum(
+                "nd,md->nm", q[:, :512], kv[:, :512],
+                preferred_element_type=jnp.float32,
+            ) + jnp.einsum(
+                "nd,md->nm", q[:, 512:], kv[:, 512:],
+                preferred_element_type=jnp.float32,
+            )
         else:
             s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
