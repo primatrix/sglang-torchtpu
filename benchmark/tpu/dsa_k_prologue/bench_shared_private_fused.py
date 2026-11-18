@@ -175,8 +175,8 @@ def make_fused(g, s_w, p_w, sm_scale, num_heads, head_dim):
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
                 grid=(nb,),
-                in_specs=[blk, pl.BlockSpec(memory_space=pltpu.ANY),
-                          pl.BlockSpec(memory_space=pltpu.ANY)],
+                in_specs=[blk, pl.BlockSpec(memory_space=pltpu.HBM),
+                          pl.BlockSpec(memory_space=pltpu.HBM)],
                 out_specs=blk,
                 scratch_shapes=[
                     pltpu.VMEM((2, s_w, 128), jnp.uint32),
