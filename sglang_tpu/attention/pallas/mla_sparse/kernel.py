@@ -37,6 +37,8 @@ DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 # Test only (narrow_output): the attention output's NoPE width.
 NARROW_OUT_DIM = 512
+# Test only: "always" (default) or "cond"; read at trace time (bench_kv_mask_ab).
+_KV_TAIL_MASK_MODE = "always"
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
 
@@ -591,8 +593,17 @@ def _attention_kernel(
         # pages and can decode to fp8 NaN; score masking zeroes the weights,
         # but 0 * NaN = NaN in the PV einsum, so the data must be finite too.
         kv_len = get_kv_len()
-        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        bkv = jnp.where(k_span < kv_len, bkv, 0)
+
+        def _mask(b):
+            k_span = lax.broadcasted_iota(jnp.int32, b.shape, 0)
+            return jnp.where(k_span < kv_len, b, 0)
+
+        # Test only (_KV_TAIL_MASK_MODE): "cond" skips the mask for full blocks
+        # (kv_len >= bkv_sz), where it is the identity.
+        if _KV_TAIL_MASK_MODE == "cond":
+            bkv = lax.cond(kv_len < bkv.shape[0], _mask, lambda b: b, bkv)
+        else:
+            bkv = _mask(bkv)
         return bkv
 
     def fixup_capped_overflow(bi_sem_idx, bo_sem_idx):
