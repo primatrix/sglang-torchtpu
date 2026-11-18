@@ -22,6 +22,7 @@ with ``jax.jit``, not through the torch op. Prints ``PGA`` lines.
 import glob
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -74,6 +75,11 @@ def main():
 
     online = jax.jit(lambda q_, rows: sparse_ragged_paged_attention(
         q_, nope, rope, rows, None, cu, dist, **kw)[..., :512])
+    # Run 1 (exp-tfapm1a2kv) passed one stacked [16, ...] array per cache and
+    # sliced it per chunk inside the jit: ~4.56 ms whatever the top-k, slower
+    # than online. Now each chunk's buffer is its own jit argument (tuples of
+    # 16), so no slice of a 2.7 GB operand is needed; the HLO is checked for
+    # copies of the gathered buffers (a layout change would show up there).
     pre = jax.jit(lambda q_, rows, gn, gr: sparse_ragged_paged_attention(
         q_, nope, rope, rows, None, cu, dist, pregathered=(gn, gr), **kw)[..., :512])
 
@@ -85,7 +91,15 @@ def main():
                                             out_size=CHUNK * TOPK, atoms_per_batch=16)
             gn.append(a.reshape(CHUNK, TOPK, 128))
             gr.append(b.reshape(CHUNK, TOPK // nsc.ROPE_PACKING, 128))
-        return jnp.stack(gn), jnp.stack(gr)
+        return tuple(gn), tuple(gr)
+
+    def hlo_copies(fn, *args):
+        """Copies / slices / layout ops over gathered-buffer-sized u32 arrays."""
+        txt = fn.lower(*args).compile().as_text()
+        pat = re.compile(r"= u32\[(?:\d+,)*(?:2048|512),128\][^ ]* (copy|slice|"
+                         r"copy-start|fusion|bitcast-convert|transpose)\(")
+        hits = [ln.strip()[:150] for ln in txt.splitlines() if pat.search(ln)]
+        return len(hits), hits[:4]
 
     def timed(fn, *args):
         st = {}
@@ -123,6 +137,9 @@ def main():
             o1 = np.asarray(online(q, rows))
             o2 = np.asarray(pre(q, rows, gn, gr))
             r["exact"] = bool(np.array_equal(o1.view(np.uint16), o2.view(np.uint16)))
+            if name == "random":
+                r["hlo_online"] = hlo_copies(online, q, rows)
+                r["hlo_pre"] = hlo_copies(pre, q, rows, gn, gr)
             # Interleave: online, pre, online, pre.
             a1, ar1 = timed(online, q, rows)
             b1, br1 = timed(pre, q, rows, gn, gr)
