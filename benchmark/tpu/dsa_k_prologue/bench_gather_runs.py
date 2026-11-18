@@ -94,7 +94,7 @@ def seg_kernel(L, nseg, depth):
         b = pl.program_id(0)
 
         def cp(i):
-            return pltpu.make_async_copy(src.at[pl.ds(starts_ref[0, i], L)],
+            return pltpu.make_async_copy(src.at[pl.ds(starts_ref[0, 0, i], L)],
                                          dst.at[pl.ds((b * G + i) * L, L)],
                                          sems.at[i % depth])
 
@@ -117,14 +117,14 @@ def seg_kernel(L, nseg, depth):
     return jax.jit(lambda starts, src: pl.pallas_call(
         body,
         grid=(nblk,),
-        in_specs=[pl.BlockSpec((1, G), lambda b: (b, 0), memory_space=pltpu.SMEM),
+        in_specs=[pl.BlockSpec((1, 1, G), lambda b: (b, 0, 0), memory_space=pltpu.SMEM),
                   pl.BlockSpec(memory_space=pltpu.HBM)],
         out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
         scratch_shapes=[pltpu.SemaphoreType.DMA((depth,))],
         out_shape=jax.ShapeDtypeStruct((nseg * L, 128), jnp.uint32),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
         name=f"seg_L{L}_d{depth}",
-    )(starts.reshape(nblk, G), src))
+    )(starts.reshape(nblk, 1, G), src))
 
 
 def seg_bench():
@@ -170,6 +170,7 @@ def seg_bench():
 def main():
     raw = sys.argv[1] if len(sys.argv) > 1 else "/old/fj8"
     try:
+        if os.environ.get("SKIP_RUN") != "1":
         run_stats(raw)
     except Exception as e:  # report, do not hide
         print("RUN " + json.dumps({"fail": repr(e)[:400]}), flush=True)
