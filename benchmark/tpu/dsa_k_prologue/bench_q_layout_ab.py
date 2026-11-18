@@ -81,7 +81,7 @@ def main():
             nope, rope, kvc_, kpe_, kvl, pi, active, nope_spec=ns, rope_spec=rs)
         out = sparse_ragged_paged_attention(
             q_, nope, rope, rows, None, cuq, dist, sm_scale=sm, k_scale=1.0,
-            cache_layout=lay, **KW)
+            cache_layout="sparsecore", **KW)
         return out[..., :512], nope, rope
 
     dev = jax.devices()[0]
