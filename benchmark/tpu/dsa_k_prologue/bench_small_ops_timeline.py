@@ -9,7 +9,7 @@ line is printed as a ``TGT`` line with:
 
 * its start / duration relative to the call;
 * ``sc_busy_us``: how much of it overlaps SparseCore gather work (union of
-  ``native_sc`` events on all SparseCore lines);
+  every event on the SparseCore planes);
 * ``tc_other_us``: how much overlaps other TensorCore ops (attention etc.).
 
 A target with ``sc_busy_us`` near its duration is hidden under the gather;
@@ -108,7 +108,7 @@ def main():
     mods = sorted(e for p, l, ev in lines if l == "XLA Modules" and p == first for e in ev
                   if e[2] - e[1] > 1e6)
     w0, w1 = mods[1][1], mods[1][2]
-    gat, tc_ops, tgts = [], [], []
+    gat, tc_ops, tgts, top = [], [], [], []
     for pname, lname, evs in lines:
         if lname in ("XLA Modules", "Steps"):
             continue
@@ -117,8 +117,17 @@ def main():
                 continue
             s, e = max(s, w0), min(e, w1)
             low = nm.lower()
-            if any(k in nm for k in GATHER):
+            if "SparseCore" in pname:
+                # Every SparseCore event counts as SC busy (gather programs show
+                # up under per-TEC names like ep_copy_in, not only native_sc).
                 gat.append((s, e))
+                if any(k in low for k in TARGETS) and e - s > 2e6:
+                    tgts.append((nm, pname, lname, s, e))
+                continue
+            if lname == "XLA Ops" and e - s > 5e6:
+                top.append((e - s, nm, s))
+            if False:
+                pass
             elif any(k in low for k in TARGETS) and e - s > 2e6:  # > 2 us
                 tgts.append((nm, pname, lname, s, e))
             elif "SparseCore" not in pname and lname == "XLA Ops":
@@ -144,6 +153,11 @@ def main():
                                "targets_under_gather_us": us(tot["sc"]),
                                "targets_overlap_tc_us": us(tot["tc"]),
                                "idle_us": us((w1 - w0) - busy)}), flush=True)
+    # Largest TensorCore ops in the call (catches a pad / data-format op that was
+    # fused or renamed), each with how much of it sits under SparseCore work.
+    for d, nm, s in sorted(top, reverse=True)[:20]:
+        print("TOP " + json.dumps({"n": nm[:90], "t": us(s - w0), "d": us(d),
+                                   "sc_busy_us": us(inter([(s, s + d)], gat))}), flush=True)
     print("TGT_DONE", flush=True)
 
 
