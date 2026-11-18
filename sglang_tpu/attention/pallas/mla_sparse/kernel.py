@@ -315,6 +315,7 @@ def _attention_kernel(
     capped_windows: int | None = None,
     latent_values_only: bool = False,
     compact_output: bool = False,
+    all_slots_live: bool = False,
 ):
     # Capped mode (`capped_windows` = W set, SparseCore layout only): the
     # gathered buffers hold W windows of `bkv_sz` rows per token, window-major
@@ -405,8 +406,9 @@ def _attention_kernel(
         # Mask scores past kv_len (the "-1" tail): zeroing the keys alone is
         # not enough -- a zeroed key still scores 0 and inflates the softmax
         # denominator whenever kv_len << topk.
-        kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
+        if not all_slots_live:
+            kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
 
         m = jnp.max(s, axis=1, keepdims=True)
         p = jnp.exp(s - m)
@@ -592,9 +594,10 @@ def _attention_kernel(
         # Zero keys beyond kv_len: the "-1" tail is gathered from scattered
         # pages and can decode to fp8 NaN; score masking zeroes the weights,
         # but 0 * NaN = NaN in the PV einsum, so the data must be finite too.
-        kv_len = get_kv_len()
-        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        bkv = jnp.where(k_span < kv_len, bkv, 0)
+        if not all_slots_live:
+            kv_len = get_kv_len()
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
     def fixup_capped_overflow(bi_sem_idx, bo_sem_idx):
@@ -892,6 +895,7 @@ def prepare_outputs(
         "gather_rope",
         "latent_values_only",
         "compact_output",
+        "_all_slots_live",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -927,6 +931,7 @@ def sparse_ragged_paged_attention(
     gather_rope: bool = True,
     latent_values_only: bool = False,
     compact_output: bool = False,
+    _all_slots_live: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1096,13 +1101,16 @@ def sparse_ragged_paged_attention(
         )
 
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
-    kv_lens, physical_indices = prepare_gather_indices(
-        topk_indices,
-        page_indices,
-        cu_q_lens,
-        page_size=page_size,
-        total_num_pages=cache_kv_nope.shape[0],
-    )
+    if _all_slots_live:
+        if page_indices is not None or topk_cap is not None or not sparsecore_layout:
+            raise ValueError("all-live specialization is for uncapped physical SparseCore slots")
+        kv_lens = jnp.full((q.shape[0],), topk, dtype=jnp.int32)
+        physical_indices = topk_indices
+    else:
+        kv_lens, physical_indices = prepare_gather_indices(
+            topk_indices, page_indices, cu_q_lens,
+            page_size=page_size, total_num_pages=cache_kv_nope.shape[0],
+        )
 
     # Rows the grid never reaches (padding past `batch_end`) keep this
     # sentinel, so a downstream merge weights them at exp(min - max) == 0
@@ -1150,6 +1158,7 @@ def sparse_ragged_paged_attention(
             gather_rope=gather_rope,
             latent_values_only=latent_values_only,
             compact=compact,
+            all_slots_live=_all_slots_live,
         )
         if compact_output:
             compact = result
@@ -1262,6 +1271,7 @@ def sparse_attention_chunk(
     gather_rope: bool = True,
     latent_values_only: bool = False,
     compact: jax.Array | None = None,
+    all_slots_live: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1391,6 +1401,7 @@ def sparse_attention_chunk(
             capped_windows=capped_windows,
             latent_values_only=latent_values_only,
             compact_output=compact is not None,
+            all_slots_live=all_slots_live,
         )
 
         scope_name = (

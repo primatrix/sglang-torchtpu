@@ -109,6 +109,7 @@ def main():
     p.add_argument('--raw-dir', required=True)
     p.add_argument('--pv-ab', action='store_true', help='Compare full PV with latent-only PV')
     p.add_argument('--compact', action='store_true', help='Also test compact output DMA and scratch')
+    p.add_argument('--guard-ab', action='store_true', help='Time on-device dispatch to the fully valid Top-K specialization')
     p.add_argument('--pv-layout', choices=('rowmajor', 'split'), default='rowmajor')
     p.add_argument('--out-dir', required=True)
     p.add_argument('--files', default='synthetic,raw-0096-layer0,raw-0097-layer10,raw-0099-layer40')
@@ -173,6 +174,8 @@ def main():
                                             'nrmse_sampled_above_base': 0.005})
     if a.pv_ab:
         manifest.update(operator_name='dsa_latent_only_pv', acceptance={'bit_exact_and_finite': True})
+    if a.guard_ab:
+        manifest.update(operator_name='dsa_guarded_full_slots', acceptance={'bit_exact_and_finite': True})
     (root.parent / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     emit(dict(kind='manifest', **manifest))
     paths = {Path(f).stem: f for f in glob.glob(a.raw_dir + '/**/raw-*.npy', recursive=True)}
@@ -181,7 +184,7 @@ def main():
     def physical(rows):
         return to_physical(rows, c['pi'], c['ppr'], c['cu_q'], page=PAGE)
 
-    def attend(q, no, ro, rows, group=1, lse=False, latent=False, compact=False):
+    def attend(q, no, ro, rows, group=1, lse=False, latent=False, compact=False, live=False):
         nt = rows.shape[0]
         return sparse_ragged_paged_attention(
             q, no, ro, rows, None, jnp.array([0, nt], jnp.int32), dist,
@@ -190,14 +193,19 @@ def main():
             attention_kernel_batch_size=BATCH // group,
             sparsecore_atoms_per_batch=atoms_for(CHUNK // group, rows.shape[1]),
             sparsecore_gather_wait_mode='overlap_rope', return_lse=lse, latent_values_only=latent,
-            compact_output=compact)
+            compact_output=compact, _all_slots_live=live)
 
-    def make_call(layout, rows, tag, group=1, latent=False, compact=False):
+    def make_call(layout, rows, tag, group=1, latent=False, compact=False, guarded=False):
         def step(no, ro, qin, kv, pe, indices):
             no, ro = kcu.update_sparse_mla_kv_cache(
                 no, ro, kv, pe, kvl, pi, cuq, nope_spec=ns, rope_spec=rs)
             q = jnp.concatenate(qin, axis=-1) if layout == 'split' else qin
-            if group == 1:
+            if guarded:
+                # Indices are dynamic arguments. Charge the full predicate and both dispatch costs.
+                valid = jnp.all((indices >= 0) & (indices < no.shape[0] * PAGE))
+                out = jax.lax.cond(valid, lambda: attend(q, no, ro, indices, live=True)[..., :512],
+                                   lambda: attend(q, no, ro, indices)[..., :512])
+            elif group == 1:
                 out = attend(q, no, ro, indices, latent=latent, compact=compact)[..., :512]
             else:
                 shared, private = indices
@@ -301,12 +309,12 @@ def main():
             assert raw.shape == (t, TOPK)
             assert (raw >= 0).all() and (raw <= c['prefixes'][0] + np.arange(t)[:, None]).all()
             assert np.all(np.diff(np.sort(raw, axis=1), axis=1) > 0)
-            if name == 'masked' and a.pv_ab:
+            if name == 'masked' and (a.pv_ab or a.guard_ab):
                 lengths = np.resize([1, 63, 64, 127, 128, 1025, 2047, 2048], t)
                 raw[np.arange(TOPK)[None, :] >= lengths[:, None]] = -1
             full = physical(raw)
             sample, ref_quant, ref_bf = reference(c, raw)
-            layout = a.pv_layout if a.pv_ab else 'rowmajor'
+            layout = a.pv_layout if a.pv_ab or a.guard_ab else 'rowmajor'
             base = make_call(layout, full, name + '_base')
             base_error = differences(base['out'][sample], ref_quant)
             if (not np.isfinite(base['out']).all() or not base_error['finite']
@@ -320,6 +328,20 @@ def main():
             base_row.update(profile(base, name + '_base'))
             base_row['latency_ms'] = base_row['us'] / 1000
             emit(base_row)
+
+            if a.guard_ab:
+                cand = make_call(layout, full, name + '_guard', guarded=True)
+                if (not np.array_equal(cand['out'].view(np.uint16), base['out'].view(np.uint16))
+                        or cand['info']['cache_sha256'] != base['info']['cache_sha256']):
+                    raise AssertionError('Guarded attention output or cache differs from baseline')
+                times = measure({'full': base, 'guarded': cand})
+                emit(dict(kind='guard_ab', sample=name, exact=True, cache_equal=True,
+                          all_slots_live=bool((raw >= 0).all()), paired_timings=times,
+                          latency_ms=times['guarded']['us']/1000, fp8_reference=base_error,
+                          **profile(cand, name + '_guard')))
+                del cand, base
+                gc.collect()
+                continue
 
             if a.pv_ab:
                 cand = make_call(layout, full, name + '_pv512', latent=True)
