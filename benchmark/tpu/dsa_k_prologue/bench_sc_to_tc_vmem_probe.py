@@ -104,6 +104,11 @@ def main():
     tc_vmem = pallas_core.CoreMemorySpace(tpu_core.MemorySpace.VMEM, tmesh)
     sc_vmem = pallas_core.CoreMemorySpace(tpu_core.MemorySpace.VMEM, vmesh)
 
+    # TC and SC meshes default to different memory spaces (ANY vs HBM); with
+    # >1 mesh every input/output must name its memory space explicitly.
+    def hbm(*xs):
+        return [pltpu.with_memory_space_constraint(x, pltpu.HBM) for x in xs]
+
     def tc_sc_scratch():
         return [tc_vmem((ROWS, W), jnp.int32), sc_vmem((8,), jnp.int32),
                 sc_vmem((8, W), jnp.int32), pltpu.SemaphoreType.DMA @ vmesh]
@@ -120,9 +125,9 @@ def main():
 
         return mpmd.mpmd_map(
             [(vmesh, sc_part), (tmesh, tc_part)],
-            out_types=jax.ShapeDtypeStruct((ROWS, W), jnp.int32),
+            out_types=pltpu.HBM((ROWS, W), jnp.int32),
             scratch_types=tc_sc_scratch(), name="sctc_tc_sc",
-        )(k, idx)
+        )(*hbm(k, idx))
 
     run_stages("tc_sc", tc_sc, (k, idx), ref)
 
@@ -141,9 +146,9 @@ def main():
 
         return mpmd.mpmd_map(
             [(vmesh, sc_part), (tmesh, tc_part)],
-            out_types=jax.ShapeDtypeStruct((ROWS, W), jnp.int32),
+            out_types=pltpu.HBM((ROWS, W), jnp.int32),
             scratch_types=tc_sc_scratch(), name="sctc_tc_sc_plain",
-        )(k, idx)
+        )(*hbm(k, idx))
 
     run_stages("tc_sc_plain", tc_sc_plain, (k, idx), ref)
 
