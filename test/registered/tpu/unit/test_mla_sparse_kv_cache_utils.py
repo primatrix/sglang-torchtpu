@@ -88,6 +88,17 @@ def _empty(spec: SparseMLAKVCacheSpec) -> jax.Array:
     return jnp.zeros(spec.shape, spec.jax_dtype)
 
 
+def _random_fp8_bytes(rng: np.random.Generator, shape) -> np.ndarray:
+    """Random uint8 bytes that are not float8_e4m3fn NaN codes (0x7F / 0xFF).
+
+    The TPU writer canonicalizes NaN (0xFF -> 0x7F) on the fp8 path, so NaN
+    codes do not survive a byte-exact round trip there; real FP8 K/V never
+    holds them (quantization clips to +-448).
+    """
+    raw = rng.integers(0, 256, shape, np.uint8)
+    return np.where((raw & 0x7F) == 0x7F, raw ^ 0x01, raw).astype(np.uint8)
+
+
 def unpack4(words_u32: np.ndarray) -> np.ndarray:
     """Unpack uint32 words `[..., n]` into four uint8 bands `[..., 4, n]`."""
     w = np.asarray(words_u32).astype(np.uint32)
@@ -796,7 +807,7 @@ class SparseCoreRopePackingTest(parameterized.TestCase):
         byte contract the native gather is tested against on TPU."""
         num_tokens = PAGE_SIZE * 2
         rng = np.random.default_rng(3)
-        raw = rng.integers(0, 256, (num_tokens, ROPE_DIM), np.uint8)
+        raw = _random_fp8_bytes(rng, (num_tokens, ROPE_DIM))
         k_pe = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
         kv_c = jnp.zeros((num_tokens, LKV_DIM), jnp.float8_e4m3fn)
         block_tables = np.array([6, 2, 0, 0], np.int32)
@@ -828,7 +839,7 @@ class SparseCoreRopePackingTest(parameterized.TestCase):
         num_tokens = sum(q_lens)
         query_start_loc = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
         block_tables = rng.permutation(TOTAL_PAGES).astype(np.int32)
-        raw = rng.integers(0, 256, (num_tokens, ROPE_DIM), np.uint8)
+        raw = _random_fp8_bytes(rng, (num_tokens, ROPE_DIM))
         k_pe = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
         kv_c = jnp.zeros((num_tokens, LKV_DIM), jnp.float8_e4m3fn)
         caches = {}
