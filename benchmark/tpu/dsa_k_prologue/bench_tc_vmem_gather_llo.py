@@ -36,8 +36,11 @@ def main():
     k = jnp.asarray(rng.integers(0, 1000, (d, vg.W), dtype=np.int32))
     idx = jnp.asarray(np.stack([rng.choice(d, vg.TOPK, replace=False)
                                 for _ in range(vg.Q)]).astype(np.int32).reshape(-1))
-    for unroll in (1, 8):
-        jax.block_until_ready(vg.gather(k, idx, variant="vld", qb=1, unroll=unroll))
+    for variant in ("iar", "iar_acc"):
+        try:
+            jax.block_until_ready(vg.gather(k, idx, variant=variant, qb=1))
+        except Exception as e:  # report, do not hide
+            print(f"LLO_ERROR {variant} {repr(e)[:600]}", flush=True)
     files = sorted(f for f in glob.glob(f"{DUMP}/**/*", recursive=True) if os.path.isfile(f))
     print(f"LLO_FILES {len(files)}", flush=True)
     for f in files:
@@ -45,6 +48,7 @@ def main():
     # The kernel's own files: name contains the pallas_call name.
     mine = [f for f in files if "tc_vmem_gather" in os.path.basename(f)
             or "tc_vmem_gather" in open(f, errors="replace").read(200000)]
+    mine = [f for f in mine if "final_bundles" in f or "schedule-analysis_final" in f]
     for f in mine:
         text = open(f, errors="replace").read().splitlines()
         tag = os.path.basename(f)[-60:]

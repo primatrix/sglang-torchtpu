@@ -69,6 +69,30 @@ def _dma_kernel(idx_ref, k_ref, o_ref, buf, sem, *, qb):
         _reduce(buf, o_ref, qi)
 
 
+def _iar_kernel(idx_ref, k_ref, o_ref, buf, *, qb, acc):
+    """Vector-index gather: 8 rows per load from an (8,) index vector, which
+    Mosaic lowers to vsetiar.sublane + vld.iar (TensorCore ISA topic 15).
+    idx_ref: VMEM i32[qb * 16, 128], 16 rows of 128 indices per query.
+    ``acc``: sum the rows in registers (what a fused QK would consume) instead
+    of storing them to the [2048, 128] buffer."""
+    for qi in range(qb):
+        def body(rw, a, qi=qi):
+            irow = idx_ref[pl.ds(qi * 16 + rw, 1), :]  # (1, 128)
+            for j in range(16):
+                v = irow[0, j * 8:(j + 1) * 8]
+                rows = k_ref[v, :]  # (8, 128)
+                if acc:
+                    a = a + rows
+                else:
+                    buf[pl.ds(pl.multiple_of(rw * 128 + j * 8, 8), 8), :] = rows
+            return a
+        a = lax.fori_loop(0, TOPK // 128, body, jnp.zeros((8, W), jnp.int32))
+        if acc:
+            o_ref[qi] = a
+        else:
+            _reduce(buf, o_ref, qi)
+
+
 def _contig_kernel(idx_ref, k_ref, o_ref, buf, *, qb):
     for qi in range(qb):
         s = pl.multiple_of(jnp.minimum(idx_ref[qi * TOPK], k_ref.shape[0] - TOPK) // 8 * 8, 8)
@@ -82,6 +106,9 @@ def gather(k, idx, *, variant, qb, unroll=8):
     # 1D blocks of qb * 2048 indices: a (qb, 2048) SMEM block with qb < 8 fails
     # the TPU block-shape rule (last two dims divisible by 8 and 128).
     idx_spec = pl.BlockSpec((qb * TOPK,), lambda i: (i,), memory_space=pltpu.SMEM)
+    if variant.startswith("iar"):
+        idx_spec = pl.BlockSpec((qb * 16, 128), lambda i: (i, 0))
+        idx = idx.reshape(-1, 128)
     if variant == "dma_hbm":
         k_spec = pl.BlockSpec(memory_space=pl.ANY)
     else:
@@ -89,6 +116,8 @@ def gather(k, idx, *, variant, qb, unroll=8):
     scratch = [pltpu.VMEM((TOPK, W), jnp.int32)]
     if variant == "vld":
         kern = functools.partial(_vld_kernel, qb=qb, unroll=unroll)
+    elif variant.startswith("iar"):
+        kern = functools.partial(_iar_kernel, qb=qb, acc=variant == "iar_acc")
     elif variant in ("dma_vmem", "dma_hbm"):
         kern = functools.partial(_dma_kernel, qb=qb)
         scratch.append(pltpu.SemaphoreType.DMA(()))
@@ -104,7 +133,7 @@ def gather(k, idx, *, variant, qb, unroll=8):
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",), vmem_limit_bytes=56 * 1024 * 1024),
         name=f"tc_vmem_gather_{variant}_d{d}_qb{qb}",
-    )(idx.reshape(-1), k)
+    )(idx if variant.startswith("iar") else idx.reshape(-1), k)
 
 
 def reference(k, idx):
@@ -132,8 +161,8 @@ def main():
         idx_np = np.stack([rng.choice(d, TOPK, replace=False) for _ in range(Q)]).astype(np.int32)
         k, idx = jnp.asarray(k_np), jnp.asarray(idx_np)
         ref = reference(k_np, idx_np)
-        points = [("contig", 4, 8), ("vld", 1, 8), ("vld", 4, 8), ("vld", 4, 16),
-                  ("dma_vmem", 4, 8), ("dma_hbm", 4, 8)]
+        points = [("contig", 4, 8), ("vld", 4, 16), ("iar", 1, 0), ("iar", 4, 0),
+                  ("iar_acc", 1, 0), ("iar_acc", 4, 0)]
         for variant, qb, unroll in points:
             row = dict(d=d, variant=variant, qb=qb, unroll=unroll, rows=rows)
             try:
