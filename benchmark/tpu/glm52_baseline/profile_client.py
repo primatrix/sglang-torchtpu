@@ -72,11 +72,20 @@ def summarise(out_dir):
         }), flush=True)
 
 
+async def post_text(session, base, endpoint, payload=None):
+    """/start_profile and /stop_profile answer in plain text, not JSON."""
+    async with session.post(base + endpoint, json=payload or {}) as r:
+        return r.status, (await r.text())[:500]
+
+
 async def main(a):
     a.output.mkdir(parents=True, exist_ok=False)
     prof = (a.output / "xprof").resolve()
     timeout = aiohttp.ClientTimeout(total=3600)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        # A capture armed by an earlier attempt would trace the smoke request.
+        print("PROF " + json.dumps({"stop_previous": await post_text(
+            session, a.base_url, "/stop_profile")}), flush=True)
         save(a.output / "server-info.json", await api(session, a.base_url, "/server_info"))
         tok = await asyncio.to_thread(load_tokenizer, a.model)
         text = tok.apply_chat_template(
@@ -96,8 +105,11 @@ async def main(a):
         if skip:
             # Cached prefix so the traced chunk attends a deep context.
             await generate(session, a.base_url, target[:skip], 0, 1, a.output, "prefix")
-        await api(session, a.base_url, "/start_profile",
-                  dict(output_dir=str(prof), num_steps=a.steps, profile_prefix="extend"))
+        st = await post_text(session, a.base_url, "/start_profile",
+                             dict(output_dir=str(prof), num_steps=a.steps,
+                                  profile_prefix="extend"))
+        print("PROF " + json.dumps({"start_profile": st}), flush=True)
+        assert st[0] == 200, st
         t0 = time.perf_counter()
         await generate(session, a.base_url, target[:skip + a.traced_tokens], 0, 1,
                        a.output, "traced")
