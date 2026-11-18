@@ -327,6 +327,7 @@ def _attention_kernel(
     capped_windows: int | None = None,
     narrow_output: int = 0,
     split_q: bool = False,
+    ablate: tuple = (),
 ):
     # split_q (needs narrow_output): q_hbm_ref is the 512-wide NoPE
     # part; the RoPE part arrives as a separate [T, H, 64] input and both are
@@ -424,10 +425,17 @@ def _attention_kernel(
         # block, so no FlashAttention running-max/rescale state (GLM-5.2 DSA
         # has no SWA or sinks). The step1/step2 split only interleaves VPU
         # and MXU work across batch entries.
-        s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+        if "no_qk" in ablate:  # test only: skip the QK matmul
+            s = jnp.broadcast_to(
+                q[:, :1].astype(jnp.float32), (q.shape[0], kv.shape[0])
+            )
+        else:
+            s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
         if k_scale != 1.0:
             s *= k_scale
+        if "no_softmax" in ablate:  # test only: no mask / max / exp / sum
+            return s, jnp.ones((s.shape[0], 1), jnp.float32), s[:, :1]
 
         # Mask scores past kv_len (the "-1" tail): zeroing the keys alone is
         # not enough -- a zeroed key still scores 0 and inflates the softmax
@@ -436,7 +444,7 @@ def _attention_kernel(
         s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
 
         m = jnp.max(s, axis=1, keepdims=True)
-        p = jnp.exp(s - m)
+        p = (s - m) if "no_exp" in ablate else jnp.exp(s - m)
         l_sum = jnp.sum(p, axis=1, keepdims=True)
 
         # `m` is needed only to reconstruct the log-sum-exp for a cross-shard
@@ -448,7 +456,12 @@ def _attention_kernel(
         kv,
         l_sum,
     ):
-        pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+        if "no_pv" in ablate:  # test only: skip the PV matmul
+            pv = jnp.broadcast_to(l_sum, (p.shape[0], kv.shape[1]))
+        else:
+            if "pv_bf16" in ablate:  # test only: bf16 probabilities into PV
+                p = p.astype(jnp.bfloat16)
+            pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
 
         # We use `k_scale` for the PV step as well since MLA uses a shared
         # compressed latent for k/v and k_scale ~= v_scale.
@@ -635,7 +648,8 @@ def _attention_kernel(
         # but 0 * NaN = NaN in the PV einsum, so the data must be finite too.
         kv_len = get_kv_len()
         k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        bkv = jnp.where(k_span < kv_len, bkv, 0)
+        if "no_kv_mask" not in ablate:
+            bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
     def fixup_capped_overflow(bi_sem_idx, bo_sem_idx):
@@ -1346,6 +1360,8 @@ def sparse_attention_chunk(
     narrow_output: bool = False,
     o: jax.Array | None = None,
     q_rope: jax.Array | None = None,  # split q (see split_q)
+    ablate: tuple = (),  # test only: kernel ablations (_attention_kernel)
+    gathered_group: tuple | None = None,  # test only: pre-gathered tiles
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1489,6 +1505,7 @@ def sparse_attention_chunk(
             capped_windows=capped_windows,
             narrow_output=0 if not narrow_output else (2 if o is not None else 1),
             split_q=q_rope is not None,
+            ablate=ablate,
         )
 
         scope_name = (
@@ -1497,6 +1514,8 @@ def sparse_attention_chunk(
         )
         if capped_windows is not None:
             scope_name += f"-capw_{capped_windows}"
+        if ablate:  # test only: keep ablation bodies apart in caches / profiles
+            scope_name += "-ab_" + "_".join(ablate)
         num_prefetch = len(scalar_prefetches)
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
@@ -1577,7 +1596,10 @@ def sparse_attention_chunk(
     # based on their lengths. For the sequences-segment below certain length,
     # we use a different kernel (dense attention and mask), for the rest of
     # sequences, we use this gather-and-attention kernel.
-    if topk_cap is not None:
+    if gathered_group is not None:
+        assert sparsecore_layout and topk_cap is None
+        gathered_nope_buffer, gathered_rope_buffer = gathered_group
+    elif topk_cap is not None:
         # Window-major: window w of the chunk's top-k is rows [w*C, (w+1)*C)
         # of a [W*C, topk_cap] index array; window 0 is the plain `topk_cap`
         # slice. The live bound reaches the last window any gridded row needs
