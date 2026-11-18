@@ -296,7 +296,7 @@ def main():
                     profile_complete=bool(coverage) and all(x['events'] == a.profile_iters for x in coverage))
 
     def phase_experiment(name, full, base, base_error):
-        phases = (0, 1, 5)
+        phases = (0, 1, 3, 5, 7)
         calls = {0: base}
         for phase in phases[1:]:
             cand = make_call('split', full, f'{name}_phase{phase}', phase=phase)

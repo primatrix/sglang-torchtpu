@@ -83,7 +83,7 @@ PY
 # no additional performance-affecting compiler flags are introduced here.
 df -h /tmp /dev/shm | tee "$ROOT/profiling/disk-after-install.txt"
 
-if [[ "${1:-}" == gather-phase ]]; then
+if [[ "${1:-}" == gather-phase || "${1:-}" == gather-phase-sweep ]]; then
   "$PY" benchmark/tpu/dsa_k_prologue/bench_fair_shared_ab.py --gather-phase \
     --raw-dir /old/fj8 --out-dir "$ROOT/rank-0" \
     --files synthetic,raw-0096-layer0,raw-0097-layer10,raw-0099-layer40,masked \
