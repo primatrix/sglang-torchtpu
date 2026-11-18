@@ -447,9 +447,29 @@ extend_c1，SparseCore 布局，物理 slot，chunk 128 / batch 16，每次调�
 - 没试过的：私有段按长度分 2-3 个桶，每桶一个静态窗口 kernel。即使成功，上限也只是浅层几个百分点再减求交集开销。这个方向暂停。
 - 交集统计脚本 `isect.py` 和 manifest `falcon_isect*.yaml` 在本目录；原型和融合 kernel 只在测试分支 `test/dsa-sc-pr2212-ab`，不进 PR。
 
+### 输出末尾的 640→512 slice（`narrow_output`，已撤回）
+
+设想：kernel 的输出 alias 到 pad 过的 q（640 宽），调用结束后再 `[..., :512]` 切出 NoPE 部分。`jax.jit` 时间线（exp-9pxwfo32rg，`bench_small_ops_timeline.py`）里这次 `slice.92` 约 83 µs，排在最后一次 gather 之后。q 的 576→640 pad（约 160 µs）落在第一次 gather 期间，与 SC 并行，不处理。
+
+做法：kernel 加 `narrow_output`，直接写 512 宽输出；第一个 chunk 新建 buffer，之后的 chunk alias 复用，每个 chunk 只写自己的行。不支持 `return_lse` / `topk_cap`。
+
+| 测法 | 形状 | slice（现状） | `narrow_output` | 差 |
+|---|---|---|---|---|
+| `jax.jit`（exp-g0tsdh8vhc，测试分支 c602393） | extend 49K | 3414.1 us | 3334.3 us | −79.8 us（−2.3%） |
+| torch op（exp-10e3m2l6i4，测试分支 6ab1198） | extend 49K | 3483.1 | 3504.4 | +21（噪声内） |
+| torch op | extend 51K | 3512.6 | 3531.4 | +19（噪声内） |
+| torch op | verify | 171.3 | 171.6 | 持平 |
+| torch op | decode | 138.7 | 138.5 | 持平 |
+
+torch op 一行均为 SparseCore + physical，同一 pod 先 OFF（`NARROW_AB_OFF=1` 恢复 slice）后 ON；Default / Physical 两列也在噪声内，全部输出与 Default 逐位一致。
+
+- 生产走 torch op（`custom_jax_kernel` 导出 StableHLO），这条路径上没有收益。推测 torch_tpu 路径下这次 slice 已经和输出处理融合或被调度掉，没有抓 HLO 确认。
+- 曾推进 #2246（5ececf4），因上面的结果用 revert 提交 ac230df 撤回，PR body 同步还原。
+- 教训：微基准要走与生产相同的 torch op 路径测，`jax.jit` 的结论不能直接写进 PR。
+
 ### 结论
 
-extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense 都比现在慢；gather 与 attention 的跨 chunk 重叠 XLA 已经做了；gather 前的 q 拷贝只出现在微基准里；共享块 + 私有块（组内交集只 gather 一次）三版实现最好的是浅层快 5%-9%、深层变慢，扣掉求交集后没有净收益；复用现有 attention、只改 KV 加载的去重方案，卡在 TensorCore 逐行摆放：Pallas 能写出的只有标量 `sld` 加单 sublane `vld`，每行至少一个 bundle（0.57-0.63 ns/行）；硬件的 `vld.iar` 能做到 8 行一条指令，但 Pallas 和 Mosaic 在 TensorCore 上都没有实现。这条路线暂停。在现有编译器能力下，extend 的收益就是 SparseCore 布局的 −16%～−21%。
+extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense 都比现在慢；gather 与 attention 的跨 chunk 重叠 XLA 已经做了；gather 前的 q 拷贝只出现在微基准里；共享块 + 私有块（组内交集只 gather 一次）三版实现最好的是浅层快 5%-9%、深层变慢，扣掉求交集后没有净收益；输出末尾的 640→512 slice 去掉后，`jax.jit` 下快 2.3%，torch op 路径下没有收益，已从 #2246 撤回；复用现有 attention、只改 KV 加载的去重方案，卡在 TensorCore 逐行摆放：Pallas 能写出的只有标量 `sld` 加单 sublane `vld`，每行至少一个 bundle（0.57-0.63 ns/行）；硬件的 `vld.iar` 能做到 8 行一条指令，但 Pallas 和 Mosaic 在 TensorCore 上都没有实现。这条路线暂停。在现有编译器能力下，extend 的收益就是 SparseCore 布局的 −16%～−21%。
 
 重新打开的条件（都要 Pallas / Mosaic 侧改动，我们这边绕不过去）：
 - Mosaic 给 TensorCore 实现 `tpu.vector_load_idx` 的 lowering（到 `vsetiar` + `vld.iar`），或 Pallas 让 `ref[vec_idx, :]` 走这条路；
