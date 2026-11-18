@@ -379,9 +379,77 @@ extend_c1，SparseCore 布局，物理 slot，chunk 128 / batch 16，每次调�
 - 以前用 `bench_target_gather_sweep` 等脚本测的 extend 时间里都含这次拷贝（约 100 µs，3%）。SparseCore 与 TensorCore 两种布局都有，所以前文的相对收益不受影响，绝对时间略偏高。
 - 未核实：`q_split` 用 `jax.jit` 模拟生产入参，没有抓 torch_tpu `jax.export` + `custom_jax_kernel` 路径编译出的 HLO。bridge 导出时只给 `ShapeDtypeStruct`，按理是默认行主序，但没有确认。
 
+### 共享块 + 私有块（组内交集只 gather 一次）
+
+设想：g 个相邻 query 都选中的行（交集）只 gather 一次，g 个 query 共用；每个 query 剩下的行照常 sparse gather；两部分用 log-sum-exp / online softmax 合并。每组少取 (g−1)·|∩| 行，计算量不增加（区别于前面对并集做 dense attention 的方案）。
+
+#### 交集统计（exp-szvd16mhqd，`isect.py`，离线）
+
+读 exp-fj8ahrq5pz / exp-s2a0c6e4ss 存下的 raw top-k（`raw-*.npy`，每个实验 8 次深上下文调用，2048 query x 2048 行，max_pos 34815/36863），不起服务。两个实验输入相同，数字在小数点后 2-3 位一致，按 8 个样本算。所有 query 都选满 2048 行。剩下的 gather 行数占比（越低越好）：
+
+| 调用 | g=2 | g=4 | g=8 | g=16 | g=128 |
+|---|---|---|---|---|---|
+| 层 0（0096） | 59% | 49% | 51% | 57% | 80% |
+| 层 0（0102） | 60% | 51% | 54% | 60% | 82% |
+| 层 0（0101） | 66% | 67% | 76% | 85% | 98% |
+| 层 10 | 60% | 55% | 60% | 67% | 87% |
+| 层 20 | 62% | 57% | 62% | 68% | 86% |
+| 层 40 | 68% | 70% | 77% | 84% | 96% |
+| 层 60 | 66% | 66% | 74% | 81% | 95% |
+
+- 交集随组变大衰减很快：g=2 占 2048 的 63%-82%，g=16 降到 16%-46%，g=128 只剩 2%-21%。按 attention batch 16 或整个 128 query chunk 分组不划算，最好的是 g=4 左右。
+- 深层（40/60）只省约 1/3，浅层最多省一半。
+- 局限：只有约 35K 上下文、一种自然代码输入、8 个样本。
+
+#### 原型 1：两次 `sparse_ragged_paged_attention` + LSE 合并（exp-2sgevbvpt5，测试分支 48709f1，`bench_shared_private.py`）
+
+复用现有 kernel：共享部分把 g 个 query 当成一个 token 的 g·H 个 head（MLA latent K/V 跨 head 共享），私有部分照常调用，两者都 `return_lse`，在 f32 里合并。共享长度 Ks 必须静态，取全部组的最小交集向下取整到 64。
+
+| 层 | 原版 wall | g=2 | g=4 |
+|---|---|---|---|
+| 0 | 3984 us | +10.1%（剩 87.5% 行） | +4.3%（81.3%） |
+| 10 | 3910 us | +3.8%（75.0%） | −3.6%（71.9%） |
+| 40 | 3876 us | 跳过（最小交集 221，Ks=0） | 跳过（最小交集 175） |
+
+- 数值正确：与原版 max_abs 0.0156，对 bf16 参考的误差与原版相同。
+- 输的原因：静态 Ks 被最差的组拖住（层 0 g=2 交集均值 1673、最小 721）；第二次调用多一次 q pad（130-180 us）和 LSE 合并（约 230 us），共约 400 us。
+
+#### 原型 2：融合 kernel，固定私有窗口（exp-6fh0byh6ua，测试分支 a270a8e，`bench_shared_private_fused.py`）
+
+每个 128 query chunk 一个平铺行列表：每组的共享段（自己的交集长度）后跟 g 个私有段，每段补齐到 64 行；一次 `dsa_gather_native_sc`（`num_live_indices` 只读有效行）。一个 TensorCore Pallas kernel，每组一个 grid step：DMA 共享窗口和每个 query 的私有窗口（偏移/长度 scalar prefetch，组间双缓冲），共享行按 g·H 个 head 算一次，私有行逐 query 算，在寄存器里合并。q 只 pad 一次。私有窗口按 chunk 内最长的 `p_w` 开，靠 mask 去掉多余部分。
+
+| 层 | 原版 wall | g=2 | g=4 | g=8 |
+|---|---|---|---|---|
+| 0 | 3800 us | +14.0%（剩 61.5% 行） | +0.1%（51.1%） | **−5.4%**（52.8%） |
+| 10 | 3692 us | +7.3%（62.6%） | −7.6%（56.5%） | **−8.9%**（61.6%） |
+| 40 | 3663 us | +31.6%（70.8%） | +11.8%（71.7%） | +7.6%（78.7%） |
+
+- 数值正确：与原版 max_abs 0.0078，输出全有限。exp-nyuy4o5g8j 同一 kernel 复现（层 0 g=8 −5.4%，层 10 g=8 −9.3%，层 40 g=8 +7.7%）。
+- 耗时与少取的行数关系弱（层 0 g=4 少取 49% 行，时间持平）：每个 query 都按最长 `p_w` 做 DMA 和 QK/PV，层 40 的 `p_w` 达 1856-1984，接近满长 2048。
+
+#### 原型 3：融合 kernel，变长私有 DMA（exp-nyuy4o5g8j，测试分支 92cd36f）
+
+每段按实际长度切成 `blk` 行的 job，组内 `fori_loop` 遍历，KV 块在 job 和组之间双缓冲；共享段累加 g·H 行的 online softmax 状态，私有段按当前 query 累加，最后一个私有 job 合并写出。计算量降到剩余行数加 job 补齐（53%-84%）。
+
+| 层 | 原版 wall | g=4 blk=128 | g=4 blk=256 | g=8 blk=128 | g=8 blk=256 |
+|---|---|---|---|---|---|
+| 0 | 3785 us | 3.9x | 2.5x | 3.9x | 2.6x |
+| 10 | 3707 us | 4.3x | 2.7x | 4.6x | 2.9x |
+| 40 | 3656 us | 5.3x | 3.3x | 5.7x | 3.5x |
+
+- 数值正确（max_abs ≤ 0.0156）。
+- blk 减半、job 数翻倍，耗时也接近翻倍：慢在每个 job 的固定开销。推测来源（没看 profile）：每个 job 在 VMEM 里读写 g·H 行的 online softmax 状态（`as_` 为 f32[g·H, 640]）；`fori_loop` + 动态 DMA 打断了原版 kernel 那种 MXU / VPU 交错。
+
+#### 小结
+
+- 三版里只有固定窗口融合 kernel 有收益：浅层 g=8 快 5%-9%（0.2-0.33 ms），深层慢 7.7%，按层平均大致打平。
+- 都没算设备上求交集的开销；参考 SC 标记表去重（16 个 chunk 约 0.27 ms），与浅层收益同量级，按现在的形态没有净收益。
+- 没试过的：私有段按长度分 2-3 个桶，每桶一个静态窗口 kernel。即使成功，上限也只是浅层几个百分点再减求交集开销。这个方向暂停。
+- 交集统计脚本 `isect.py` 和 manifest `falcon_isect*.yaml` 在本目录；原型和融合 kernel 只在测试分支 `test/dsa-sc-pr2212-ab`，不进 PR。
+
 ### 结论
 
-extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense 都比现在慢；gather 与 attention 的跨 chunk 重叠 XLA 已经做了；gather 前的 q 拷贝只出现在微基准里；复用现有 attention、只改 KV 加载的去重方案，卡在 TensorCore 逐行摆放：Pallas 能写出的只有标量 `sld` 加单 sublane `vld`，每行至少一个 bundle（0.57-0.63 ns/行）；硬件的 `vld.iar` 能做到 8 行一条指令，但 Pallas 和 Mosaic 在 TensorCore 上都没有实现。这条路线暂停。在现有编译器能力下，extend 的收益就是 SparseCore 布局的 −16%～−21%。
+extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense 都比现在慢；gather 与 attention 的跨 chunk 重叠 XLA 已经做了；gather 前的 q 拷贝只出现在微基准里；共享块 + 私有块（组内交集只 gather 一次）三版实现最好的是浅层快 5%-9%、深层变慢，扣掉求交集后没有净收益；复用现有 attention、只改 KV 加载的去重方案，卡在 TensorCore 逐行摆放：Pallas 能写出的只有标量 `sld` 加单 sublane `vld`，每行至少一个 bundle（0.57-0.63 ns/行）；硬件的 `vld.iar` 能做到 8 行一条指令，但 Pallas 和 Mosaic 在 TensorCore 上都没有实现。这条路线暂停。在现有编译器能力下，extend 的收益就是 SparseCore 布局的 −16%～−21%。
 
 重新打开的条件（都要 Pallas / Mosaic 侧改动，我们这边绕不过去）：
 - Mosaic 给 TensorCore 实现 `tpu.vector_load_idx` 的 lowering（到 `vsetiar` + `vld.iar`），或 Pallas 让 `ref[vec_idx, :]` 走这条路；

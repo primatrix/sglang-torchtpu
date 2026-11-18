@@ -1,0 +1,77 @@
+name: glm52-dsa-topk-isect
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: gke-tpu-train-us-central1-1-prod
+priority: 0
+tags: [glm52, dsa, topk-isect]
+config: '{"module":"DSA top-k intersection","stage":"offline read of old raw dumps"}'
+role_to_task_spec:
+  worker:
+    command: |
+      set -u
+      OUT="${ARTIFACT_LOCAL_DIR:-/tmp/isect-out}"
+      mkdir -p "$OUT"
+      for d in /old/fj8 /old/s2a; do
+        echo "LS $d"; find "$d" -path '*topk-stats*' -name '*.npy' 2>/dev/null | head -n 20
+      done
+      cat > /tmp/isect.py <<'PYEOF'
+      import glob, json, os, sys
+      import numpy as np
+      G = (2, 4, 8, 16, 32, 64, 128)
+      for root in sys.argv[1:]:
+          files = sorted(glob.glob(f"{root}/**/raw-*.npy", recursive=True))
+          print("FILES " + json.dumps({"root": root[-60:], "n": len(files),
+                "names": [os.path.basename(f) for f in files]}), flush=True)
+          for f in files:
+              r = np.load(f)
+              k = r.shape[1]
+              nv = (r >= 0).sum(1)
+              out = {"f": os.path.basename(f), "shape": list(r.shape), "valid_p50": int(np.median(nv)),
+                     "full": float(np.mean(nv == k)), "max_pos": int(r.max())}
+              sets = [np.sort(x[x >= 0]) for x in r]
+              for g in G:
+                  inter, rem = [], []
+                  for b in range(0, len(sets) - g + 1, g):
+                      s = sets[b]
+                      for t in sets[b + 1:b + g]:
+                          s = np.intersect1d(s, t, assume_unique=True)
+                      n = sum(len(t) for t in sets[b:b + g])
+                      inter.append(len(s))
+                      # shared+private: gather |I| once plus each query's private rows
+                      rem.append((n - (g - 1) * len(s)) / max(n, 1))
+                  if inter:
+                      a = np.array(inter)
+                      out[str(g)] = [round(a.mean() / k, 4), round(float(np.percentile(a, 10)) / k, 4),
+                                     round(float(np.percentile(a, 90)) / k, 4), round(float(np.mean(rem)), 4)]
+              # how many of a 128-query block's queries pick each row
+              cov = []
+              for b in range(0, len(sets) - 127, 128):
+                  u, c = np.unique(np.concatenate(sets[b:b + 128]), return_counts=True)
+                  cov.append(np.bincount(np.minimum(c, 128) // 16, minlength=9)[:9] / len(u))
+              if cov:
+                  out["cov16"] = [round(float(x), 3) for x in np.mean(cov, 0)]
+              print("ISECT " + json.dumps(out), flush=True)
+      print("ISECT_DONE", flush=True)
+      PYEOF
+      python3 -I /tmp/isect.py /old/fj8 /old/s2a 2>&1 | tee "$OUT/isect.log" | cut -c1-900
+      exit 0
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    mounts:
+      - name: old-fj8
+        type: gcs
+        bucket: tpu-for-training-falcon-logs
+        prefix: experiments/exp-fj8ahrq5pz/artifacts/art-a04166yn3l
+        mount_path: /old/fj8
+        read_only: true
+        mount_options: [implicit-dirs]
+      - name: old-s2a
+        type: gcs
+        bucket: tpu-for-training-falcon-logs
+        prefix: experiments/exp-s2a0c6e4ss/artifacts/art-07ri3hfy3u
+        mount_path: /old/s2a
+        read_only: true
+        mount_options: [implicit-dirs]
