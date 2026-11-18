@@ -12,7 +12,7 @@ PR：sgl-project/sglang-torchtpu#2246（Draft，头提交 e8be99e，分支 `feat
 - verify / decode 持平，在波动范围内。
 - 四个形状、所有变体的输出都和原版 Target 逐字节一致。
 - 每 token 字节数不变，KV 容量不受影响。
-- 后续（2026-11-18，见文末“top-k 去重”一节）：extend 剩下的约 2.9 ms 是 SC gather 的每行开销。真实 GLM-5.2 top-k 在 128 query 内去重后只剩约 4%，SC 标记表去重 16 个 chunk 只要约 270 us，但 dense-over-distinct 的 attention（不分组和分组都试过）比现在每 chunk 约 220 us 的 gather + attention 更慢。VMEM 内按行 sparse 读取也测了（exp-85fudprrt4）：TensorCore 最快 1.46 ns/行，是 SC 从 HBM gather（0.547 ns/行）的 2.7 倍；LLO bundle（exp-7uv7xzb1cp）显示每行至少一条标量 `sld` 取行号，完美流水下限约 0.57-0.63 ns/行，仍高于 SC gather，KV 加载的去重路线暂停。在现有 Pallas 能力下，extend gather 这条线的收益就是上面的 −16%～−21%。
+- 后续（2026-11-18，见文末“top-k 去重”一节）：extend 剩下的约 2.9 ms 是 SC gather 的每行开销。真实 GLM-5.2 top-k 在 128 query 内去重后只剩约 4%，SC 标记表去重 16 个 chunk 只要约 270 us，但 dense-over-distinct 的 attention（不分组和分组都试过）比现在每 chunk 约 220 us 的 gather + attention 更慢。VMEM 内按行 sparse 读取也测了（exp-85fudprrt4）：TensorCore 最快 1.46 ns/行，是 SC 从 HBM gather（0.547 ns/行）的 2.7 倍；LLO bundle（exp-7uv7xzb1cp）显示 Pallas 写法每行一条标量 `sld` 取行号，完美流水下限约 0.57-0.63 ns/行，仍高于 SC gather。硬件有 8 行一条的 `vld.iar`，但 Pallas indexer、`lax.gather` 和直接发 `tpu.vector_load_idx`（exp-q8ui3ppzti，Mosaic TC layout pass 未实现）都到不了，KV 加载的去重路线暂停。在现有编译器能力下，extend gather 这条线的收益就是上面的 −16%～−21%。
 
 ## 背景
 
@@ -302,7 +302,7 @@ gather 的耗时几乎全在每行一次的 indirect DMA 上（见上节），�
 
 - 实测反推时钟：372 us / 262,144 行 / 2.25 bundle ≈ 1.6 GHz。
 - 理想流水下 `sld` / `vld` / `vst` 每 bundle 各一条，下限每行 1 个 bundle，即 0.57-0.63 ns/行（1.6-1.75 GHz），只算 NoPE。unroll 16 从 1.60 降到 1.46 ns/行，在往这个方向走。
-- 这个下限去不掉：TensorCore 没有按向量索引的 gather load（`vld.idx` 只在 SparseCore TEC 上），每行地址都要一次标量 `sld`，dump 里每个 bundle 只发一条。接入后还要加 RoPE 的 load 和拼 tile。
+- 在 Pallas 能写出来的范围内，这个下限去不掉：每行地址都要一次标量 `sld`，dump 里每个 bundle 只发一条。接入后还要加 RoPE 的 load 和拼 tile。（更正：硬件其实有按向量索引的 load，见下一节，但编译器栈生成不出来。）
 
 | 项目 | ns/行 |
 |---|---|
@@ -313,12 +313,27 @@ gather 的耗时几乎全在每行一次的 indirect DMA 上（见上节），�
 
 TC 逐行读的下限已经超过现在整条 SC gather，更超过去重留出的预算，所以没有写融合原型，也不再做 KV 并集上的 dense attention。
 
+### TensorCore 的 `vld.iar`（TensorCore ISA 文档专题 15）
+
+硬件有按向量索引的 VMEM gather：`vsetiar.sublane iar0, vIdx` 锁存 8 个子通道各自的行偏移，再一条 `vld.iar0.8x128` 读 8 行；重复行号和同 Bank 不停机。理想流水约 0.07 ns/行，远低于 0.42 ns/行的预算。文档称 Pallas 的 `ref[row_indices, :]` 会 lower 到它，但在我们用的版本上不成立。三条路都试了，都到不了 `vld.iar`：
+
+| 写法 | 结果 |
+|---|---|
+| `k_ref[idx_vec, :]`（exp-qfkdi9t03h，测试分支 a0f0930） | Pallas indexer 报 `Cannot do int indexing on TPU`（`_canonicalize_transforms_to_indexer`，0.11.2 和 0.12.0.1 都有） |
+| `lax.gather` | 只 lower 到 `tpu.dynamic_gather`：对寄存器里的值、只沿最内两维，不能从 VMEM 任意取行 |
+| 用内部 `register_lowering_rule` 让 TC kernel 直接发 `tpu.vector_load_idx`（exp-q8ui3ppzti，测试分支 95fbefb） | 每维一个索引向量的写法通过 verifier，但 Mosaic 报 `Unsupported operation: tpu.vector_load_idx in infer-vector-layout pass`；只给一个索引的写法过不了 verifier（每维需要一个索引向量） |
+
+- `tpu.vector_load_idx` / `vector_store_idx` 在 Mosaic dialect 里存在，但 Pallas 只在 SparseCore 的 `plsc.load_gather` 里调用；TC 的 layout 推断 pass 没实现它。
+- 升级 jax 没用：0.12.0.1 的 indexer 检查和 gather lowering 与 0.11.2 相同（pin 在 `pyproject_tpu.toml`：jax / jaxlib 0.11.2，libtpu 0.0.50）。
+- 对照组正常：`contig` 约 45 us，`vld` 384 us，与之前一致。
+- 第三种写法只在测试分支上，用的是不受支持的内部接口，不进任何 PR。
+
 ### 结论
 
-extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense 都比现在慢；复用现有 attention、只改 KV 加载的去重方案，卡在 TensorCore 逐行摆放每行至少一个 bundle（0.57-0.63 ns/行）。这条路线暂停。在现有 Pallas 能力下，extend 的收益就是 SparseCore 布局的 −16%～−21%。
+extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense 都比现在慢；复用现有 attention、只改 KV 加载的去重方案，卡在 TensorCore 逐行摆放：Pallas 能写出的只有标量 `sld` 加单 sublane `vld`，每行至少一个 bundle（0.57-0.63 ns/行）；硬件的 `vld.iar` 能做到 8 行一条指令，但 Pallas 和 Mosaic 在 TensorCore 上都没有实现。这条路线暂停。在现有编译器能力下，extend 的收益就是 SparseCore 布局的 −16%～−21%。
 
-重新打开的条件（目前都没有 Pallas 接口）：
-- TensorCore 上暴露一条指令读多行的向量索引 load；
+重新打开的条件（都要 Pallas / Mosaic 侧改动，我们这边绕不过去）：
+- Mosaic 给 TensorCore 实现 `tpu.vector_load_idx` 的 lowering（到 `vsetiar` + `vld.iar`），或 Pallas 让 `ref[vec_idx, :]` 走这条路；
 - SC 能把去重后的行按每个 query 的顺序直接写进 TC VMEM（ISA 里的 `TC VMEM <-> SC SPMEM` 直连 DMA），且每行开销明显低于 0.547 ns。
 
 微基准 manifest 从这次起改为挂载 GCS 上的 torch_tpu wheel（`/wheels/torch-tpu`，与 GLM-5.2 e2e runner 相同，SHA256 `6e12816e…` 校验通过），不再分片传输；pod 启动到出结果不到 1 分钟。
