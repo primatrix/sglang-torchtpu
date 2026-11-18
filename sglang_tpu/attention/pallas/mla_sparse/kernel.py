@@ -923,6 +923,9 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     gather_rope: bool = True,
     narrow_output: bool = False,
+    # Test only: (nope [num_chunks, chunk, topk, 128], rope [num_chunks, chunk,
+    # topk // 4, 128]) gathered in advance; attention reads them, no SC gather.
+    pregathered: tuple[jax.Array, jax.Array] | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1142,6 +1145,8 @@ def sparse_ragged_paged_attention(
             gather_rope=gather_rope,
             narrow_output=narrow_output,
             o=o,
+            pregathered=None if pregathered is None
+            else (pregathered[0][i], pregathered[1][i]),
         )
         if narrow_output:
             o = result
@@ -1255,6 +1260,7 @@ def sparse_attention_chunk(
     gather_rope: bool = True,
     narrow_output: bool = False,
     o: jax.Array | None = None,
+    pregathered: tuple[jax.Array, jax.Array] | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1517,6 +1523,8 @@ def sparse_attention_chunk(
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             capped_windows * chunk_size, topk_cap // native_sc_gather.ROPE_PACKING, 128
         )
+    elif sparsecore_layout and pregathered is not None:
+        gathered_nope_buffer, gathered_rope_buffer = pregathered
     elif sparsecore_layout:
         live_kwargs = {}
         gather_atoms = sparsecore_atoms_per_batch
