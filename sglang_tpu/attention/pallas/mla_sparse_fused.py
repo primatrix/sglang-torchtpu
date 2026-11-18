@@ -22,6 +22,8 @@ TODO(sglang-torchtpu#1072): measure the kernels' other layout (SparseCore),
 which is meant to gather keys faster.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -318,7 +320,8 @@ def sparse_mla_attention_fused(
         # The kernel writes the 512-wide NoPE output directly, so no
         # [..., :NOPE_DIM] slice of a 640-wide buffer follows (~84 us at
         # extend 2048 x 64 heads).
-        narrow_output=True,
+        # Test branch only: NARROW_AB_OFF=1 restores the sliced output for the A/B.
+        narrow_output=os.environ.get("NARROW_AB_OFF") != "1",
         **(
             dict(
                 cache_layout=SPARSECORE_CACHE_LAYOUT,
@@ -341,6 +344,8 @@ def sparse_mla_attention_fused(
         ),
     )
     # narrow_output: out is already the 512-wide NoPE part of each head.
+    if os.environ.get("NARROW_AB_OFF") == "1":
+        out = out[..., :NOPE_DIM]
     return out, cache_nope, cache_rope
 
 
