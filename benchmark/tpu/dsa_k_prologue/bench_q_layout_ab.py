@@ -144,6 +144,7 @@ def main():
             row["fail"] = repr(e)[:800]
             traceback.print_exc()
         print("QAB " + json.dumps(row), flush=True)
+        print("QABT " + json.dumps({k: row.get(k) for k in ("variant", "q_copies", "exact_vs_default", "us", "us_range", "module_us", "fail")}), flush=True)
     print("QAB_DONE", flush=True)
 
 
