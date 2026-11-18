@@ -93,6 +93,55 @@ def _iar_kernel(idx_ref, k_ref, o_ref, buf, *, qb, acc):
             _reduce(buf, o_ref, qi)
 
 
+# Test only: Pallas rejects vector indices into a TensorCore ref ("Cannot do int
+# indexing on TPU") and uses tpu.vector_load_idx only for SparseCore load_gather.
+# This private primitive emits tpu.vector_load_idx in a TensorCore kernel, to see
+# whether Mosaic accepts it there and lowers it to vsetiar + vld.iar.
+from jax._src import core as _jax_core  # noqa: E402
+from jax._src.lib.mlir import ir as _ir  # noqa: E402
+from jax._src.pallas.mosaic import lowering as _tcl  # noqa: E402
+from jax._src.state import types as _state_types  # noqa: E402
+from jax.experimental.mosaic.dialects import tpu as _tpu_d  # noqa: E402
+
+tc_load_idx_p = _jax_core.Primitive("tc_vector_load_idx")
+
+
+@tc_load_idx_p.def_effectful_abstract_eval
+def _tc_load_idx_abstract(ref, *idx):
+    return _jax_core.ShapedArray(idx[0].shape, ref.dtype), {_state_types.ReadEffect(0)}
+
+
+@_tcl.register_lowering_rule(tc_load_idx_p)
+def _tc_load_idx_lowering(ctx, ref, *idx):
+    out = ctx.avals_out[0]
+    vt = _ir.VectorType.get(out.shape, _tcl._dtype_to_ir_type(out.dtype))
+    return _tpu_d.vector_load_idx(vt, ref, list(idx))
+
+
+def _iarx_kernel(idx_ref, k_ref, o_ref, buf, *, qb, acc, form):
+    """idx_ref: i32[qb * 8, 256]; column c of a query's (8, 256) block holds its
+    rows 8c..8c+7 (one per sublane), so a static column slice broadcast along the
+    lanes is the per-sublane row index (no lane-to-sublane relayout).
+    form "2d": indices (row, lane) per element; "1d": the row index only."""
+    lane = lax.broadcasted_iota(jnp.int32, (8, W), 1)
+    for qi in range(qb):
+        def body(cb, a, qi=qi):
+            blk = idx_ref[pl.ds(qi * 8, 8), pl.ds(pl.multiple_of(cb * 128, 128), 128)]
+            for j in range(128):
+                r = jnp.broadcast_to(blk[:, j:j + 1], (8, W))
+                rows = tc_load_idx_p.bind(k_ref, *((r, lane) if form == "2d" else (r,)))
+                if acc:
+                    a = a + rows
+                else:
+                    buf[pl.ds(pl.multiple_of(cb * 1024 + j * 8, 8), 8), :] = rows
+            return a
+        a = lax.fori_loop(0, TOPK // 1024, body, jnp.zeros((8, W), jnp.int32))
+        if acc:
+            o_ref[qi] = a
+        else:
+            _reduce(buf, o_ref, qi)
+
+
 def _contig_kernel(idx_ref, k_ref, o_ref, buf, *, qb):
     for qi in range(qb):
         s = pl.multiple_of(jnp.minimum(idx_ref[qi * TOPK], k_ref.shape[0] - TOPK) // 8 * 8, 8)
@@ -106,7 +155,10 @@ def gather(k, idx, *, variant, qb, unroll=8):
     # 1D blocks of qb * 2048 indices: a (qb, 2048) SMEM block with qb < 8 fails
     # the TPU block-shape rule (last two dims divisible by 8 and 128).
     idx_spec = pl.BlockSpec((qb * TOPK,), lambda i: (i,), memory_space=pltpu.SMEM)
-    if variant.startswith("iar"):
+    if variant.startswith("iarx"):
+        idx_spec = pl.BlockSpec((qb * 8, 256), lambda i: (i, 0))
+        idx = idx.reshape(Q, 256, 8).transpose(0, 2, 1).reshape(Q * 8, 256)
+    elif variant.startswith("iar"):
         idx_spec = pl.BlockSpec((qb * 16, 128), lambda i: (i, 0))
         idx = idx.reshape(-1, 128)
     if variant == "dma_hbm":
@@ -116,6 +168,9 @@ def gather(k, idx, *, variant, qb, unroll=8):
     scratch = [pltpu.VMEM((TOPK, W), jnp.int32)]
     if variant == "vld":
         kern = functools.partial(_vld_kernel, qb=qb, unroll=unroll)
+    elif variant.startswith("iarx"):
+        kern = functools.partial(_iarx_kernel, qb=qb, acc=variant.endswith("_acc"),
+                                 form="1d" if "_1d" in variant else "2d")
     elif variant.startswith("iar"):
         kern = functools.partial(_iar_kernel, qb=qb, acc=variant == "iar_acc")
     elif variant in ("dma_vmem", "dma_hbm"):
@@ -161,8 +216,8 @@ def main():
         idx_np = np.stack([rng.choice(d, TOPK, replace=False) for _ in range(Q)]).astype(np.int32)
         k, idx = jnp.asarray(k_np), jnp.asarray(idx_np)
         ref = reference(k_np, idx_np)
-        points = [("contig", 4, 8), ("vld", 4, 16), ("iar", 1, 0), ("iar", 4, 0),
-                  ("iar_acc", 1, 0), ("iar_acc", 4, 0)]
+        points = [("contig", 4, 8), ("vld", 4, 16), ("iarx_2d", 1, 0), ("iarx_2d", 4, 0),
+                  ("iarx_2d_acc", 4, 0), ("iarx_1d", 4, 0), ("iarx_1d_acc", 4, 0)]
         for variant, qb, unroll in points:
             row = dict(d=d, variant=variant, qb=qb, unroll=unroll, rows=rows)
             try:

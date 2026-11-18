@@ -36,7 +36,7 @@ def main():
     k = jnp.asarray(rng.integers(0, 1000, (d, vg.W), dtype=np.int32))
     idx = jnp.asarray(np.stack([rng.choice(d, vg.TOPK, replace=False)
                                 for _ in range(vg.Q)]).astype(np.int32).reshape(-1))
-    for variant in ("iar", "iar_acc"):
+    for variant in ("iarx_2d", "iarx_1d", "iarx_2d_acc"):
         try:
             jax.block_until_ready(vg.gather(k, idx, variant=variant, qb=1))
         except Exception as e:  # report, do not hide
