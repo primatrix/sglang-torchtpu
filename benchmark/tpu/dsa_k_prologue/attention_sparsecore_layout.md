@@ -12,7 +12,7 @@ PR：sgl-project/sglang-torchtpu#2246（Draft，头提交 e8be99e，分支 `feat
 - verify / decode 持平，在波动范围内。
 - 四个形状、所有变体的输出都和原版 Target 逐字节一致。
 - 每 token 字节数不变，KV 容量不受影响。
-- 后续（2026-11-18，见文末“top-k 去重”一节）：extend 剩下的约 2.9 ms 是 SC gather 的每行开销。真实 GLM-5.2 top-k 在 128 query 内去重后只剩约 4%，SC 标记表去重 16 个 chunk 只要约 270 us，但 dense-over-distinct 的 attention（不分组和分组都试过）比现在每 chunk 约 220 us 的 gather + attention 更慢。VMEM 内按行 sparse 读取也测了（exp-85fudprrt4）：TensorCore 最快 1.46 ns/行，是 SC 从 HBM gather（0.547 ns/行）的 2.7 倍。在现有 Pallas 能力下，extend gather 这条线的收益就是上面的 −16%～−21%。
+- 后续（2026-11-18，见文末“top-k 去重”一节）：extend 剩下的约 2.9 ms 是 SC gather 的每行开销。真实 GLM-5.2 top-k 在 128 query 内去重后只剩约 4%，SC 标记表去重 16 个 chunk 只要约 270 us，但 dense-over-distinct 的 attention（不分组和分组都试过）比现在每 chunk 约 220 us 的 gather + attention 更慢。VMEM 内按行 sparse 读取也测了（exp-85fudprrt4）：TensorCore 最快 1.46 ns/行，是 SC 从 HBM gather（0.547 ns/行）的 2.7 倍；LLO bundle（exp-7uv7xzb1cp）显示每行至少一条标量 `sld` 取行号，完美流水下限约 0.57-0.63 ns/行，仍高于 SC gather，KV 加载的去重路线暂停。在现有 Pallas 能力下，extend gather 这条线的收益就是上面的 −16%～−21%。
 
 ## 背景
 
@@ -281,9 +281,45 @@ gather 的耗时几乎全在每行一次的 indirect DMA 上（见上节），�
 - 瓶颈是每行一次标量取索引加一次动态 sublane load，不是 VMEM 带宽（连续读同样多数据只要 47 us）。按行 DMA 更慢，单次 DMA 开销在微秒级。
 - 第一次提交（exp-4besr7rwle）编译失败：索引按 1 / 4 行分块放 SMEM，不满足最后两维为 8 / 128 倍数的要求；改为一维整块放 SMEM 后通过。
 
+### 微基准与接入现有 attention 的差别
+
+目标是复用现有 attention 的 QK、softmax、PV 和精度，只改 KV 加载。现有 kernel（`mla_sparse/kernel.py`）的输入是每个 query 一块连续的 `[2048, 640]` tile：SC 把每个 query 的 2048 行 gather 到 HBM，attention 每个 batch 发两次整块 DMA（`_fetch_bkv_batch`，双缓冲），`unpack_bkv` 在 VMEM 里 bitcast、拼 RoPE、pad 到 640、mask 尾部后进两个 einsum。所以不对并集做 dense 时，每个 chunk 都要把 262,144 行按 query 摆好；去重只减少从 HBM 读的行，摆放的行数不变。
+
+| `vld` 384 us 里的部分 | 估计 | 接入后 |
+|---|---|---|
+| 去重后的行 HBM→VMEM（整块 BlockSpec，≤ 8 MB） | 几 us | 仍需要，便宜 |
+| 每行：SMEM 取行号、动态 sublane load、store 到 buf | 约 337 us | 仍需要，attention 读的就是这块 buf |
+| 对 buf 求和（防止被优化掉） | 在 contig 的 47 us 内 | 可去掉，QK 直接读 buf |
+| 输出写回、同步 | 可忽略 | 已有 |
+| RoPE 的每行摆放 | 没算 | 要加，每行再一次 load |
+
+- 按块加载：每个 query 的行号分散，相邻 query 重叠约 75% 不会让同一个 query 内的行变连续，一次 load 仍只装一行（一个 vreg 的 1/8）。
+- 换 SC 摆放（去重后的行放 SPMEM，再按 query 摆）：SC gather 的成本按行算，与字节数和索引是否连续基本无关（RoPE 128 B→64 B 只快 1.3%），从 SPMEM 读也只省字节。
+
+### bundle 核对（exp-7uv7xzb1cp，测试分支 5a6a6c9，`bench_tc_vmem_gather_llo.py`）
+
+`--xla_jf_dump_llo_text` dump 的 `vld` 变体（qb=1，unroll 8）`final_bundles`，内层循环 `0x46`–`0x57`：8 行 18 个 bundle，每行 2.25 个。每行固定四条：`sld`（SMEM 读行号）→ `scalar_lea`（算 VMEM 地址）→ `vld [..] ss:$0 sm:$0xff`（按标量地址读一行）→ `vst [..] sm:$0x1`（写目标 buf 的 1 个 sublane）。前 7 个 bundle 基本只在串行发 `sld`，迭代之间没有软件流水。
+
+- 实测反推时钟：372 us / 262,144 行 / 2.25 bundle ≈ 1.6 GHz。
+- 理想流水下 `sld` / `vld` / `vst` 每 bundle 各一条，下限每行 1 个 bundle，即 0.57-0.63 ns/行（1.6-1.75 GHz），只算 NoPE。unroll 16 从 1.60 降到 1.46 ns/行，在往这个方向走。
+- 这个下限去不掉：TensorCore 没有按向量索引的 gather load（`vld.idx` 只在 SparseCore TEC 上），每行地址都要一次标量 `sld`，dump 里每个 bundle 只发一条。接入后还要加 RoPE 的 load 和拼 tile。
+
+| 项目 | ns/行 |
+|---|---|
+| 现在的 SC 从 HBM gather | 0.547 |
+| 去重方案留给 TC 摆放的上限 | 约 0.42 |
+| TC 逐行读理论下限（只算 NoPE，完美流水） | 0.57-0.63 |
+| TC 实测 | 1.42-1.60 |
+
+TC 逐行读的下限已经超过现在整条 SC gather，更超过去重留出的预算，所以没有写融合原型，也不再做 KV 并集上的 dense attention。
+
 ### 结论
 
-extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense、VMEM 按行 sparse 读都比现在慢。在现有 Pallas 能力下，这条线的收益就是 SparseCore 布局的 −16%～−21%。唯一没试的是让 SC 把去重后的行按每个 query 的布局直接写进 TC VMEM（ISA 里的 `TC VMEM <-> SC SPMEM` 直连 DMA），Pallas 目前没有暴露，要动编译器层。
+extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense 都比现在慢；复用现有 attention、只改 KV 加载的去重方案，卡在 TensorCore 逐行摆放每行至少一个 bundle（0.57-0.63 ns/行）。这条路线暂停。在现有 Pallas 能力下，extend 的收益就是 SparseCore 布局的 −16%～−21%。
+
+重新打开的条件（目前都没有 Pallas 接口）：
+- TensorCore 上暴露一条指令读多行的向量索引 load；
+- SC 能把去重后的行按每个 query 的顺序直接写进 TC VMEM（ISA 里的 `TC VMEM <-> SC SPMEM` 直连 DMA），且每行开销明显低于 0.547 ns。
 
 微基准 manifest 从这次起改为挂载 GCS 上的 torch_tpu wheel（`/wheels/torch-tpu`，与 GLM-5.2 e2e runner 相同，SHA256 `6e12816e…` 校验通过），不再分片传输；pod 启动到出结果不到 1 分钟。
 
