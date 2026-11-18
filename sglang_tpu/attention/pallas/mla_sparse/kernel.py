@@ -313,6 +313,7 @@ def _attention_kernel(
     return_lse: bool = False,
     sparsecore_layout: bool = False,
     capped_windows: int | None = None,
+    latent_values_only: bool = False,
 ):
     # Capped mode (`capped_windows` = W set, SparseCore layout only): the
     # gathered buffers hold W windows of `bkv_sz` rows per token, window-major
@@ -416,7 +417,9 @@ def _attention_kernel(
         kv,
         l_sum,
     ):
-        pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+        # RoPE participates in QK, but MLA projects only the latent values.
+        values = kv[:, :nope_dim] if latent_values_only else kv
+        pv = jnp.einsum("nm,md->nd", p, values, preferred_element_type=jnp.float32)
 
         # We use `k_scale` for the PV step as well since MLA uses a shared
         # compressed latent for k/v and k_scale ~= v_scale.
@@ -430,6 +433,9 @@ def _attention_kernel(
             if q_dtype == jnp.float32
             else (pv * pltpu.reciprocal(l_sum, approx=True)).astype(q_dtype)
         )
+        # Preserve the Q/O alias, existing DMA geometry and pipeline dependency.
+        if latent_values_only:
+            out = jnp.pad(out, ((0, 0), (0, head_dim - nope_dim)))
         return out
 
     def _async_copy(src, dst, sem, wait):
@@ -880,6 +886,7 @@ def prepare_outputs(
         "live_gather_all_chunks",
         "topk_cap",
         "gather_rope",
+        "latent_values_only",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -913,6 +920,7 @@ def sparse_ragged_paged_attention(
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
     gather_rope: bool = True,
+    latent_values_only: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1048,6 +1056,9 @@ def sparse_ragged_paged_attention(
         )
 
     _, actual_num_q_heads, actual_head_dim = q.shape
+    latent_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
+    if latent_values_only and (actual_head_dim < latent_dim or topk_cap is not None):
+        raise ValueError("latent-only PV requires full latent inputs and uncapped attention")
 
     q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
 
@@ -1127,6 +1138,7 @@ def sparse_ragged_paged_attention(
             topk_cap=topk_cap,
             topk_override=topk,
             gather_rope=gather_rope,
+            latent_values_only=latent_values_only,
         )
         if return_lse:
             q, lse = result
@@ -1134,7 +1146,7 @@ def sparse_ragged_paged_attention(
             q = result
 
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
-    out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
+    out = prepare_outputs(q, actual_num_q_heads, latent_dim if latent_values_only else actual_head_dim)
     if return_lse:
         return out, lse[:, :actual_num_q_heads, 0]
     return out
@@ -1234,6 +1246,7 @@ def sparse_attention_chunk(
     topk_cap: int | None = None,
     topk_override: int | None = None,
     gather_rope: bool = True,
+    latent_values_only: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1358,6 +1371,7 @@ def sparse_attention_chunk(
             return_lse=return_lse,
             sparsecore_layout=sparsecore_layout,
             capped_windows=capped_windows,
+            latent_values_only=latent_values_only,
         )
 
         scope_name = (

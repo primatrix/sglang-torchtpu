@@ -83,7 +83,7 @@ def reference(c, raw):
     quantized, unquantized = [], []
     prefix = int(c['prefixes'][0])
     for i in sample:
-        pos = raw[i]
+        pos = raw[i][raw[i] >= 0]
         slots = c['pi'][pos // PAGE] * PAGE + pos % PAGE
         lat = c['prefix_kv'][slots].astype(np.float64)
         rope = c['prefix_pe'][slots].astype(np.float64)
@@ -107,6 +107,7 @@ def reference(c, raw):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--raw-dir', required=True)
+    p.add_argument('--pv-ab', action='store_true', help='Compare full PV with latent-only PV')
     p.add_argument('--out-dir', required=True)
     p.add_argument('--files', default='synthetic,raw-0096-layer0,raw-0097-layer10,raw-0099-layer40')
     p.add_argument('--groups', default='2,4,8,16')
@@ -168,6 +169,8 @@ def main():
                     devices=[str(x) for x in jax.devices()], active_device=str(jax.devices()[0]),
                     args=vars(a), acceptance={'max_sampled_error_above_base': 0.01,
                                             'nrmse_sampled_above_base': 0.005})
+    if a.pv_ab:
+        manifest.update(operator_name='dsa_latent_only_pv', acceptance={'bit_exact_and_finite': True})
     (root.parent / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     emit(dict(kind='manifest', **manifest))
     paths = {Path(f).stem: f for f in glob.glob(a.raw_dir + '/**/raw-*.npy', recursive=True)}
@@ -176,7 +179,7 @@ def main():
     def physical(rows):
         return to_physical(rows, c['pi'], c['ppr'], c['cu_q'], page=PAGE)
 
-    def attend(q, no, ro, rows, group=1, lse=False):
+    def attend(q, no, ro, rows, group=1, lse=False, latent=False):
         nt = rows.shape[0]
         return sparse_ragged_paged_attention(
             q, no, ro, rows, None, jnp.array([0, nt], jnp.int32), dist,
@@ -184,15 +187,15 @@ def main():
             gather_and_attention_chunk_size=CHUNK // group,
             attention_kernel_batch_size=BATCH // group,
             sparsecore_atoms_per_batch=atoms_for(CHUNK // group, rows.shape[1]),
-            sparsecore_gather_wait_mode='overlap_rope', return_lse=lse)
+            sparsecore_gather_wait_mode='overlap_rope', return_lse=lse, latent_values_only=latent)
 
-    def make_call(layout, rows, tag, group=1):
+    def make_call(layout, rows, tag, group=1, latent=False):
         def step(no, ro, qin, kv, pe, indices):
             no, ro = kcu.update_sparse_mla_kv_cache(
                 no, ro, kv, pe, kvl, pi, cuq, nope_spec=ns, rope_spec=rs)
             q = jnp.concatenate(qin, axis=-1) if layout == 'split' else qin
             if group == 1:
-                out = attend(q, no, ro, indices)[..., :512]
+                out = attend(q, no, ro, indices, latent=latent)[..., :512]
             else:
                 shared, private = indices
                 if private.shape[1] == 0:
@@ -291,10 +294,13 @@ def main():
     for name in a.files.split(','):
         print('FAIR_PROGRESS ' + name, flush=True)
         try:
-            raw = c['topk'].copy() if name == 'synthetic' else np.load(paths[name]).astype(np.int32)
+            raw = c['topk'].copy() if name in ('synthetic', 'masked') else np.load(paths[name]).astype(np.int32)
             assert raw.shape == (t, TOPK)
             assert (raw >= 0).all() and (raw <= c['prefixes'][0] + np.arange(t)[:, None]).all()
             assert np.all(np.diff(np.sort(raw, axis=1), axis=1) > 0)
+            if name == 'masked' and a.pv_ab:
+                lengths = np.resize([1, 63, 64, 127, 128, 1025, 2047, 2048], t)
+                raw[np.arange(TOPK)[None, :] >= lengths[:, None]] = -1
             full = physical(raw)
             sample, ref_quant, ref_bf = reference(c, raw)
             base = make_call('rowmajor', full, name + '_base')
@@ -310,6 +316,24 @@ def main():
             base_row.update(profile(base, name + '_base'))
             base_row['latency_ms'] = base_row['us'] / 1000
             emit(base_row)
+
+            if a.pv_ab:
+                cand = make_call('rowmajor', full, name + '_pv512', latent=True)
+                eq = np.array_equal(cand['out'].view(np.uint16), base['out'].view(np.uint16))
+                cache_eq = cand['info']['cache_sha256'] == base['info']['cache_sha256']
+                if not (eq and cache_eq and np.isfinite(cand['out']).all()):
+                    raise AssertionError(f'PV mismatch: {eq=}, {cache_eq=}, {differences(cand["out"], base["out"])}')
+                times = measure({'full': base, 'latent': cand})
+                ratios = [x/y for x,y in zip(times['latent']['us_runs'], times['full']['us_runs'])]
+                row = dict(kind='pv_ab', variant='pv512', sample=name, exact=True, cache_equal=True,
+                           us=times['latent']['us'], latency_ms=times['latent']['us']/1000,
+                           paired_timings=times, paired_ratios=ratios, ratio=statistics.median(ratios),
+                           fp8_reference=base_error, topk_sha256=digest(raw), **cand['info'])
+                row.update(profile(cand, name + '_pv512'))
+                emit(row)
+                del cand, base
+                gc.collect()
+                continue
 
             # Equal output/cache and timing boundaries, different Q input layouts only.
             for layout in ('default', 'split'):
