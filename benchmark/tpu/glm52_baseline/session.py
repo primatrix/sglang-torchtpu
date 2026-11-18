@@ -170,7 +170,6 @@ def run():
             # Test only: the server records extend top-k stats here once the
             # top-k client creates <dir>/ENABLE (dsa_topk_stats.py). Shared by
             # both hosts: global rank 0 can run on either Falcon rank's host.
-            SGLANG_TPU_DSA_TOPK_STATS_DIR=str(shared / "topk-stats"),
         )
         (shared / "topk-stats").mkdir(parents=True, exist_ok=True)
         for key in ("XDG_CACHE_HOME", "TMPDIR", "JAX_COMPILATION_CACHE_DIR"):
@@ -353,7 +352,7 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     sys.executable,
                     "-u",
                     "-m",
-                    "benchmark.tpu.glm52_baseline.topk_client",
+                    "benchmark.tpu.glm52_baseline.profile_client",
                     "--stats-dir",
                     str(shared / "topk-stats"),
                     "--base-url",
