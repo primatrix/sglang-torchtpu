@@ -156,8 +156,7 @@ def main():
     paths = {os.path.basename(f)[:-4]: f
              for f in glob.glob(f"{a.raw_dir}/**/raw-*.npy", recursive=True)}
     if a.mask_ab:
-        variants = (("online", ()), ("kv_mask_col", ("kv_mask_col",)),
-                    ("kv_mask_cond", ("kv_mask_cond",)))
+        variants = (("online", ()), ("kv_mask_batch", ("kv_mask_batch",)))
         for name in a.samples.split(","):
             try:
                 lg = (np.asarray(c["topk"]) if name == "synthetic"

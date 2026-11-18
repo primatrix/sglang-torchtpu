@@ -609,14 +609,15 @@ def _attention_kernel(
         """Stores one token's f32[num_q_heads, 1] log-sum-exp column."""
         blse_x2_ref.at[bo_sem_idx, batch_idx][...] = lse_col
 
-    def load_bkv(bkv_sem_idx, batch_idx):
+    def load_bkv(bkv_sem_idx, batch_idx, apply_mask=True):
         return unpack_bkv(
             bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx],
             bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx],
             lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
+            apply_mask=apply_mask,
         )
 
-    def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
+    def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len, apply_mask=True):
         bkv_nope = bkv_nope_ref[...]
         if sparsecore_layout:
             # Native SC returns one uint32[128] row per token. Bitcasting
@@ -646,6 +647,8 @@ def _attention_kernel(
         # Zero keys beyond kv_len: the "-1" tail is gathered from scattered
         # pages and can decode to fp8 NaN; score masking zeroes the weights,
         # but 0 * NaN = NaN in the PV einsum, so the data must be finite too.
+        if not apply_mask:  # test only (kv_mask_batch): batch has no -1 tail
+            return bkv
         kv_len = get_kv_len()
         if "kv_mask_col" in ablate:  # test only: [bkv_sz, 1] iota, broadcast select
             k_col = lax.broadcasted_iota(jnp.int32, (bkv.shape[0], 1), 0)
@@ -792,69 +795,87 @@ def _attention_kernel(
         bo_sem_idx = sem_ids_ref[1]
         sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
 
-        prev_p = None
-        prev_bkv = None
-        prev_l_sum = None
-        prev_m = None
-        prev_out = None
+        def pipelined(apply_mask):
+            prev_p = None
+            prev_bkv = None
+            prev_l_sum = None
+            prev_m = None
+            prev_out = None
 
-        def write_blse(batch_idx, m, l_sum):
-            # log-sum-exp in the *unshifted* frame, so a peer holding a
-            # disjoint slice of the same token's top-k can merge with
-            # o = sum_r softmax(lse_r) * o_r without knowing our max.
-            if not return_lse:
-                return
-            store_blse(bo_sem_idx, batch_idx, m + jnp.log(l_sum))
+            def write_blse(batch_idx, m, l_sum):
+                # log-sum-exp in the *unshifted* frame, so a peer holding a
+                # disjoint slice of the same token's top-k can merge with
+                # o = sum_r softmax(lse_r) * o_r without knowing our max.
+                if not return_lse:
+                    return
+                store_blse(bo_sem_idx, batch_idx, m + jnp.log(l_sum))
 
-        # Wait for cur blocks if not ready yet
-        wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
-        wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
+            # Wait for cur blocks if not ready yet
+            wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
+            wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
 
-        @pl.when(pl.program_id(0) >= 2)
-        def _wait_send():
-            # This slot holds the transfer from two batches earlier.
-            sent_start = (
-                batch_start_seq_idx - 2 * batch_size
-                if preserve_suffix
-                else batch_start_seq_idx
-            )
-            wait_send_bo_batch(sent_start, bo_sem_idx)
-            if return_lse:
-                _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
+            @pl.when(pl.program_id(0) >= 2)
+            def _wait_send():
+                # This slot holds the transfer from two batches earlier.
+                sent_start = (
+                    batch_start_seq_idx - 2 * batch_size
+                    if preserve_suffix
+                    else batch_start_seq_idx
+                )
+                wait_send_bo_batch(sent_start, bo_sem_idx)
+                if return_lse:
+                    _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
-        for batch_idx in range(batch_size):
-            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-            bkv = load_bkv(bi_sem_idx, batch_idx)
-            bq = load_bq(bi_sem_idx, batch_idx)
+            for batch_idx in range(batch_size):
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                bkv = load_bkv(bi_sem_idx, batch_idx, apply_mask)
+                bq = load_bq(bi_sem_idx, batch_idx)
 
-            if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting
-                # LLO's QK runahead
-                # We use jnp.where to prevent XLA from optimizing the dependency away.
-                # prev_out won't be inf in practice.
-                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
+                if prev_out is not None:
+                    # Artificial dependency to force MXU/VPU interleaving by limiting
+                    # LLO's QK runahead
+                    # We use jnp.where to prevent XLA from optimizing the dependency away.
+                    # prev_out won't be inf in practice.
+                    bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
 
-            p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
+                p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
 
-            if prev_p is not None:
-                assert prev_bkv is not None
-                assert prev_l_sum is not None
-                out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+                if prev_p is not None:
+                    assert prev_bkv is not None
+                    assert prev_l_sum is not None
+                    out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
 
-                # Store output from acc to bo.
-                bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
-                write_blse(batch_idx - 1, prev_m, prev_l_sum)
-                prev_out = out
+                    # Store output from acc to bo.
+                    bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
+                    write_blse(batch_idx - 1, prev_m, prev_l_sum)
+                    prev_out = out
 
-            prev_p = p
-            prev_bkv = bkv
-            prev_l_sum = l_sum
-            prev_m = m
+                prev_p = p
+                prev_bkv = bkv
+                prev_l_sum = l_sum
+                prev_m = m
 
-        # end of pipelining loop
-        out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
-        bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
-        write_blse(batch_size - 1, prev_m, prev_l_sum)
+            # end of pipelining loop
+            out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+            bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
+            write_blse(batch_size - 1, prev_m, prev_l_sum)
+
+        if "kv_mask_batch" in ablate:
+            # test only: pick the mask once per batch, both bodies straight-line.
+            has_tail = kv_lens_ref[batch_start_seq_idx] < bkv_sz
+            for b in range(1, batch_size):
+                has_tail = has_tail | (kv_lens_ref[batch_start_seq_idx + b] < bkv_sz)
+
+            @pl.when(has_tail)
+            def _masked():
+                pipelined(True)
+
+            @pl.when(jnp.logical_not(has_tail))
+            def _unmasked():
+                pipelined(False)
+
+        else:
+            pipelined(True)
         if capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
