@@ -326,7 +326,11 @@ def _attention_kernel(
     sparsecore_layout: bool = False,
     capped_windows: int | None = None,
     narrow_output: int = 0,
+    split_q: bool = False,
 ):
+    # split_q (test only, needs narrow_output): q_hbm_ref is the 512-wide NoPE
+    # part; the RoPE part arrives as a separate [T, H, 64] input and both are
+    # joined (and zero-padded to 640) in registers, so XLA does no concat/pad.
     # narrow_output: 0 = the output aliases q (head_dim wide, sliced by the
     # caller); 1 = a fresh NARROW_OUT_DIM-wide output (first chunk);
     # 2 = that output passed back in, aliased, so later chunks keep the rows
@@ -344,6 +348,12 @@ def _attention_kernel(
         refs = refs[:-6]
     if narrow_output == 2:
         refs = refs[1:]
+    q_rope_hbm_ref = bq_rope_x2_ref = qr_sems = None
+    if split_q:
+        assert narrow_output and not return_lse and capped_windows is None
+        q_rope_hbm_ref = refs[0]
+        bq_rope_x2_ref, qr_sems = refs[-2], refs[-1]
+        refs = refs[1:-2]
     if return_lse:
         (
             _lse_in_hbm_ref,  # aliased with lse_hbm_ref; never read
@@ -371,6 +381,9 @@ def _attention_kernel(
     assert q_hbm_ref.shape[:2] == o_hbm_ref.shape[:2]
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
+    if split_q:
+        # NoPE (512) + RoPE padded to one 128-lane tile: the kv width.
+        head_dim += 128
     o_dim = o_hbm_ref.shape[-1]
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
@@ -498,8 +511,18 @@ def _attention_kernel(
                 sem,
                 wait,
             )
+            if split_q:
+                _async_copy(
+                    q_rope_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                    bq_rope_x2_ref.at[bq_sem_idx, :],
+                    qr_sems.at[bq_sem_idx],
+                    wait,
+                )
         else:
             _async_copy(src=bq_vmem_ref, dst=bq_vmem_ref, sem=sem, wait=True)
+            if split_q:
+                qr_ref = bq_rope_x2_ref.at[bq_sem_idx, :]
+                _async_copy(src=qr_ref, dst=qr_ref, sem=qr_sems.at[bq_sem_idx], wait=True)
 
     def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
@@ -560,7 +583,12 @@ def _attention_kernel(
         return _send_bo_batch(seq_idx_start, bo_sem_idx, wait=True)
 
     def load_bq(bq_sem_idx, batch_idx):
-        return bq_x2_ref.at[bq_sem_idx, batch_idx][...]
+        bq = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
+        if split_q:
+            qr = bq_rope_x2_ref.at[bq_sem_idx, batch_idx][...]
+            qr = jnp.pad(qr, ((0, 0), (0, head_dim - bq.shape[-1] - qr.shape[-1])))
+            bq = jnp.concatenate([bq, qr], axis=-1)
+        return bq
 
     def store_blse(bo_sem_idx, batch_idx, lse_col):
         """Stores one token's f32[num_q_heads, 1] log-sum-exp column."""
@@ -944,6 +972,9 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     gather_rope: bool = True,
     narrow_output: bool = False,
+    # Test only: q is the 512-wide NoPE part and q_rope [T, H, 64] the RoPE
+    # part; the kernel joins them in VMEM (needs narrow_output).
+    q_rope: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1095,7 +1126,11 @@ def sparse_ragged_paged_attention(
 
     _, actual_num_q_heads, actual_head_dim = q.shape
 
-    q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
+    if q_rope is not None:
+        if not narrow_output or q.shape[-1] != NARROW_OUT_DIM:
+            raise ValueError("q_rope (test only) needs narrow_output and a 512-wide q")
+    else:
+        q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
 
     page_size = cache_kv_nope.shape[1]
 
@@ -1182,6 +1217,7 @@ def sparse_ragged_paged_attention(
             gather_rope=gather_rope,
             narrow_output=narrow_output,
             o=o,
+            q_rope=q_rope,
         )
         if narrow_output:
             o = result
@@ -1299,6 +1335,7 @@ def sparse_attention_chunk(
     gather_rope: bool = True,
     narrow_output: bool = False,
     o: jax.Array | None = None,
+    q_rope: jax.Array | None = None,  # test only: split q (see split_q)
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1387,6 +1424,8 @@ def sparse_attention_chunk(
         )
         if narrow_output_mode == 2:
             in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # o (in)
+        if q_rope is not None:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # q_rope
 
         scratch_shapes = [
             bkv_nope_double_buf,
@@ -1412,6 +1451,11 @@ def sparse_attention_chunk(
                 pltpu.VMEM((num_q_heads, head_dim), jnp.float32),
                 pltpu.SemaphoreType.DMA((2, 2)),
             ]
+        if q_rope is not None:
+            scratch_shapes += [
+                pltpu.VMEM((2, batch_size, num_q_heads, q_rope.shape[-1]), q_rope.dtype),
+                pltpu.SemaphoreType.DMA((2,)),
+            ]
 
         bounds = [start_seq_idx, end_seq_idx]
         if preserve_suffix:
@@ -1432,6 +1476,7 @@ def sparse_attention_chunk(
             sparsecore_layout=sparsecore_layout,
             capped_windows=capped_windows,
             narrow_output=0 if not narrow_output else (2 if o is not None else 1),
+            split_q=q_rope is not None,
         )
 
         scope_name = (
@@ -1488,6 +1533,8 @@ def sparse_attention_chunk(
         operands = [q, cache_kv_nope, cache_kv_rope]
         if narrow_output_mode == 2:
             operands.append(o)
+        if q_rope is not None:
+            operands.append(q_rope)
         if return_lse:
             operands.append(lse)
         return kernel(*scalar_prefetches, *operands)

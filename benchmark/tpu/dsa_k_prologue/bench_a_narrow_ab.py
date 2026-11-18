@@ -6,7 +6,9 @@ bench_fair_shared_ab.py: FP8 KV write (caches donated) + split-Q concat + all 16
 attention chunks + output 512; the full tuple is synced. ``narrow`` makes the
 kernel write the 512-wide output itself, so no trailing [..., :512] slice.
 Real top-k (layer 0 / 10 / 40) plus synthetic; 10 rounds x 30 calls, order
-alternated per round. Prints ``NAB`` lines.
+alternated per round. ``A_splitq`` also drops the XLA concat + 576->640 pad of q:
+the kernel DMAs NoPE q (512) and RoPE q (64) separately and joins them in VMEM.
+Prints ``NAB`` lines.
 """
 
 import glob
@@ -61,11 +63,11 @@ def main():
     qin = (jax.device_put(c["q_latent"], fmt), jax.device_put(c["q_rope"], fmt))
     t = c["T"]
 
-    def make(narrow, rows):
+    def make(narrow, rows, split=False):
         def step(no, ro, qs, kv, pe, ix):
             no, ro = kcu.update_sparse_mla_kv_cache(
                 no, ro, kv, pe, kvl, pi, cuq, nope_spec=ns, rope_spec=rs)
-            q = jnp.concatenate(qs, axis=-1)
+            q = qs[0] if split else jnp.concatenate(qs, axis=-1)
             out = sparse_ragged_paged_attention(
                 q, no, ro, ix, None, jnp.array([0, t], jnp.int32), dist,
                 sm_scale=float(c["sm_scale"]), k_scale=1.0, cache_layout="sparsecore",
@@ -73,7 +75,7 @@ def main():
                 sparsecore_atoms_per_batch=32, sparsecore_gather_wait_mode="overlap_rope",
                 sparsecore_phase_stride=5, compact_rope_output=True,
                 sparsecore_rows_per_dma=32, sparsecore_batch_fold=1,
-                narrow_output=narrow)
+                narrow_output=narrow, q_rope=qs[1] if split else None)
             return (out if narrow else out[..., :512]), no, ro
 
         jf = jax.jit(step, donate_argnums=(0, 1),
@@ -91,8 +93,12 @@ def main():
         caches = [np.asarray(x) for x in st["cache"]]
         slices = sum(1 for ln in hlo.splitlines()
                      if "bf16[2048,64,512]" in ln and " slice(" in ln)
+        # q concat / pad ops XLA runs before the kernel (gone with split q).
+        qprep = sum(1 for ln in hlo.splitlines()
+                    if ("bf16[2048,64,640]" in ln or "bf16[2048,64,576]" in ln)
+                    and any(k in ln for k in (" pad(", " concatenate(", " fusion(", " copy(")))
         return dict(call=call, sync=lambda: jax.block_until_ready(st["last"]),
-                    out=out, caches=caches, slices=slices)
+                    out=out, caches=caches, slices=slices, qprep=qprep)
 
     paths = {os.path.basename(f)[:-4]: f
              for f in glob.glob(f"{raw_dir}/**/raw-*.npy", recursive=True)}
@@ -104,18 +110,28 @@ def main():
         r = {"sample": name}
         try:
             rows = put(to_physical(lg, c["pi"], c["ppr"], c["cu_q"], page=PAGE))
-            v = {"A": make(False, rows), "A_narrow": make(True, rows)}
-            r["out_exact"] = bool(np.array_equal(v["A"]["out"], v["A_narrow"]["out"]))
-            r["cache_exact"] = all(np.array_equal(x, y) for x, y in
-                                   zip(v["A"]["caches"], v["A_narrow"]["caches"]))
+            v = {"A": make(False, rows), "A_narrow": make(True, rows),
+                 "A_splitq": make(True, rows, split=True)}
+            r["out_exact"] = {k: bool(np.array_equal(v["A"]["out"], x["out"]))
+                              for k, x in v.items() if k != "A"}
+            r["cache_exact"] = {k: all(np.array_equal(a_, b_) for a_, b_ in
+                                       zip(v["A"]["caches"], x["caches"]))
+                                for k, x in v.items() if k != "A"}
+            if not r["out_exact"]["A_splitq"]:
+                a32 = v["A"]["out"].astype(np.uint32) << 16
+                b32 = v["A_splitq"]["out"].astype(np.uint32) << 16
+                af, bf = a32.view(np.float32), b32.view(np.float32)
+                r["splitq_max_abs"] = float(np.nanmax(np.abs(af - bf)))
+                r["splitq_finite"] = bool(np.isfinite(bf).all())
             r["hlo_out_slices"] = {k: x["slices"] for k, x in v.items()}
+            r["hlo_q_prep"] = {k: x["qprep"] for k, x in v.items()}
             for f in v.values():
                 for _ in range(3):
                     f["call"]()
                 f["sync"]()
             keys, times = list(v), {k: [] for k in v}
             for rep in range(ROUNDS):
-                for k in keys[rep % 2:] + keys[:rep % 2]:
+                for k in keys[rep % len(keys):] + keys[:rep % len(keys)]:
                     f = v[k]
                     f["sync"]()
                     t0 = time.perf_counter()
@@ -127,7 +143,8 @@ def main():
             r.update(median_us=med,
                      range_us={k: [round(min(x), 1), round(max(x), 1)]
                                for k, x in times.items()},
-                     saved_us=round(med["A"] - med["A_narrow"], 1))
+                     saved_us={k: round(med["A"] - med[k], 1) for k in med if k != "A"},
+                     splitq_vs_narrow_us=round(med["A_narrow"] - med["A_splitq"], 1))
             del v
         except Exception as e:  # report, do not hide
             import traceback
