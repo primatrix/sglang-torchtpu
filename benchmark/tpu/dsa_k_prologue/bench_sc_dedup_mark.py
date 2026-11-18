@@ -35,6 +35,19 @@ from jax.experimental import pallas as pl  # noqa: E402
 from jax.experimental.pallas import tpu as pltpu  # noqa: E402
 from jax.experimental.pallas import tpu_sc as plsc  # noqa: E402
 
+
+def _popcount(x):
+    """Per-lane bit count of an int32 vector. ``lax.population_count`` has no
+    SparseCore lowering; shifts, ands and adds do (no multiply)."""
+    x = x.astype(jnp.int32)
+    srl = lax.shift_right_logical
+    x = x - jnp.bitwise_and(srl(x, 1), jnp.int32(0x55555555))
+    x = jnp.bitwise_and(x, jnp.int32(0x33333333)) + jnp.bitwise_and(srl(x, 2), jnp.int32(0x33333333))
+    x = jnp.bitwise_and(x + srl(x, 4), jnp.int32(0x0F0F0F0F))
+    x = x + srl(x, 8)
+    x = x + srl(x, 16)
+    return jnp.bitwise_and(x, jnp.int32(0x3F))
+
 LANES = 16
 TOPK = 2048
 QUERIES = 128  # rows per chunk = the gather chunk
@@ -82,7 +95,7 @@ def _kernel(topk_hbm, distinct_hbm, count_hbm, inv_hbm,
 
         # 2a. prefix popcount per word
         def pre(i, carry):
-            cnt = lax.population_count(bitmap[pl.ds(i * LANES, LANES)])
+            cnt = _popcount(bitmap[pl.ds(i * LANES, LANES)])
             incl = plsc.cumsum(cnt) + carry
             prefix[pl.ds(i * LANES, LANES)] = incl - cnt
             return incl[LANES - 1]
@@ -119,7 +132,7 @@ def _kernel(topk_hbm, distinct_hbm, count_hbm, inv_hbm,
                 b = jnp.bitwise_and(p, 31)
                 word = plsc.load_gather(bitmap, [w])
                 below = jnp.bitwise_and(word, jnp.left_shift(one, b) - 1)
-                rank = plsc.load_gather(prefix, [w]) + lax.population_count(below)
+                rank = plsc.load_gather(prefix, [w]) + _popcount(below)
                 invbuf[pl.ds(i * LANES, LANES)] = jnp.where(ok, rank, -1)
 
             plsc.parallel_loop(0, ROWS * TOPK // LANES, unroll=4)(inv)
