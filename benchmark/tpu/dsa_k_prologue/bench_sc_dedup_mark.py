@@ -102,8 +102,14 @@ def _kernel(topk_hbm, distinct_hbm, count_hbm, inv_hbm,
 
         plsc.parallel_loop(0, nwords // LANES, unroll=2, carry=jnp.int32(0))(pre)
 
-        # 2b. emit sorted distinct positions, one BLOCK of positions at a time
-        def emit_block(blk, gofs):
+        # 2b. emit sorted distinct positions. HBM DMA offsets must be word
+        # aligned, so outbuf carries a partial block across positions and only
+        # whole BLOCKs are written, at multiples of BLOCK.
+        base = c * (p_pad + BLOCK)
+
+        def emit_block(blk, carry):
+            woff, flushed = carry
+
             def emit(i, woff):
                 p = blk * BLOCK + i * LANES + iota
                 bits = plsc.load_gather(bitmap, [jnp.right_shift(p, 5)])
@@ -111,12 +117,25 @@ def _kernel(topk_hbm, distinct_hbm, count_hbm, inv_hbm,
                 plsc.store_compressed(outbuf.at[pl.ds(woff, LANES)], p, mask=sel)
                 return woff + plsc.all_reduce_population_count(sel)[0]
 
-            n = plsc.parallel_loop(0, BLOCK // LANES, unroll=4, carry=jnp.int32(0))(emit)
-            pltpu.sync_copy(outbuf.at[pl.ds(0, BLOCK)],
-                            distinct_hbm.at[pl.ds(c * (p_pad + BLOCK) + gofs, BLOCK)])
-            return gofs + n
+            woff = plsc.parallel_loop(0, BLOCK // LANES, unroll=4, carry=woff)(emit)
+            full = woff >= BLOCK
 
-        total = lax.fori_loop(0, p_pad // BLOCK, emit_block, jnp.int32(0))
+            @pl.when(full)
+            def _():
+                pltpu.sync_copy(outbuf.at[pl.ds(0, BLOCK)],
+                                distinct_hbm.at[pl.ds(base + flushed, BLOCK)])
+                for i in range(BLOCK // LANES):
+                    outbuf[pl.ds(i * LANES, LANES)] = outbuf[pl.ds(BLOCK + i * LANES, LANES)]
+
+            return (jnp.where(full, woff - BLOCK, woff),
+                    jnp.where(full, flushed + BLOCK, flushed))
+
+        woff, flushed = lax.fori_loop(0, p_pad // BLOCK, emit_block,
+                                      (jnp.int32(0), jnp.int32(0)))
+        # Last partial block (entries past woff are padding, beyond count).
+        pltpu.sync_copy(outbuf.at[pl.ds(0, BLOCK)],
+                        distinct_hbm.at[pl.ds(base + flushed, BLOCK)])
+        total = flushed + woff
         cntbuf[...] = jnp.full((LANES,), total, jnp.int32)
         pltpu.sync_copy(cntbuf, count_hbm.at[pl.ds(c * LANES, LANES)])
 
@@ -163,7 +182,7 @@ def sc_dedup(topk, *, p_pad):
             pltpu.VMEM((p_pad // 32,), jnp.int32),  # prefix
             pltpu.VMEM((ROWS * TOPK,), jnp.int32),  # rowbuf
             pltpu.VMEM((ROWS * TOPK,), jnp.int32),  # invbuf
-            pltpu.VMEM((BLOCK + LANES,), jnp.int32),  # outbuf
+            pltpu.VMEM((2 * BLOCK + LANES,), jnp.int32),  # outbuf (carry-over)
             pltpu.VMEM((LANES,), jnp.int32),  # cntbuf
         ),
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True,
