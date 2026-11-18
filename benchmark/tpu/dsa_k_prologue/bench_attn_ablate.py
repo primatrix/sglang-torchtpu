@@ -156,7 +156,11 @@ def main():
     paths = {os.path.basename(f)[:-4]: f
              for f in glob.glob(f"{a.raw_dir}/**/raw-*.npy", recursive=True)}
     if a.mask_ab:
-        variants = (("online", ()), ("kv_mask_batch", ("kv_mask_batch",)))
+        # online with parts of attention removed (outputs wrong by design): if the
+        # step stays ~3.0-3.3 ms, the SC gather / hand-off is the critical path.
+        variants = (("online", ()), ("online+no_kv_mask", ("no_kv_mask",)),
+                    ("online+no_qk", ("no_qk",)),
+                    ("online+no_qk+no_softmax+no_pv", ("no_qk", "no_softmax", "no_pv")))
         for name in a.samples.split(","):
             try:
                 lg = (np.asarray(c["topk"]) if name == "synthetic"
