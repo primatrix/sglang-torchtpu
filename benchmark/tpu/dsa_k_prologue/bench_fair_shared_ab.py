@@ -28,6 +28,8 @@ from check_physical_topk import to_physical
 
 att.FP = PAGE = 64
 CHUNK, BATCH, TOPK = 128, 16, 2048
+# (DMA rows, atoms per owner batch). Shared (32, 16) anchors the two sweeps.
+COMBINED_CONFIGS = ((16, 16), (32, 16), (64, 16), (32, 8), (32, 32))
 
 
 def digest(x):
@@ -109,12 +111,18 @@ def main():
     p.add_argument('--raw-dir', required=True)
     p.add_argument('--out-dir', required=True)
     p.add_argument('--gather-phase', action='store_true', help='Compare SC atom schedules with unchanged output order')
+    p.add_argument('--rope-half', action='store_true', help='Compare baseline and half-size intermediate RoPE buffer at phase 5')
+    p.add_argument('--combined', action='store_true', help='Measure compact phase-5 gather window and owner batch size')
+    p.add_argument('--longpipe', action='store_true', help='Fold compact32 owner rounds into one longer pipeline')
     p.add_argument('--files', default='synthetic,raw-0096-layer0,raw-0097-layer10,raw-0099-layer40')
     p.add_argument('--groups', default='2,4,8,16')
     p.add_argument('--iters', type=int, default=20)
     p.add_argument('--repeats', type=int, default=7)
     p.add_argument('--profile-iters', type=int, default=10)
     a = p.parse_args()
+    if sum((a.gather_phase, a.rope_half, a.combined, a.longpipe)) > 1:
+        p.error('choose at most one gather experiment')
+    gather_test = a.gather_phase or a.rope_half or a.combined or a.longpipe
     os.environ.setdefault('JAX_PLATFORMS', 'tpu')
     import jax
     import jax.numpy as jnp
@@ -174,6 +182,18 @@ def main():
         manifest.update(operator_name='dsa_gather_atom_phase', phases=[0, 1, 5], q_layout='split',
                         acceptance={'full_output_and_cache_bit_exact': True, 'nope_and_rope_gather_bit_exact': True},
                         gather_scope='repeated isolated 128-query chunk, first/middle/last of 16; not summed')
+    if a.rope_half:
+        manifest.update(operator_name='dsa_half_rope_output', phase=5, q_layout='split',
+                        acceptance={'full_output_and_cache_bit_exact': True, 'gather_bytes_exact': True})
+    if a.combined:
+        manifest.update(operator_name='dsa_compact_window_atoms', phase=5, q_layout='split', compact_rope=True,
+                        reference_commit='c07522f2fc3b2c4907578ed762d36ef84823a849',
+                        rows_per_dma_and_atoms=COMBINED_CONFIGS,
+                        acceptance={'full_output_and_cache_bit_exact': True, 'both_gather_outputs_bit_exact': True})
+    if a.longpipe:
+        manifest.update(operator_name='dsa_original_vs_final', phase=5, q_layout='split',
+                        variants=['original_phase5','compact32_a32','compact32_fold4'], device_index_repack_included=True,
+                        acceptance={'full_output_and_cache_bit_exact': True})
     (root.parent / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     emit(dict(kind='manifest', **manifest))
     paths = {Path(f).stem: f for f in glob.glob(a.raw_dir + '/**/raw-*.npy', recursive=True)}
@@ -182,24 +202,25 @@ def main():
     def physical(rows):
         return to_physical(rows, c['pi'], c['ppr'], c['cu_q'], page=PAGE)
 
-    def attend(q, no, ro, rows, group=1, lse=False, phase=0):
+    def attend(q, no, ro, rows, group=1, lse=False, phase=0, rope_half=False, window=16, atoms=None, fold=1):
         nt = rows.shape[0]
         return sparse_ragged_paged_attention(
             q, no, ro, rows, None, jnp.array([0, nt], jnp.int32), dist,
             sm_scale=float(c['sm_scale']), k_scale=1.0, cache_layout='sparsecore',
             gather_and_attention_chunk_size=CHUNK // group,
             attention_kernel_batch_size=BATCH // group,
-            sparsecore_atoms_per_batch=atoms_for(CHUNK // group, rows.shape[1]),
+            sparsecore_atoms_per_batch=atoms_for(CHUNK // group, rows.shape[1]) if atoms is None else atoms,
             sparsecore_gather_wait_mode='overlap_rope', return_lse=lse,
-            sparsecore_phase_stride=phase)
+            sparsecore_phase_stride=phase, compact_rope_output=rope_half, sparsecore_rows_per_dma=window,
+            sparsecore_batch_fold=fold)
 
-    def make_call(layout, rows, tag, group=1, phase=0):
+    def make_call(layout, rows, tag, group=1, phase=0, rope_half=False, window=16, atoms=None, fold=1):
         def step(no, ro, qin, kv, pe, indices):
             no, ro = kcu.update_sparse_mla_kv_cache(
                 no, ro, kv, pe, kvl, pi, cuq, nope_spec=ns, rope_spec=rs)
             q = jnp.concatenate(qin, axis=-1) if layout == 'split' else qin
             if group == 1:
-                out = attend(q, no, ro, indices, phase=phase)[..., :512]
+                out = attend(q, no, ro, indices, phase=phase, rope_half=rope_half, window=window, atoms=atoms, fold=fold)[..., :512]
             else:
                 shared, private = indices
                 if private.shape[1] == 0:
@@ -340,24 +361,139 @@ def main():
                       nope_and_rope_exact=True, output_sha256=hashes,
                       physical_slots_sha256=digest(np.asarray(chunk_rows)), scope='one repeated chunk'))
 
+    def rope_half_experiment(name, full, base, base_error):
+        cand = make_call('split', full, name + '_ropehalf', phase=5, rope_half=True)
+        if (not np.array_equal(cand['out'].view(np.uint16), base['out'].view(np.uint16))
+                or cand['info']['cache_sha256'] != base['info']['cache_sha256']):
+            raise AssertionError('compact RoPE: attention output or written cache mismatch')
+        times = measure({'baseline': base, 'compact_rope': cand})
+        emit(dict(kind='rope_half_chain', sample=name, paired_timings=times,
+                  output_and_cache_exact=True, fp8_reference=base_error, phase=5))
+
+        # Compare one complete gather of 128 queries before the consumer reads it.
+        _, slots = prepare_gather_indices(put(full), None, cuq, page_size=PAGE, total_num_pages=c['P'])
+        slots = slots[8 * CHUNK:9 * CHUNK]
+        live = put(np.int32(CHUNK * TOPK))
+        def gather_half(half):
+            last = [None]
+            def run():
+                last[0] = dsa_gather_native_sc(*base['state']['cache'], slots, out_size=CHUNK * TOPK,
+                                               atoms_per_batch=16, wait_mode='overlap_rope',
+                                               num_live_indices=live, live_multiple=BATCH * TOPK,
+                                               phase_stride=5, compact_rope_output=half)
+                return last[0]
+            return {'call': run, 'sync': lambda: jax.block_until_ready(last[0])}
+
+        calls = {name_: gather_half(half) for name_, half in [('baseline', False), ('compact_rope', True)]}
+        n0, r0 = [np.asarray(x) for x in calls['baseline']['call']()]
+        n1, r1 = [np.asarray(x) for x in calls['compact_rope']['call']()]
+        orig = r0.reshape(-1, 16, 128)
+        half = r1.reshape(-1, 8, 128)
+        if (not np.array_equal(n0, n1) or np.any(orig[:, :, 64:])
+                or not np.array_equal(half[:, :, :64], orig[:, :8, :64])
+                or not np.array_equal(half[:, :, 64:], orig[:, 8:, :64])):
+            raise AssertionError('compact RoPE: gather buffer differs after canonicalization')
+        emit(dict(kind='rope_half_gather', sample=name, chunk=8, phase=5,
+                  nope_and_canonical_rope_exact=True, rope_bytes=[r0.nbytes, r1.nbytes],
+                  paired_timings=measure(calls)))
+
+    def combined_experiment(name, full, base, base_error):
+        # All variants share the same compact physical output and the same input slots.
+        # Check the SC buffer separately so a consistently permuted K/V list cannot pass unnoticed.
+        _, slots = prepare_gather_indices(put(full), None, cuq, page_size=PAGE, total_num_pages=c['P'])
+        slots = slots[8 * CHUNK:9 * CHUNK]
+        live = put(np.int32(CHUNK * TOPK))
+        chains, micros = {}, {}
+        def gather(rows, atoms, fold):
+            last = [None]
+            def call():
+                last[0] = dsa_gather_native_sc(*base['state']['cache'], slots, out_size=CHUNK * TOPK,
+                                               atoms_per_batch=atoms, rows_per_dma=rows, phase_stride=5,
+                                               compact_rope_output=True, num_live_indices=live,
+                                               live_multiple=BATCH * TOPK, batch_fold=fold)
+                return last[0]
+            return {'call': call, 'sync': lambda: jax.block_until_ready(last[0])}
+
+        if a.longpipe:
+            explicit = {'phase5': base}
+            for tag, atoms, nfold in [('compact32_a32',32,1), ('compact32_fold4',16,4)]:
+                trial = make_call('split', full, f'{name}_{tag}', phase=5, rope_half=True,
+                                  window=32, atoms=atoms, fold=nfold)
+                if (not np.array_equal(base['out'].view(np.uint16), trial['out'].view(np.uint16))
+                        or base['info']['cache_sha256'] != trial['info']['cache_sha256']):
+                    raise AssertionError(f'{tag}: difference from original native phase5')
+                explicit[tag] = trial
+            emit(dict(kind='final_chain', sample=name, paired_timings=measure(explicit),
+                      canonical_input_sha256=digest(full), full_output_and_cache_exact=True,
+                      native_output_sha256=base['info']['output_sha256'], native_cache_sha256=base['info']['cache_sha256']))
+            return
+        configs = ([(32, 16, f) for f in (1, 2, 4, 8)] if a.longpipe else
+                   [(w, n, 1) for w, n in COMBINED_CONFIGS])
+        for window, atoms, fold in configs:
+            control = (window, atoms, fold) == configs[0]
+            tag = f'fold{fold}' if a.longpipe else f'w{window}_a{atoms}'
+            try:
+                if control:
+                    variant = base
+                else:
+                    variant = make_call('split', full, f'{name}_{tag}', phase=5, rope_half=True,
+                                        window=window, atoms=atoms, fold=fold)
+                if (not np.array_equal(base['out'].view(np.uint16), variant['out'].view(np.uint16))
+                        or base['info']['cache_sha256'] != variant['info']['cache_sha256']):
+                    raise AssertionError('attention output or persistent cache mismatch')
+                micro = gather(window, atoms, fold)
+                hashes = [digest(np.asarray(x)) for x in micro['call']()]
+                if control:
+                    oracle = hashes
+                elif hashes != oracle:
+                    raise AssertionError('NoPE or compact RoPE gather bytes mismatch')
+                chains[tag], micros[tag] = variant, micro
+            except Exception as err:
+                if control:
+                    raise
+                failures.append(f'{name}/{tag}: {err!r}')
+                emit(dict(kind='failure', sample=name, variant=tag, error=repr(err)))
+                traceback.print_exc()
+
+        # micro() obtains a fresh cache handle after donated chain calls update state.
+        exp_name = 'longpipe' if a.longpipe else 'combined'
+        for kind, calls in [(exp_name + '_chain', chains), (exp_name + '_gather', micros)]:
+            timings = measure(calls)
+            emit(dict(kind=kind, sample=name, measured=list(calls), compact=True, phase=5,
+                      fp8_reference=base_error, full_output_and_cache_exact=True, both_gather_buffers_exact=True,
+                      gather_chunk=8, physical_topk_sha256=digest(full), output_sha256=base['info']['output_sha256'],
+                      gather_sha256=oracle, paired_timings=timings))
+
     for name in a.files.split(','):
         print('FAIR_PROGRESS ' + name, flush=True)
         try:
-            raw = c['topk'].copy() if name == 'synthetic' or (a.gather_phase and name == 'masked') else np.load(paths[name]).astype(np.int32)
+            raw = c['topk'].copy() if name == 'synthetic' or (gather_test and name == 'masked') else np.load(paths[name]).astype(np.int32)
             assert raw.shape == (t, TOPK)
             assert (raw >= 0).all() and (raw <= c['prefixes'][0] + np.arange(t)[:, None]).all()
             assert np.all(np.diff(np.sort(raw, axis=1), axis=1) > 0)
-            if name == 'masked' and a.gather_phase:
+            if name == 'masked' and gather_test:
                 lengths = np.resize([1, 63, 64, 127, 128, 1025, 2047, 2048], t)
                 raw[np.arange(TOPK)[None, :] >= lengths[:, None]] = -1
             full = physical(raw)
             sample, ref_quant, ref_bf = reference(c, raw)
-            layout = 'split' if a.gather_phase else 'rowmajor'
-            base = make_call(layout, full, name + '_base')
+            layout = 'split' if gather_test else 'rowmajor'
+            compact = a.combined
+            base = make_call(layout, full, name + '_base', phase=5 if a.rope_half or a.longpipe or compact else 0,
+                             rope_half=compact, window=16)
             base_error = differences(base['out'][sample], ref_quant)
             if (not np.isfinite(base['out']).all() or not base_error['finite']
                     or base_error['max_normalized'] > 0.03):
                 raise AssertionError(f'Baseline FP8-cache reference failed: {base_error}')
+            if compact or a.longpipe:
+                combined_experiment(name, full, base, base_error)
+                del base
+                gc.collect()
+                continue
+            if a.rope_half:
+                rope_half_experiment(name, full, base, base_error)
+                del base
+                gc.collect()
+                continue
             if a.gather_phase:
                 phase_experiment(name, full, base, base_error)
                 del base
