@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 BLOCK = 128
+GROUPS = (4, 8, 16, 32, 64, 128)
 _lock = threading.Lock()
 _calls = [0]
 _raw = [0]
@@ -70,10 +71,19 @@ def _consume(layer_id: int, topk: torch.Tensor) -> None:
                 adj_overlap=round(float(np.mean(overlap)), 4) if overlap else None,
             )
         )
+    # Distinct rows per group of G consecutive queries (deep-context calls only:
+    # a group's set grows with context, and shallow queries say little).
+    groups = {}
+    if rows.size and int(rows.max()) >= 32768:
+        for g in GROUPS:
+            d = [np.unique(rows[b : b + g][rows[b : b + g] >= 0]).size
+                 for b in range(0, rows.shape[0] - g + 1, g)]
+            groups[str(g)] = round(float(np.mean(d)), 1) if d else None
     with _lock:
         n = _calls[0]
         _calls[0] += 1
-        rec = dict(call=n, layer=layer_id, tokens=int(rows.shape[0]), blocks=blocks)
+        rec = dict(call=n, layer=layer_id, tokens=int(rows.shape[0]), blocks=blocks,
+                   groups=groups)
         with open(os.path.join(out_dir, "stats-rank0.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
         # Raw rows only for deep-context chunks (a query near the start of the

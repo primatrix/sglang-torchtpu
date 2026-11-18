@@ -55,6 +55,18 @@ async def main(a):
         await asyncio.sleep(5)  # last host callbacks
         stats = a.stats_dir / "stats-rank0.jsonl"
         ok = stats.exists() and stats.stat().st_size > 0
+        if ok:
+            # One line the runner's progress tail shows: mean distinct rows per
+            # query group, by layer and group size (deep-context calls).
+            agg = {}
+            for line in stats.read_text().splitlines():
+                rec = json.loads(line)
+                for g, d in (rec.get("groups") or {}).items():
+                    if d is not None:
+                        agg.setdefault(f"L{rec['layer']}/{g}", []).append(d)
+            summary = {k: round(sum(v) / len(v), 1) for k, v in sorted(agg.items())}
+            save(a.output / "groups.json", summary)
+            print("GROUPS " + json.dumps(summary), flush=True)
         save(a.output / "summary.json",
              dict(status="PASS" if ok else "FAIL", requests=rows, stats=str(stats)))
 
