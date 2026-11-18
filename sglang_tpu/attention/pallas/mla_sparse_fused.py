@@ -22,6 +22,8 @@ TODO(sglang-torchtpu#1072): measure the kernels' other layout (SparseCore),
 which is meant to gather keys faster.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -300,9 +302,21 @@ def sparse_mla_attention_fused(
         )
         return out, cache_nope, cache_rope
 
+    # Test branch only (DSA_TORCH_AB, read at trace time): "A" = Codex fixed A
+    # gather knobs; "A_narrow" adds the 512-wide output; "A_splitq" also passes
+    # q split (no concat / pad). Unset keeps the original call.
+    ab = os.environ.get("DSA_TORCH_AB", "") if sparsecore else ""
+    ab_kw = {}
+    if ab:
+        ab_kw = dict(sparsecore_phase_stride=5, compact_rope_output=True,
+                     sparsecore_rows_per_dma=32, sparsecore_batch_fold=1)
+        if ab in ("A_narrow", "A_splitq"):
+            ab_kw["narrow_output"] = True
+        if ab == "A_splitq":
+            ab_kw["q_rope"] = q_pe
     # out: bf16[max_num_tokens, num_q_heads, 576].
     out = sparse_ragged_paged_attention(
-        jnp.concatenate([ql_nope, q_pe], axis=-1),
+        ql_nope if ab == "A_splitq" else jnp.concatenate([ql_nope, q_pe], axis=-1),
         cache_nope,
         cache_rope,
         topk_indices,
@@ -319,11 +333,12 @@ def sparse_mla_attention_fused(
                 gather_and_attention_chunk_size=min(
                     SPARSECORE_GATHER_CHUNK_TOKENS, max(64, ql_nope.shape[0])
                 ),
-                sparsecore_atoms_per_batch=_sparsecore_atoms(
+                sparsecore_atoms_per_batch=32 if ab else _sparsecore_atoms(
                     ql_nope.shape[0],
                     min(SPARSECORE_GATHER_CHUNK_TOKENS, max(64, ql_nope.shape[0])),
                     topk_indices.shape[1],
                 ),
+                **ab_kw,
             )
             if sparsecore
             else dict(
@@ -335,7 +350,9 @@ def sparse_mla_attention_fused(
         ),
     )
     # The kernel returns 512 NoPE + 64 RoPE values per head. Only the NoPE part
-    # is the attention output.
+    # is the attention output (already, with narrow_output).
+    if ab_kw.get("narrow_output"):
+        return out, cache_nope, cache_rope
     return out[..., :NOPE_DIM], cache_nope, cache_rope
 
 
