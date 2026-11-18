@@ -84,20 +84,34 @@ def main():
             cache_layout="sparsecore", **KW)
         return out[..., :512], nope, rope
 
+    def step_split(nope, rope, ql_, qpe_, kvc_, kpe_):
+        # Production (mla_sparse_fused): two dense row-major torch buffers,
+        # concatenated inside the JAX function.
+        return step(nope, rope, jnp.concatenate([ql_, qpe_], axis=-1), kvc_, kpe_)
+
     dev = jax.devices()[0]
     sh = jax.sharding.SingleDeviceSharding(dev)
     ref = None
-    for tag in ("q_default", "q_rowmajor"):
+    ql_in, qpe_in = jnp.asarray(c["q_latent"]), jnp.asarray(c["q_rope"])
+    for tag in ("q_default", "q_rowmajor", "q_split"):
         row = {"variant": tag}
         try:
             if tag == "q_default":
                 jf = jax.jit(step, donate_argnums=(0, 1))
                 qin = q
-            else:
+            elif tag == "q_rowmajor":
                 fmt = Format(Layout(major_to_minor=(0, 1, 2)), sh)
                 jf = jax.jit(step, donate_argnums=(0, 1),
                              in_shardings=(sh, sh, fmt, sh, sh))
                 qin = jax.device_put(q, fmt)
+            else:
+                fmt = Format(Layout(major_to_minor=(0, 1, 2)), sh)
+                sj = jax.jit(step_split, donate_argnums=(0, 1),
+                             in_shardings=(sh, sh, fmt, fmt, sh, sh))
+                qa, qb = jax.device_put(ql_in, fmt), jax.device_put(qpe_in, fmt)
+                jf = lambda n_, r_, _q, k1, k2: sj(n_, r_, qa, qb, k1, k2)
+                jf.lower = lambda n_, r_, _q, k1, k2: sj.lower(n_, r_, qa, qb, k1, k2)
+                qin = None
             st = {"c": tuple(jnp.asarray(x) for x in caches0)}
             hlo = jf.lower(*st["c"], qin, kvc, kpe).compile().as_text()
             qcopies = [ln.strip()[:160] for ln in hlo.splitlines()
@@ -105,6 +119,8 @@ def main():
             entry = [ln.strip()[:160] for ln in hlo.splitlines()
                      if "ENTRY" in ln][:1]
             row["q_copies"] = len(qcopies)
+            row["q_concat"] = [ln.strip()[:200] for ln in hlo.splitlines()
+                               if re.search(r"= bf16\[2048,64,576\]\{[^}]*\} (concatenate|fusion)\(", ln)][:3]
             row["q_copy_lines"] = qcopies[:3]
             row["entry"] = entry
             try:
@@ -144,7 +160,7 @@ def main():
             row["fail"] = repr(e)[:800]
             traceback.print_exc()
         print("QAB " + json.dumps(row), flush=True)
-        print("QABT " + json.dumps({k: row.get(k) for k in ("variant", "q_copies", "exact_vs_default", "us", "us_range", "module_us", "fail")}), flush=True)
+        print("QABT " + json.dumps({k: row.get(k) for k in ("variant", "q_copies", "q_concat", "exact_vs_default", "us", "us_range", "module_us", "fail")}), flush=True)
     print("QAB_DONE", flush=True)
 
 
