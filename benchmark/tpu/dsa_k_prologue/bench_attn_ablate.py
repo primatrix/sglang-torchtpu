@@ -62,6 +62,8 @@ def main():
     p.add_argument("--passes", type=int, default=2)
     p.add_argument("--qk-ab", action="store_true",
                    help="QK lowering A/B on the pre-gathered path (QAB lines)")
+    p.add_argument("--chunk-ab", action="store_true",
+                   help="online A/B of uneven chunk schedules (CAB lines)")
     p.add_argument("--timeline", action="store_true",
                    help="absolute TC/SC timeline of the online step (TL lines)")
     a = p.parse_args()
@@ -116,12 +118,17 @@ def main():
             tiles.append((gn.reshape(CHUNK, K, 128), gr.reshape(CHUNK, rope_rows, 128)))
         return tuple(tiles)
 
-    def attend(nope_, rope_, ql_, qr_, phys, kv_lens, tiles=None, ablate=()):
+    def attend(nope_, rope_, ql_, qr_, phys, kv_lens, tiles=None, ablate=(), sizes=None):
+        # sizes: test only, uneven chunk schedule (online only), e.g. a smaller
+        # last chunk so less attention trails the final gather.
+        sizes = sizes or (CHUNK,) * (T // CHUNK)
+        assert sum(sizes) == T and (tiles is None or len(set(sizes)) == 1)
+        bounds = np.cumsum((0,) + tuple(sizes))
         o = None
-        for i in range(T // CHUNK):
+        for i in range(len(sizes)):
             o = sparse_attention_chunk(
-                ql_, nope_, rope_, kv_lens, phys, None, start_pos=i * CHUNK,
-                end_pos=(i + 1) * CHUNK, token_end=jnp.int32(T), sm_scale=sm,
+                ql_, nope_, rope_, kv_lens, phys, None, start_pos=int(bounds[i]),
+                end_pos=int(bounds[i + 1]), token_end=jnp.int32(T), sm_scale=sm,
                 k_scale=1.0, cache_layout=SPARSECORE_CACHE_LAYOUT,
                 sparsecore_atoms_per_batch=atoms, topk_override=K, narrow_output=True,
                 o=o, q_rope=qr_, ablate=ablate,
@@ -159,6 +166,51 @@ def main():
 
     paths = {os.path.basename(f)[:-4]: f
              for f in glob.glob(f"{a.raw_dir}/**/raw-*.npy", recursive=True)}
+    if a.chunk_ab:
+        # Online step with uneven chunk schedules; outputs must stay bit-exact
+        # (each query attends its own rows, chunking only regroups queries).
+        H = CHUNK // 2
+        Q = CHUNK // 4
+        variants = (
+            ("c128x16", (CHUNK,) * 16),
+            ("tail64x2", (CHUNK,) * 15 + (H, H)),
+            ("tail64_32x2", (CHUNK,) * 15 + (H, Q, Q)),
+            ("tail32x4", (CHUNK,) * 15 + (Q,) * 4),
+            ("head64x2_tail64x2", (H, H) + (CHUNK,) * 14 + (H, H)),
+        )
+        for name in a.samples.split(","):
+            try:
+                lg = (np.asarray(c["topk"]) if name == "synthetic"
+                      else np.load(paths[name])).astype(np.int32)
+                phys_np = to_physical(lg, c["pi"], c["ppr"], c["cu_q"], page=FP)
+                kv_lens, phys = prepare_gather_indices(
+                    jnp.asarray(phys_np), None, jnp.asarray(c["cu_q"]), page_size=FP,
+                    total_num_pages=P)
+                args = (nope, rope, ql, qr, phys, kv_lens)
+                fs, outs, us = {}, {}, {}
+                for tag, sz in variants:
+                    fs[tag] = jax.jit(lambda *xs, _sz=sz: attend(*xs, sizes=_sz))
+                    outs[tag] = np.asarray(fs[tag](*args).view(jnp.uint16))
+                    us[tag] = []
+                for k in range(a.passes):
+                    order = variants if k % 2 == 0 else variants[::-1]
+                    for tag, _ in order:
+                        us[tag].append(timed(fs[tag], *args)[0])
+                base = float(np.median(us["c128x16"]))
+                for tag, sz in variants:
+                    m = float(np.median(us[tag]))
+                    print("CAB " + json.dumps(dict(
+                        sample=name, variant=tag, chunks=len(sz), us=round(m, 1),
+                        passes=us[tag], saved_us=round(base - m, 1),
+                        exact_vs_base=bool(np.array_equal(outs[tag], outs["c128x16"])))),
+                        flush=True)
+            except Exception as e:  # report, do not hide
+                import traceback
+
+                traceback.print_exc()
+                print("CAB " + json.dumps(dict(sample=name, fail=repr(e)[:800])), flush=True)
+        print("CAB_DONE", flush=True)
+        return
     if a.timeline:
         # Absolute [start, end) of every TC op and SparseCore TEC event in one
         # device time axis (xplane_timeline), so per-chunk overlap is measured,
