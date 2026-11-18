@@ -98,34 +98,63 @@ def main():
 
     run_stages("sc_only", sc_only, (k, idx), ref)
 
-    # --- TC + SC in one mpmd_map; SC writes into a TC-VMEM scratch.
+    # --- TC + SC in one mpmd_map. With >1 mesh every scratch must name its
+    # core (CoreMemorySpace / SemaphoreType @ mesh); the first run left the SC
+    # scratch untagged and stopped there.
     tc_vmem = pallas_core.CoreMemorySpace(tpu_core.MemorySpace.VMEM, tmesh)
+    sc_vmem = pallas_core.CoreMemorySpace(tpu_core.MemorySpace.VMEM, vmesh)
 
+    def tc_sc_scratch():
+        return [tc_vmem((ROWS, W), jnp.int32), sc_vmem((8,), jnp.int32),
+                sc_vmem((8, W), jnp.int32), pltpu.SemaphoreType.DMA @ vmesh]
+
+    # (a) indexed gather straight into TC VMEM (expected: the DMA rule refuses).
     def tc_sc(k, idx):
-        def sc_part(k_hbm, idx_hbm, o_hbm, tcbuf, idx_v, sem):
+        def sc_part(k_hbm, idx_hbm, o_hbm, tcbuf, idx_v, rows_v, sem):
             s = lax.axis_index("subcore")
             pltpu.sync_copy(idx_hbm.at[pl.ds(s * 8, 8)], idx_v)
             pltpu.async_copy(k_hbm.at[idx_v], tcbuf.at[pl.ds(s * 8, 8)], sem).wait()
 
-        def tc_part(k_hbm, idx_hbm, o_hbm, tcbuf, idx_v, sem):
+        def tc_part(k_hbm, idx_hbm, o_hbm, tcbuf, idx_v, rows_v, sem):
             pltpu.sync_copy(tcbuf, o_hbm)
 
         return mpmd.mpmd_map(
             [(vmesh, sc_part), (tmesh, tc_part)],
             out_types=jax.ShapeDtypeStruct((ROWS, W), jnp.int32),
-            scratch_types=[tc_vmem((ROWS, W), jnp.int32), pltpu.VMEM((8,), jnp.int32),
-                           pltpu.SemaphoreType.DMA],
-            name="sctc_tc_sc",
+            scratch_types=tc_sc_scratch(), name="sctc_tc_sc",
         )(k, idx)
 
     run_stages("tc_sc", tc_sc, (k, idx), ref)
 
-    # --- plain SC kernel with a TC-VMEM scratch.
-    def sc_tc_ref(k, idx):
-        def body(k_hbm, idx_hbm, o_hbm, tcbuf, idx_v, sem):
+    # (b) SC gathers into its own VMEM (supported), then a plain copy of the
+    # finished tile into TC VMEM; TC copies it out. No cross-core barrier yet,
+    # so a mismatch at run may be a race; compile/lower is the main question.
+    def tc_sc_plain(k, idx):
+        def sc_part(k_hbm, idx_hbm, o_hbm, tcbuf, idx_v, rows_v, sem):
             s = lax.axis_index("subcore")
             pltpu.sync_copy(idx_hbm.at[pl.ds(s * 8, 8)], idx_v)
-            pltpu.async_copy(k_hbm.at[idx_v], tcbuf.at[pl.ds(s * 8, 8)], sem).wait()
+            pltpu.async_copy(k_hbm.at[idx_v], rows_v, sem).wait()
+            pltpu.async_copy(rows_v, tcbuf.at[pl.ds(s * 8, 8)], sem).wait()
+
+        def tc_part(k_hbm, idx_hbm, o_hbm, tcbuf, idx_v, rows_v, sem):
+            pltpu.sync_copy(tcbuf, o_hbm)
+
+        return mpmd.mpmd_map(
+            [(vmesh, sc_part), (tmesh, tc_part)],
+            out_types=jax.ShapeDtypeStruct((ROWS, W), jnp.int32),
+            scratch_types=tc_sc_scratch(), name="sctc_tc_sc_plain",
+        )(k, idx)
+
+    run_stages("tc_sc_plain", tc_sc_plain, (k, idx), ref)
+
+    # (c) single SC kernel: gather into own VMEM, plain copy into a TC-VMEM
+    # scratch, read it back to HBM from SC.
+    def sc_plain_tc_ref(k, idx):
+        def body(k_hbm, idx_hbm, o_hbm, tcbuf, idx_v, rows_v, sem):
+            s = lax.axis_index("subcore")
+            pltpu.sync_copy(idx_hbm.at[pl.ds(s * 8, 8)], idx_v)
+            pltpu.async_copy(k_hbm.at[idx_v], rows_v, sem).wait()
+            pltpu.sync_copy(rows_v, tcbuf.at[pl.ds(s * 8, 8)])
             pltpu.sync_copy(tcbuf.at[pl.ds(s * 8, 8)], o_hbm.at[pl.ds(s * 8, 8)])
 
         return pl.kernel(
@@ -133,14 +162,15 @@ def main():
             out_type=jax.ShapeDtypeStruct((ROWS, W), jnp.int32),
             mesh=vmesh,
             scratch_types=(tc_vmem((ROWS, W), jnp.int32), pltpu.VMEM((8,), jnp.int32),
-                           pltpu.SemaphoreType.DMA),
-            name="sctc_sc_tc_ref",
+                           pltpu.VMEM((8, W), jnp.int32), pltpu.SemaphoreType.DMA),
+            name="sctc_sc_plain_tc_ref",
         )(k, idx)
 
     try:
-        run_stages("sc_tc_vmem_ref", sc_tc_ref, (k, idx), ref)
+        run_stages("sc_plain_tc_ref", sc_plain_tc_ref, (k, idx), ref)
     except Exception as e:
-        report("sc_tc_vmem_ref", "build", ok=False, error=repr(e)[:1500])
+        report("sc_plain_tc_ref", "build", ok=False, error=repr(e)[:1500])
+
     print("SCTC_DONE", flush=True)
 
 
