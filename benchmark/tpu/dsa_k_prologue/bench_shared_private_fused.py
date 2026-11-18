@@ -196,11 +196,199 @@ def make_fused(g, s_w, p_w, sm_scale, num_heads, head_dim):
     return chunk_call
 
 
+def build_jobs(L, g, blk):
+    """Variable-length schedule: each segment becomes cdiv(n, blk) jobs of ``blk`` rows.
+
+    Per group, the shared segment's jobs come first, then each query's private
+    jobs. A job past its segment's end reads the next segment's rows (or unwritten
+    tail rows); the kernel masks rows >= ``nv``. Flags: 1 = first job of its
+    segment, 2 = last. ``js`` is the chunk-local index of each group's first job,
+    so the DMA slot (job index % 2) needs no state across grid steps.
+    """
+    nch, nb = L["ks"].shape
+    jobs = [[[] for _ in range(nb)] for _ in range(nch)]
+    for c in range(nch):
+        for b in range(nb):
+            segs = [(-1, L["s_off"][c, b], L["ks"][c, b])]
+            segs += [(i, L["p_off"][c, b * g + i], L["kp"][c, b * g + i]) for i in range(g)]
+            for kind, off, n in segs:
+                nj = max(1, -(-int(n) // blk))
+                for j in range(nj):
+                    jobs[c][b].append((off + j * blk, int(np.clip(n - j * blk, 0, blk)), kind,
+                                       (1 if j == 0 else 0) | (2 if j == nj - 1 else 0)))
+    jmax = max(len(x) for ch in jobs for x in ch)
+    arr = {k: np.zeros((nch, nb * jmax), np.int32) for k in ("off", "nv", "kd", "fl")}
+    nj = np.zeros((nch, nb), np.int32)
+    js = np.zeros((nch, nb), np.int32)
+    for c in range(nch):
+        acc = 0
+        for b in range(nb):
+            nj[c, b], js[c, b] = len(jobs[c][b]), acc
+            acc += len(jobs[c][b])
+            for j, (off, nv, kd, fl) in enumerate(jobs[c][b]):
+                for k, v in zip(("off", "nv", "kd", "fl"), (off, nv, kd, fl)):
+                    arr[k][c, b * jmax + j] = v
+    assert int(arr["off"].max()) + blk <= CAP
+    work = sum(len(x) for ch in jobs for x in ch) * blk
+    return dict(nj=nj, js=js, jmax=jmax, work_frac=work / (L["ks"].shape[0] * CHUNK * TOPK),
+                **arr)
+
+
+def make_fused_var(g, blk, jmax, sm_scale, num_heads, head_dim):
+    """One grid step per group; an in-kernel loop over its ``blk``-row jobs.
+
+    KV blocks are double-buffered across jobs and across groups (the last job of
+    group b prefetches group b+1's first). Online softmax: shared state for the
+    group's ``g * H`` rows, private state for the current query; the last private
+    job of query i merges the two and writes its output.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    nb = CHUNK // g
+    f8 = jnp.float8_e4m3fn
+    gh = g * num_heads
+    neg = jnp.finfo(jnp.float32).min
+
+    def unpack(nope_u32, rope_u32, n):
+        nope = pltpu.bitcast(pltpu.bitcast(nope_u32, jnp.uint8).reshape(blk, 512), f8)
+        rope = pltpu.bitcast(pltpu.bitcast(rope_u32, jnp.uint8).reshape(blk, 128), f8)
+        kv = jnp.concatenate([nope, rope], axis=-1)
+        if kv.shape[-1] < head_dim:
+            kv = jnp.pad(kv, ((0, 0), (0, head_dim - kv.shape[-1])))
+        # Rows past nv may be another segment's or unwritten (fp8 NaN): zero them.
+        span = lax.broadcasted_iota(jnp.int32, kv.shape, 0)
+        return jnp.where(span < n, kv, 0)
+
+    def update(q, kv, n, m_ref, l_ref, a_ref):
+        s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32) * sm_scale
+        valid = lax.broadcasted_iota(jnp.int32, s.shape, 1) < n
+        s = jnp.where(valid, s, neg)
+        m_old = m_ref[...]
+        m_new = jnp.maximum(m_old, jnp.max(s, axis=1, keepdims=True))
+        alpha = jnp.exp(m_old - m_new)
+        p = jnp.where(valid, jnp.exp(s - m_new), 0.0)
+        l_ref[...] = alpha * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
+        # Same operand dtypes as partial_attn above (f32 p, fp8 kv).
+        a_ref[...] = alpha * a_ref[...] + jnp.einsum(
+            "nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+        m_ref[...] = m_new
+
+    def body(nj_ref, js_ref, off_ref, nv_ref, kd_ref, fl_ref, q_ref, nope_hbm, rope_hbm,
+             o_ref, bn, br, ms, ls, as_, mp, lp, ap, sems):
+        b = pl.program_id(0)
+
+        def dma(bb, j, sl):
+            o = pl.multiple_of(off_ref[bb * jmax + j], SEG)
+            return [
+                pltpu.make_async_copy(nope_hbm.at[pl.ds(o, blk)], bn.at[sl], sems.at[0, sl]),
+                pltpu.make_async_copy(rope_hbm.at[pl.ds(o // 4, blk // 4)], br.at[sl],
+                                      sems.at[1, sl]),
+            ]
+
+        @pl.when(b == 0)
+        def _():
+            for cp in dma(0, 0, 0):
+                cp.start()
+
+        n_jobs = nj_ref[b]
+
+        def step(j, carry):
+            sl = (js_ref[b] + j) % 2
+
+            @pl.when(j + 1 < n_jobs)
+            def _():
+                for cp in dma(b, j + 1, 1 - sl):
+                    cp.start()
+
+            @pl.when((j + 1 == n_jobs) & (b + 1 < nb))
+            def _():
+                for cp in dma(b + 1, 0, 1 - sl):
+                    cp.start()
+
+            for cp in dma(b, j, sl):
+                cp.wait()
+            k = b * jmax + j
+            n, kind, fl = nv_ref[k], kd_ref[k], fl_ref[k]
+            kv = unpack(bn[sl], br[sl], n)
+
+            @pl.when(kind < 0)
+            def _():
+                @pl.when((fl & 1) != 0)
+                def _():
+                    ms[...] = jnp.full(ms.shape, neg, jnp.float32)
+                    ls[...] = jnp.zeros(ls.shape, jnp.float32)
+                    as_[...] = jnp.zeros(as_.shape, jnp.float32)
+
+                update(q_ref[...].reshape(gh, head_dim), kv, n, ms, ls, as_)
+
+            @pl.when(kind >= 0)
+            def _():
+                @pl.when((fl & 1) != 0)
+                def _():
+                    mp[...] = jnp.full(mp.shape, neg, jnp.float32)
+                    lp[...] = jnp.zeros(lp.shape, jnp.float32)
+                    ap[...] = jnp.zeros(ap.shape, jnp.float32)
+
+                update(q_ref[kind], kv, n, mp, lp, ap)
+
+                @pl.when((fl & 2) != 0)
+                def _():
+                    r = pl.ds(pl.multiple_of(kind * num_heads, num_heads), num_heads)
+                    m1, m2 = ms[r], mp[...]
+                    m = jnp.maximum(m1, m2)
+                    e1, e2 = jnp.exp(m1 - m), jnp.exp(m2 - m)
+                    den = ls[r] * e1 + lp[...] * e2
+                    out = (as_[r] * e1 + ap[...] * e2) * pltpu.reciprocal(den, approx=True)
+                    o_ref[kind] = out.astype(o_ref.dtype)
+
+            return carry
+
+        lax.fori_loop(0, n_jobs, step, 0)
+
+    def chunk_call(c, q, nope_g, rope_g, nj, js, off, nv, kd, fl):
+        base = c * nb
+        qb = pl.BlockSpec((g, num_heads, head_dim), lambda b, *_: (base + b, 0, 0))
+        return pl.pallas_call(
+            body,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=6,
+                grid=(nb,),
+                in_specs=[qb, pl.BlockSpec(memory_space=pltpu.HBM),
+                          pl.BlockSpec(memory_space=pltpu.HBM)],
+                out_specs=qb,
+                scratch_shapes=[
+                    pltpu.VMEM((2, blk, 128), jnp.uint32),
+                    pltpu.VMEM((2, blk // 4, 128), jnp.uint32),
+                    pltpu.VMEM((gh, 1), jnp.float32),
+                    pltpu.VMEM((gh, 1), jnp.float32),
+                    pltpu.VMEM((gh, head_dim), jnp.float32),
+                    pltpu.VMEM((num_heads, 1), jnp.float32),
+                    pltpu.VMEM((num_heads, 1), jnp.float32),
+                    pltpu.VMEM((num_heads, head_dim), jnp.float32),
+                    pltpu.SemaphoreType.DMA((2, 2)),
+                ],
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",), vmem_limit_bytes=100 * 1024 * 1024),
+            out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+            input_output_aliases={6: 0},
+            name=f"MLA-shared-private-var-g{g}-b{blk}",
+        )(nj, js, off, nv, kd, fl, q, nope_g, rope_g)
+
+    return chunk_call
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--raw-dir", required=True)
     p.add_argument("--files", default="raw-0096-layer0,raw-0097-layer10,raw-0099-layer40")
-    p.add_argument("--groups", default="2,4,8")
+    p.add_argument("--groups", default="4,8")
+    # Variable-length private DMA: job block rows (multiples of SEG); 0 = the fixed kernel.
+    p.add_argument("--blocks", default="0,128,256")
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--xprof-dir", required=True)
@@ -288,25 +476,35 @@ def main():
         print("SPF " + json.dumps(row), flush=True)
         print("SPFT " + json.dumps({"file": name, "base_us": row["base"]["us"],
                                     "base_module_us": row["base"]["module_us"]}), flush=True)
-        for g in (int(x) for x in a.groups.split(",")):
-            r = {"file": name, "g": g}
+        for g, blk in ((int(x), int(y)) for x in a.groups.split(",")
+                       for y in a.blocks.split(",")):
+            r = {"file": name, "g": g, "blk": blk}
             try:
                 L = build_layout(raw, phys, g, n)
                 r.update(rows_frac=round(L["rows_frac"], 4), s_w=L["s_w"], p_w=L["p_w"],
                          ks_mean=round(L["ks_mean"], 1), ks_min=L["ks_min"])
-                call_chunk = make_fused(g, L["s_w"], L["p_w"], sm, H, 640)
                 dev = {k: jnp.asarray(L[k]) for k in ("idx", "live", "s_off", "ks", "p_off", "kp")}
+                if blk:
+                    J = build_jobs(L, g, blk)
+                    r.update(work_frac=round(J["work_frac"], 4), jmax=J["jmax"])
+                    for k in ("nj", "js", "off", "nv", "kd", "fl"):
+                        dev["j_" + k] = jnp.asarray(J[k])
+                    call_chunk = make_fused_var(g, blk, J["jmax"], sm, H, 640)
+                    chunk_args = lambda d, ci: [d["j_" + k][ci] for k in
+                                                ("nj", "js", "off", "nv", "kd", "fl")]
+                else:
+                    call_chunk = make_fused(g, L["s_w"], L["p_w"], sm, H, 640)
+                    chunk_args = lambda d, ci: [d[k][ci] for k in ("s_off", "ks", "p_off", "kp")]
 
                 @jax.jit
-                def fused(q_, nope_, rope_, d):
+                def fused(q_, nope_, rope_, d, call_chunk=call_chunk, chunk_args=chunk_args):
                     qp = prepare_q_inputs(q_)  # [T, H, 640]
                     for ci in range(T // CHUNK):
                         ng, rg = native_sc_gather.dsa_gather_native_sc(
                             nope_, rope_, d["idx"][ci].reshape(CAP // 64, 64), out_size=CAP,
                             atoms_per_batch=16, num_live_indices=d["live"][ci],
                             live_multiple=SEG)
-                        qp = call_chunk(ci, qp, ng, rg, d["s_off"][ci], d["ks"][ci],
-                                        d["p_off"][ci], d["kp"][ci])
+                        qp = call_chunk(ci, qp, ng, rg, *chunk_args(d, ci))
                     return qp[:, :H, :512]
 
                 out = np.asarray(fused(q, nope, rope, dev)).astype(np.float32)
@@ -315,7 +513,7 @@ def main():
                                     p99_rel=float(np.percentile(np.abs(out - ref) / den, 99)),
                                     finite=bool(np.isfinite(out).all()))
                 r["err"] = att.error_vs_bf16(c, out.astype(np.float64), rows_bf)
-                r.update(timed(f"{name}_fused_g{g}", lambda: fused(q, nope, rope, dev)))
+                r.update(timed(f"{name}_fused_g{g}_b{blk}", lambda: fused(q, nope, rope, dev)))
             except Exception as e:  # report, do not hide
                 import traceback
 
@@ -323,7 +521,7 @@ def main():
                 r["fail"] = repr(e)[:500]
             print("SPF " + json.dumps(r), flush=True)
             print("SPFT " + json.dumps({k: r.get(k) for k in (
-                "file", "g", "rows_frac", "ks_mean", "s_w", "p_w", "vs_base", "us",
+                "file", "g", "blk", "rows_frac", "work_frac", "s_w", "p_w", "vs_base", "us",
                 "module_us", "fail")}), flush=True)
     print("SPF_DONE", flush=True)
 
