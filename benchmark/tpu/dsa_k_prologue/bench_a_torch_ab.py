@@ -85,6 +85,25 @@ def run_variant(a):
             bargs = (nope, rope, ql, qr, kvc, kpe)
             med, runs = att._median_time(lambda: cf(*bargs), sync, a.iters, a.repeats)
             r.update(us=round(med, 1), us_range=[round(min(runs), 1), round(max(runs), 1)])
+            if a.profile and name == "raw-0096-layer0":
+                # xprof of 10 warm calls: per-op self time and per-module time,
+                # so ops the torch boundary adds around the custom call show up.
+                from bench_torch_ab import _profile
+
+                pd = os.path.join(a.npz_dir, f"xprof_{a.variant}")
+                s = _profile(cf, bargs, 10, pd)
+                if "error" in s:
+                    print("TPROF " + json.dumps({"variant": a.variant, "error": s["error"][:500]}),
+                          flush=True)
+                else:
+                    print("TPROF " + json.dumps({
+                        "variant": a.variant, "device_us": round(s["device_us"], 1),
+                        "modules": [(n[:60], round(u, 1)) for n, u in s["modules"][:8]]}),
+                        flush=True)
+                    # One op per line so no line is cut by the log filter.
+                    for n, u in s["ops"][:25]:
+                        print("TPROFOP " + json.dumps({"v": a.variant, "us": round(u, 1),
+                                                       "op": n[:150]}), flush=True)
         except Exception as e:  # report, do not hide
             import traceback
 
@@ -102,8 +121,12 @@ def run_all(a):
             cmd = [sys.executable, "-u", __file__, "--variant", v, "--pass-id", str(p),
                    "--npz-dir", a.npz_dir, "--raw-dir", a.raw_dir,
                    "--iters", str(a.iters), "--repeats", str(a.repeats)]
+            if a.profile and p == 0:
+                cmd.append("--profile")
             proc = subprocess.run(cmd, capture_output=True, text=True)
             for line in proc.stdout.splitlines():
+                if line.startswith(("TPROF", "TPROFOP")):
+                    print(line, flush=True)
                 if line.startswith("TAB "):
                     print(line, flush=True)
                     rows.append(json.loads(line[4:]))
@@ -143,6 +166,7 @@ def main():
     p.add_argument("--raw-dir", default="/old/fj8")
     p.add_argument("--iters", type=int, default=30)
     p.add_argument("--repeats", type=int, default=10)
+    p.add_argument("--profile", action="store_true")  # xprof on layer 0, pass 0
     a = p.parse_args()
     os.makedirs(a.npz_dir, exist_ok=True)
     sys.exit(run_variant(a) if a.variant else run_all(a))
