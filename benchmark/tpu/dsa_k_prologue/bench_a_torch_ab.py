@@ -96,8 +96,18 @@ def run_variant(a):
                     print("TPROF " + json.dumps({"variant": a.variant, "error": s["error"][:500]}),
                           flush=True)
                 else:
+                    names = [n for n, _ in s["ops"]]
+                    # Did the variant compile its own body? narrow drops the
+                    # 640->512 output slice, split q drops the q concat/pad.
+                    has_slice = any("bf16[2048,64,512]" in n and " slice(" in n
+                                    or n.startswith("slice.") for n in names)
+                    has_qcat = any("fusion.2.q_hbm_ref" in n for n in names)
+                    expect = {"A": (True, True), "A_narrow": (False, True),
+                              "A_splitq": (False, False)}[a.variant]
                     print("TPROF " + json.dumps({
                         "variant": a.variant, "device_us": round(s["device_us"], 1),
+                        "out_slice": has_slice, "q_concat": has_qcat,
+                        "body_ok": (has_slice, has_qcat) == expect,
                         "modules": [(n[:60], round(u, 1)) for n, u in s["modules"][:8]]}),
                         flush=True)
                     # One op per line so no line is cut by the log filter.

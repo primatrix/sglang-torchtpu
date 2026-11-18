@@ -130,6 +130,14 @@ def _build_pallas_sparse_mla_kernel_op(
         # Flat-slot rows, no page-table lookup: a different body, so a different name.
         op_name += "_phys"
         chunk_kwargs["topk_is_physical"] = True
+    # Test branch only: DSA_TORCH_AB changes the traced body (mla_sparse_fused),
+    # so it must change the name too, or a compile cache keyed by the op name
+    # serves the A body to every variant (exp-s6g09vsj5i: one module hash).
+    import os as _os
+
+    _ab = _os.environ.get("DSA_TORCH_AB", "")
+    if _ab:
+        op_name += f"_ab{_ab}"
 
     # custom_jax_kernel reads this function's signature: every tensor has to
     # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
