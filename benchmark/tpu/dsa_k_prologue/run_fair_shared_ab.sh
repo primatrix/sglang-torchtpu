@@ -83,8 +83,10 @@ PY
 # no additional performance-affecting compiler flags are introduced here.
 df -h /tmp /dev/shm | tee "$ROOT/profiling/disk-after-install.txt"
 
-if [[ "${1:-}" == pv-ab ]]; then
-  "$PY" benchmark/tpu/dsa_k_prologue/bench_fair_shared_ab.py --pv-ab \
+if [[ "${1:-}" == pv-ab || "${1:-}" == pv-compact ]]; then
+  args=()
+  if [[ "$1" == pv-compact ]]; then args+=(--compact --pv-layout split); fi
+  "$PY" benchmark/tpu/dsa_k_prologue/bench_fair_shared_ab.py --pv-ab "${args[@]}" \
     --raw-dir /old/fj8 --out-dir "$ROOT/rank-0" \
     --files synthetic,raw-0096-layer0,raw-0097-layer10,raw-0099-layer40,masked \
     --iters 30 --repeats 10 --profile-iters 3 2>&1 | tee "$ROOT/rank-0/benchmark/pv.log"

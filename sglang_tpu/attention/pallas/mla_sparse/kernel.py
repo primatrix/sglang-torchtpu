@@ -314,6 +314,7 @@ def _attention_kernel(
     sparsecore_layout: bool = False,
     capped_windows: int | None = None,
     latent_values_only: bool = False,
+    compact_output: bool = False,
 ):
     # Capped mode (`capped_windows` = W set, SparseCore layout only): the
     # gathered buffers hold W windows of `bkv_sz` rows per token, window-major
@@ -321,6 +322,9 @@ def _attention_kernel(
     # exactly like the uncapped path. Tokens with more than `bkv_sz` live rows
     # are recomputed over all their windows by an online-softmax fix-up with
     # double-buffered window DMAs (two-slot scratch trails the usual scratch).
+    if compact_output:
+        # Pallas aliases this compact input to the output; prior chunks survive.
+        _out_alias, *refs = refs
     fix_refs = None
     if capped_windows is not None:
         assert sparsecore_layout
@@ -350,10 +354,10 @@ def _attention_kernel(
         lse_hbm_ref = None
         blse_x2_ref = None
 
-    assert q_hbm_ref.shape == o_hbm_ref.shape
+    assert q_hbm_ref.shape[:2] == o_hbm_ref.shape[:2]
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
-    o_dim = head_dim
+    o_dim = o_hbm_ref.shape[-1]
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
     bkv_sz = (
@@ -887,6 +891,7 @@ def prepare_outputs(
         "topk_cap",
         "gather_rope",
         "latent_values_only",
+        "compact_output",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -921,6 +926,7 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     gather_rope: bool = True,
     latent_values_only: bool = False,
+    compact_output: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1059,6 +1065,8 @@ def sparse_ragged_paged_attention(
     latent_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     if latent_values_only and (actual_head_dim < latent_dim or topk_cap is not None):
         raise ValueError("latent-only PV requires full latent inputs and uncapped attention")
+    if compact_output and (not latent_values_only or return_lse):
+        raise ValueError("compact output currently requires latent-only PV without LSE")
 
     q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
 
@@ -1109,6 +1117,8 @@ def sparse_ragged_paged_attention(
         else None
     )
 
+    # Untouched suffix rows must keep Q, just like the full-width aliased buffer.
+    compact = q[..., :latent_dim] if compact_output else None
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
@@ -1139,14 +1149,18 @@ def sparse_ragged_paged_attention(
             topk_override=topk,
             gather_rope=gather_rope,
             latent_values_only=latent_values_only,
+            compact=compact,
         )
-        if return_lse:
+        if compact_output:
+            compact = result
+        elif return_lse:
             q, lse = result
         else:
             q = result
 
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
-    out = prepare_outputs(q, actual_num_q_heads, latent_dim if latent_values_only else actual_head_dim)
+    out = prepare_outputs(compact if compact_output else q, actual_num_q_heads,
+                          latent_dim if latent_values_only else actual_head_dim)
     if return_lse:
         return out, lse[:, :actual_num_q_heads, 0]
     return out
@@ -1247,6 +1261,7 @@ def sparse_attention_chunk(
     topk_override: int | None = None,
     gather_rope: bool = True,
     latent_values_only: bool = False,
+    compact: jax.Array | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1302,6 +1317,8 @@ def sparse_attention_chunk(
         ]
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
+        if compact is not None:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))
         # Each chunk writes only its own token rows, so -- exactly like `q` --
         # the lse buffer is threaded through as an aliased in/out to carry
         # earlier chunks' rows forward.
@@ -1326,7 +1343,8 @@ def sparse_attention_chunk(
             q.dtype,
         )
 
-        bo_double_buf = bq_double_buf
+        bo_double_buf = (bq_double_buf if compact is None else
+                         pltpu.VMEM((2, batch_size, num_q_heads, compact.shape[-1]), q.dtype))
 
         scratch_shapes = [
             bkv_nope_double_buf,
@@ -1372,6 +1390,7 @@ def sparse_attention_chunk(
             sparsecore_layout=sparsecore_layout,
             capped_windows=capped_windows,
             latent_values_only=latent_values_only,
+            compact_output=compact is not None,
         )
 
         scope_name = (
@@ -1402,7 +1421,7 @@ def sparse_attention_chunk(
                         jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype),
                     ]
                     if return_lse
-                    else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
+                    else jax.ShapeDtypeStruct(shape=q.shape if compact is None else compact.shape, dtype=q.dtype)
                 ),
                 input_output_aliases=(
                     {
@@ -1413,13 +1432,15 @@ def sparse_attention_chunk(
                     else {
                         # 3 = q; operand indices count the scalar prefetches
                         # (DSV4's "4" also counted attention_sinks).
-                        num_prefetch: 0,  # Alias output activation with q
+                        (num_prefetch if compact is None else num_prefetch + 3): 0,
                     }
                 ),
                 name=scope_name,
             )
         )
         operands = [q, cache_kv_nope, cache_kv_rope]
+        if compact is not None:
+            operands.append(compact)
         if return_lse:
             operands.append(lse)
         return kernel(*scalar_prefetches, *operands)

@@ -108,6 +108,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--raw-dir', required=True)
     p.add_argument('--pv-ab', action='store_true', help='Compare full PV with latent-only PV')
+    p.add_argument('--compact', action='store_true', help='Also test compact output DMA and scratch')
+    p.add_argument('--pv-layout', choices=('rowmajor', 'split'), default='rowmajor')
     p.add_argument('--out-dir', required=True)
     p.add_argument('--files', default='synthetic,raw-0096-layer0,raw-0097-layer10,raw-0099-layer40')
     p.add_argument('--groups', default='2,4,8,16')
@@ -179,7 +181,7 @@ def main():
     def physical(rows):
         return to_physical(rows, c['pi'], c['ppr'], c['cu_q'], page=PAGE)
 
-    def attend(q, no, ro, rows, group=1, lse=False, latent=False):
+    def attend(q, no, ro, rows, group=1, lse=False, latent=False, compact=False):
         nt = rows.shape[0]
         return sparse_ragged_paged_attention(
             q, no, ro, rows, None, jnp.array([0, nt], jnp.int32), dist,
@@ -187,15 +189,16 @@ def main():
             gather_and_attention_chunk_size=CHUNK // group,
             attention_kernel_batch_size=BATCH // group,
             sparsecore_atoms_per_batch=atoms_for(CHUNK // group, rows.shape[1]),
-            sparsecore_gather_wait_mode='overlap_rope', return_lse=lse, latent_values_only=latent)
+            sparsecore_gather_wait_mode='overlap_rope', return_lse=lse, latent_values_only=latent,
+            compact_output=compact)
 
-    def make_call(layout, rows, tag, group=1, latent=False):
+    def make_call(layout, rows, tag, group=1, latent=False, compact=False):
         def step(no, ro, qin, kv, pe, indices):
             no, ro = kcu.update_sparse_mla_kv_cache(
                 no, ro, kv, pe, kvl, pi, cuq, nope_spec=ns, rope_spec=rs)
             q = jnp.concatenate(qin, axis=-1) if layout == 'split' else qin
             if group == 1:
-                out = attend(q, no, ro, indices, latent=latent)[..., :512]
+                out = attend(q, no, ro, indices, latent=latent, compact=compact)[..., :512]
             else:
                 shared, private = indices
                 if private.shape[1] == 0:
@@ -303,12 +306,13 @@ def main():
                 raw[np.arange(TOPK)[None, :] >= lengths[:, None]] = -1
             full = physical(raw)
             sample, ref_quant, ref_bf = reference(c, raw)
-            base = make_call('rowmajor', full, name + '_base')
+            layout = a.pv_layout if a.pv_ab else 'rowmajor'
+            base = make_call(layout, full, name + '_base')
             base_error = differences(base['out'][sample], ref_quant)
             if (not np.isfinite(base['out']).all() or not base_error['finite']
                     or base_error['max_normalized'] > 0.03):
                 raise AssertionError(f'Baseline FP8-cache reference failed: {base_error}')
-            base_row = dict(kind='baseline', sample=name, variant='q_rowmajor',
+            base_row = dict(kind='baseline', sample=name, variant='q_' + layout,
                             topk_sha256=digest(raw), reference_queries=sample.tolist(),
                             error_vs_quantized=base_error,
                             error_vs_bf16=differences(base['out'][sample], ref_bf), **base['info'])
@@ -318,20 +322,32 @@ def main():
             emit(base_row)
 
             if a.pv_ab:
-                cand = make_call('rowmajor', full, name + '_pv512', latent=True)
+                cand = make_call(layout, full, name + '_pv512', latent=True)
                 eq = np.array_equal(cand['out'].view(np.uint16), base['out'].view(np.uint16))
                 cache_eq = cand['info']['cache_sha256'] == base['info']['cache_sha256']
                 if not (eq and cache_eq and np.isfinite(cand['out']).all()):
                     raise AssertionError(f'PV mismatch: {eq=}, {cache_eq=}, {differences(cand["out"], base["out"])}')
-                times = measure({'full': base, 'latent': cand})
+                methods = {'full': base, 'latent': cand}
+                if a.compact:
+                    small = make_call(layout, full, name + '_compact512', latent=True, compact=True)
+                    if (not np.array_equal(small['out'].view(np.uint16), base['out'].view(np.uint16))
+                            or small['info']['cache_sha256'] != base['info']['cache_sha256']):
+                        raise AssertionError('Compact output or cache mismatch')
+                    methods['compact'] = small
+                times = measure(methods)
                 ratios = [x/y for x,y in zip(times['latent']['us_runs'], times['full']['us_runs'])]
                 row = dict(kind='pv_ab', variant='pv512', sample=name, exact=True, cache_equal=True,
                            us=times['latent']['us'], latency_ms=times['latent']['us']/1000,
                            paired_timings=times, paired_ratios=ratios, ratio=statistics.median(ratios),
                            fp8_reference=base_error, topk_sha256=digest(raw), **cand['info'])
                 row.update(profile(cand, name + '_pv512'))
+                if a.compact:
+                    row['compact_exact'] = True
+                    row['compact_cache_equal'] = True
+                    row['compact_profile'] = profile(small, name + '_compact512')
+                    del small
                 emit(row)
-                del cand, base
+                del methods, cand, base
                 gc.collect()
                 continue
 
