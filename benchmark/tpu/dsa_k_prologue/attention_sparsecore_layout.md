@@ -12,7 +12,7 @@ PR：sgl-project/sglang-torchtpu#2246（Draft，头提交 e8be99e，分支 `feat
 - verify / decode 持平，在波动范围内。
 - 四个形状、所有变体的输出都和原版 Target 逐字节一致。
 - 每 token 字节数不变，KV 容量不受影响。
-- 后续（2026-11-18，见文末“top-k 去重”一节）：extend 剩下的约 2.9 ms 是 SC gather 的每行开销。真实 GLM-5.2 top-k 在 128 query 内去重后只剩约 4%，SC 标记表去重 16 个 chunk 只要约 270 us，但 dense-over-distinct 的 attention（不分组和分组都试过）比现在每 chunk 约 220 us 的 gather + attention 更慢。VMEM 内按行 sparse 读取也测了（exp-85fudprrt4）：TensorCore 最快 1.46 ns/行，是 SC 从 HBM gather（0.547 ns/行）的 2.7 倍；LLO bundle（exp-7uv7xzb1cp）显示 Pallas 写法每行一条标量 `sld` 取行号，完美流水下限约 0.57-0.63 ns/行，仍高于 SC gather。硬件有 8 行一条的 `vld.iar`，但 Pallas indexer、`lax.gather` 和直接发 `tpu.vector_load_idx`（exp-q8ui3ppzti，Mosaic TC layout pass 未实现）都到不了；SC 直接写 TC VMEM 的硬件通路也存在，但 Pallas `mpmd_map` 不支持 TC + SC 组合（exp-si0d8z8396），尚未验证。KV 加载的去重路线暂停，等这两处编译器支持之一打开。在现有编译器能力下，extend gather 这条线的收益就是上面的 −16%～−21%。
+- 后续（2026-11-18，见文末“top-k 去重”一节）：extend 剩下的约 2.9 ms 是 SC gather 的每行开销。真实 GLM-5.2 top-k 在 128 query 内去重后只剩约 4%，SC 标记表去重 16 个 chunk 只要约 270 us，但 dense-over-distinct 的 attention（不分组和分组都试过）比现在每 chunk 约 220 us 的 gather + attention 更慢。VMEM 内按行 sparse 读取也测了（exp-85fudprrt4）：TensorCore 最快 1.46 ns/行，是 SC 从 HBM gather（0.547 ns/行）的 2.7 倍；LLO bundle（exp-7uv7xzb1cp）显示 Pallas 写法每行一条标量 `sld` 取行号，完美流水下限约 0.57-0.63 ns/行，仍高于 SC gather。硬件有 8 行一条的 `vld.iar`，但 Pallas indexer、`lax.gather` 和直接发 `tpu.vector_load_idx`（exp-q8ui3ppzti，Mosaic TC layout pass 未实现）都到不了；SC 直接写 TC VMEM 的硬件通路也存在，但 Pallas `mpmd_map` 不支持 TC + SC 组合（exp-si0d8z8396），尚未验证。KV 加载的去重路线暂停，等这两处编译器支持之一打开。在现有编译器能力下，extend gather 这条线的收益就是上面的 −16%～−21%。仿 CSA2 显式重叠 gather 与 attention 没有空间：XLA 已经让相邻 chunk 重叠（exp-5knzugwt13）。微基准里 gather 前约 100 µs 的 q 布局拷贝在生产入参方式下不存在（exp-4qjftujfbc）。
 
 ## 背景
 
@@ -344,9 +344,44 @@ TC 逐行读的下限已经超过现在整条 SC gather，更超过去重留出�
 - 结论：这条路**在 Pallas 前端被挡住，硬件通路存在，未验证**，不算走不通。没有测到搬运时间，也没做正确性以外的测试。若同事的实现不经过 Pallas `mpmd_map`（XLA 自己的 SC offload、custom call 或内部构建），可能是第三个入口。
 - probe 只在测试分支上，用了未导出的 `jax._src.pallas.mpmd`，不进任何 PR。
 
+### 相邻 chunk 的 gather 与 attention 是否已重叠（exp-5knzugwt13，测试分支 9641b0a，`bench_chunk_timeline.py`）
+
+起因：DeepSeek-V4.1 CSA2 的 `pipeline.py` 用 `optimization_barrier` 把第 i+1 个 chunk 的 gather 和第 i 个 chunk 的 attention 配对，让两者重叠。先看现有 trace 里有没有这个空间，再决定要不要做同样的改写。
+
+extend_c1，SparseCore 布局，物理 slot，chunk 128 / batch 16，每次调用 3445 µs：
+
+| 区段（µs） | 时长 | 内容 |
+|---|---|---|
+| 0–45 | ~45 | KV 写入（`scatter_*_sparsecore_cache`）和少量索引 op |
+| 44–163 | ~120 | SC 上的 `copy.165` / `copy.166`（`OFFLOAD_DATA_FORMATTING`），在第一次 gather 前串行执行 |
+| 172 起 | 每个 ~180 | `sc_native_sc_gather_*`，起点间隔约 187 µs |
+
+- SC 上的 gather 首尾相接，相邻两次之间只空约 7 µs，从不等 attention。XLA 的调度已经让 gather i+1 和 attention i 重叠，效果和 CSA2 的显式配对相同。
+- 剩下能动的只有约 7 µs × 15 ≈ 0.1 ms 的间隙，以及最后一个 chunk 的 attention。不值得写重叠版本，没有做 A/B。
+- 局限：脚本的 attention 匹配只找到 16 次中的 5 次，所以 `OVL` 里的 attention 字段不完整，不能用；结论只依据 SC gather 的时间线。
+
+### gather 前的 ~120 µs 拷贝：q 的布局转换（exp-vvmc2ippfj、exp-4qjftujfbc，测试分支 3327afa / f9b2ed3）
+
+`bench_copy_hlo.py` 抓了编译后的 HLO：`copy.165` 是 `bf16[2048,64,576]` 从 `{0,2,1}` 转成 `{2,1,0}`，metadata `op_name="q_"`，144 MB。TensorCore 布局下也有同样大小的 `copy.111` / `copy.104`，源头同样是 `q`，所以它与 #2246 无关，只是 SparseCore 布局下 XLA 把它放到了 SC 上。
+
+`bench_q_layout_ab.py` 在同一个 step、相同输入上比较三种传 q 的方式：
+
+| 变体 | q 怎么传入 | q copy | wall 中位数（µs） | device module（µs） | 与 `q_default` 逐位一致 |
+|---|---|---|---|---|---|
+| `q_default` | 一整个 q，参数布局由 XLA 选（得到 (1,2,0)） | 1 | 3521.6 | 3442.0 | — |
+| `q_rowmajor` | 一整个 q，用 `Format(Layout((0,1,2)))` 钉成行主序 | 0 | 3391.9 | 3335.9 | 是 |
+| `q_split` | `ql_nope` [T,H,512] 和 `q_pe` [T,H,64] 两个行主序张量，在 jit 内拼接（与生产相同） | 0 | 3396.1 | 3336.2 | 是 |
+
+（上一轮 exp-jj4qrxlelj 的两个变体：3485.0 / 3416.7 µs wall，3442.1 / 3338.9 µs module，结论相同。）
+
+- 这次拷贝来自微基准的入参方式：整块 q 作为 jit 参数时，XLA 给它选了 (1,2,0) 布局，再转回 kernel 需要的行主序。
+- 生产路径 `_mla_kernel_args`（`sglang_tpu/attention_pallas_mla.py`）先对 `ql_nope` / `q_pe` 做 `.contiguous()`，以两个张量交给 `custom_jax_kernel`，拼接在 `mla_sparse_fused.py` 的 JAX 函数里。按这个方式传入（`q_split`），编译结果里没有 q copy，耗时与 `q_rowmajor` 相同。所以这约 100 µs 在生产里不存在，不算优化候选。
+- 以前用 `bench_target_gather_sweep` 等脚本测的 extend 时间里都含这次拷贝（约 100 µs，3%）。SparseCore 与 TensorCore 两种布局都有，所以前文的相对收益不受影响，绝对时间略偏高。
+- 未核实：`q_split` 用 `jax.jit` 模拟生产入参，没有抓 torch_tpu `jax.export` + `custom_jax_kernel` 路径编译出的 HLO。bridge 导出时只给 `ShapeDtypeStruct`，按理是默认行主序，但没有确认。
+
 ### 结论
 
-extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense 都比现在慢；复用现有 attention、只改 KV 加载的去重方案，卡在 TensorCore 逐行摆放：Pallas 能写出的只有标量 `sld` 加单 sublane `vld`，每行至少一个 bundle（0.57-0.63 ns/行）；硬件的 `vld.iar` 能做到 8 行一条指令，但 Pallas 和 Mosaic 在 TensorCore 上都没有实现。这条路线暂停。在现有编译器能力下，extend 的收益就是 SparseCore 布局的 −16%～−21%。
+extend gather 的路线都测过：减字节（#2212）1-3%；atoms / chunk / batch 默认已最优；去重后 dense attention、分组 dense 都比现在慢；gather 与 attention 的跨 chunk 重叠 XLA 已经做了；gather 前的 q 拷贝只出现在微基准里；复用现有 attention、只改 KV 加载的去重方案，卡在 TensorCore 逐行摆放：Pallas 能写出的只有标量 `sld` 加单 sublane `vld`，每行至少一个 bundle（0.57-0.63 ns/行）；硬件的 `vld.iar` 能做到 8 行一条指令，但 Pallas 和 Mosaic 在 TensorCore 上都没有实现。这条路线暂停。在现有编译器能力下，extend 的收益就是 SparseCore 布局的 −16%～−21%。
 
 重新打开的条件（都要 Pallas / Mosaic 侧改动，我们这边绕不过去）：
 - Mosaic 给 TensorCore 实现 `tpu.vector_load_idx` 的 lowering（到 `vsetiar` + `vld.iar`），或 Pallas 让 `ref[vec_idx, :]` 走这条路；
