@@ -56,6 +56,10 @@ def main():
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--repeats", type=int, default=7)
     p.add_argument("--xprof-dir", default="")
+    p.add_argument("--mask-ab", action="store_true",
+                   help="online A/B of the KV mask variants (MAB lines), outputs "
+                        "compared bit for bit with online")
+    p.add_argument("--passes", type=int, default=2)
     a = p.parse_args()
 
     import jax
@@ -151,6 +155,43 @@ def main():
 
     paths = {os.path.basename(f)[:-4]: f
              for f in glob.glob(f"{a.raw_dir}/**/raw-*.npy", recursive=True)}
+    if a.mask_ab:
+        variants = (("online", ()), ("kv_mask_col", ("kv_mask_col",)),
+                    ("kv_mask_cond", ("kv_mask_cond",)))
+        for name in a.samples.split(","):
+            try:
+                lg = (np.asarray(c["topk"]) if name == "synthetic"
+                      else np.load(paths[name])).astype(np.int32)
+                phys_np = to_physical(lg, c["pi"], c["ppr"], c["cu_q"], page=FP)
+                kv_lens, phys = prepare_gather_indices(
+                    jnp.asarray(phys_np), None, jnp.asarray(c["cu_q"]), page_size=FP,
+                    total_num_pages=P)
+                args = (nope, rope, ql, qr, phys, kv_lens)
+                fs, outs, us = {}, {}, {}
+                for tag, ab in variants:
+                    fs[tag] = jax.jit(lambda *xs, _ab=ab: attend(*xs, ablate=_ab))
+                    outs[tag] = np.asarray(fs[tag](*args).view(jnp.uint16))
+                    us[tag] = []
+                # Interleaved passes: every variant once per pass, order flipped.
+                for k in range(a.passes):
+                    order = variants if k % 2 == 0 else variants[::-1]
+                    for tag, _ in order:
+                        us[tag].append(timed(fs[tag], *args)[0])
+                base = float(np.median(us["online"]))
+                for tag, _ in variants:
+                    m = float(np.median(us[tag]))
+                    print("MAB " + json.dumps(dict(
+                        sample=name, variant=tag, us=round(m, 1), passes=us[tag],
+                        saved_us=round(base - m, 1),
+                        exact_vs_online=bool(np.array_equal(outs[tag], outs["online"])),
+                        kv_len_min=int(np.asarray(kv_lens).min()))), flush=True)
+            except Exception as e:  # report, do not hide
+                import traceback
+
+                traceback.print_exc()
+                print("MAB " + json.dumps(dict(sample=name, fail=repr(e)[:800])), flush=True)
+        print("MAB_DONE", flush=True)
+        return
     for name in a.samples.split(","):
         try:
             lg = (np.asarray(c["topk"]) if name == "synthetic"

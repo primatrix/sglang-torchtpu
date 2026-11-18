@@ -647,8 +647,18 @@ def _attention_kernel(
         # pages and can decode to fp8 NaN; score masking zeroes the weights,
         # but 0 * NaN = NaN in the PV einsum, so the data must be finite too.
         kv_len = get_kv_len()
-        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        if "no_kv_mask" not in ablate:
+        if "kv_mask_col" in ablate:  # test only: [bkv_sz, 1] iota, broadcast select
+            k_col = lax.broadcasted_iota(jnp.int32, (bkv.shape[0], 1), 0)
+            bkv = jnp.where(k_col < kv_len, bkv, 0)
+        elif "kv_mask_cond" in ablate:  # test only: mask only when a tail exists
+
+            def _mask(x):
+                k_span = lax.broadcasted_iota(jnp.int32, x.shape, 0)
+                return jnp.where(k_span < kv_len, x, jnp.zeros_like(x))
+
+            bkv = lax.cond(kv_len < bkv.shape[0], _mask, lambda x: x, bkv)
+        elif "no_kv_mask" not in ablate:
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
             bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
