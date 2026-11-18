@@ -62,6 +62,8 @@ def main():
     p.add_argument("--passes", type=int, default=2)
     p.add_argument("--qk-ab", action="store_true",
                    help="QK lowering A/B on the pre-gathered path (QAB lines)")
+    p.add_argument("--timeline", action="store_true",
+                   help="absolute TC/SC timeline of the online step (TL lines)")
     a = p.parse_args()
 
     import jax
@@ -157,6 +159,50 @@ def main():
 
     paths = {os.path.basename(f)[:-4]: f
              for f in glob.glob(f"{a.raw_dir}/**/raw-*.npy", recursive=True)}
+    if a.timeline:
+        # Absolute [start, end) of every TC op and SparseCore TEC event in one
+        # device time axis (xplane_timeline), so per-chunk overlap is measured,
+        # not inferred from per-line busy totals. Calls 1..3 of 6 captured.
+        from xplane_timeline import call_timeline
+
+        for name in a.samples.split(","):
+            try:
+                lg = (np.asarray(c["topk"]) if name == "synthetic"
+                      else np.load(paths[name])).astype(np.int32)
+                phys_np = to_physical(lg, c["pi"], c["ppr"], c["cu_q"], page=FP)
+                kv_lens, phys = prepare_gather_indices(
+                    jnp.asarray(phys_np), None, jnp.asarray(c["cu_q"]), page_size=FP,
+                    total_num_pages=P)
+                args = (nope, rope, ql, qr, phys, kv_lens)
+                for tag, f in (("online", jax.jit(attend)),
+                               ("pre", None)):
+                    if tag == "pre":
+                        tiles = jax.block_until_ready(jax.jit(gather)(phys))
+                        f = jax.jit(lambda *xs: attend(*xs[:6], tiles=xs[6]))
+                        fargs = (*args, tiles)
+                    else:
+                        fargs = args
+                    jax.block_until_ready(f(*fargs))
+                    us, _ = timed(f, *fargs)
+                    d = os.path.join(a.xprof_dir or "/tmp/tl", f"{name}_{tag}")
+                    jax.profiler.start_trace(d)
+                    try:
+                        for _ in range(6):
+                            out = f(*fargs)
+                        jax.block_until_ready(out)
+                    finally:
+                        jax.profiler.stop_trace()
+                    for call in (1, 2, 3):
+                        r = call_timeline(d, call=call)
+                        r.update(sample=name, variant=tag, call=call, wall_us=us)
+                        print("TL " + json.dumps(r), flush=True)
+            except Exception as e:  # report, do not hide
+                import traceback
+
+                traceback.print_exc()
+                print("TL " + json.dumps(dict(sample=name, fail=repr(e)[:800])), flush=True)
+        print("TL_DONE", flush=True)
+        return
     if a.qk_ab:
         # QK lowering A/B on the pre-gathered path (attention alone), where the
         # QK matmul costs ~2x the PV one. Exactness is vs plain pre.
