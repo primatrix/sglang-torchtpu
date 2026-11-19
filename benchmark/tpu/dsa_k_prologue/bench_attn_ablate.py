@@ -64,6 +64,8 @@ def main():
                    help="QK lowering A/B on the pre-gathered path (QAB lines)")
     p.add_argument("--hot-ab", action="store_true",
                    help="gather micro: hot-row share x read order (HAB lines)")
+    p.add_argument("--dedup-bound", action="store_true",
+                   help="dedup upper bound: gather of distinct rows, attention vs rows (DUB lines)")
     p.add_argument("--chunk-ab", action="store_true",
                    help="online A/B of uneven chunk schedules (CAB lines)")
     p.add_argument("--timeline", action="store_true",
@@ -168,6 +170,131 @@ def main():
 
     paths = {os.path.basename(f)[:-4]: f
              for f in glob.glob(f"{a.raw_dir}/**/raw-*.npy", recursive=True)}
+    if a.dedup_bound:
+        # Upper bound of a shared + private dedup, two halves measured apart:
+        # (1) SC gather of only the rows a chunk needs once: rows read by >= N of
+        #     its 128 queries once, plus each query's other rows padded to the
+        #     chunk's longest (static shapes); rounded up to whole owner rounds
+        #     with fresh distinct rows. Rows are laid out as [R / 2048, 2048]
+        #     so the #2246 gather schedule (atoms, phase stride, compact RoPE)
+        #     applies unchanged. N = 0 is "every distinct row once" (no private
+        #     part; the TC could not consume it, a floor).
+        # (2) TC attention alone (pre-gathered tiles) with K rows per query, the
+        #     cost of attending shared + padded private rows instead of 2048.
+        # Outputs are not compared: half (1) feeds no attention.
+        owner_round = nsc.NUM_CORES * nsc.NUM_SUBCORES * atoms * nsc.OCCURRENCES_PER_ATOM
+        rng = np.random.default_rng(7)
+
+        def plan(phys_np, n_min):
+            per_chunk, stats = [], []
+            for i in range(T // CHUNK):
+                ch = phys_np[i * CHUNK:(i + 1) * CHUNK]
+                rows, cnt = np.unique(ch, return_counts=True)
+                if n_min == 0:
+                    shared, priv = rows, [np.zeros(0, np.int64)] * CHUNK
+                else:
+                    shared = rows[cnt >= n_min]
+                    priv = [np.setdiff1d(q, shared, assume_unique=False) for q in ch]
+                pmax = max(len(x) for x in priv)
+                need = np.concatenate([shared] + [
+                    np.concatenate([x, np.repeat(x[-1:] if len(x) else shared[:1],
+                                                 pmax - len(x))]) for x in priv])
+                per_chunk.append(need)
+                stats.append((len(shared), pmax, len(need)))
+            r = -(-max(len(x) for x in per_chunk) // owner_round) * owner_round
+            out = []
+            for need in per_chunk:
+                fill = rng.choice(n, r - len(need), replace=False) if r > len(need) else []
+                v = np.concatenate([need, np.asarray(fill, np.int64)]).astype(np.int32)
+                v = np.sort(v.reshape(-1, K), axis=1)  # real top-k reads ascending
+                out.append(v)
+            s = np.asarray(stats)
+            return np.stack(out), dict(shared_mean=round(float(s[:, 0].mean())),
+                                       priv_max=int(s[:, 1].max()),
+                                       needed_mean=round(float(s[:, 2].mean())),
+                                       rows_per_chunk=int(r))
+
+        def gather_rows(idx):  # idx [chunks, R / K, K]
+            def f(ix):
+                outs = []
+                for i in range(ix.shape[0]):
+                    outs.append(nsc.dsa_gather_native_sc(
+                        nope, rope, ix[i], out_size=ix.shape[1] * K, atoms_per_batch=atoms,
+                        phase_stride=gkw.get("sparsecore_phase_stride", 0),
+                        compact_rope_output=gkw.get("compact_rope_output", False),
+                        rows_per_dma=gkw["sparsecore_rows_per_dma"]))
+                return outs
+            return jax.jit(f)
+
+        def med(f, *xs):
+            runs = [timed(f, *xs)[0] for _ in range(a.passes)]
+            return round(float(np.median(runs)), 1), runs
+
+        for name in a.samples.split(","):
+            if name == "synthetic":
+                continue
+            try:
+                lg = np.load(paths[name]).astype(np.int32)
+                phys_np = to_physical(lg, c["pi"], c["ppr"], c["cu_q"], page=FP)
+                base = jnp.asarray(phys_np.reshape(T // CHUNK, CHUNK, K))
+                us, runs = med(gather_rows(base), base)
+                print("DUB " + json.dumps(dict(sample=name, part="gather", n_min="none",
+                                               rows_per_chunk=CHUNK * K, us=us,
+                                               per_chunk_us=round(us / 16, 1), passes=runs)),
+                      flush=True)
+                for n_min in (16, 32, 64, 96, 0):
+                    idx, st = plan(phys_np, n_min)
+                    ix = jnp.asarray(idx)
+                    us, runs = med(gather_rows(ix), ix)
+                    # rows each query would attend: shared + padded private
+                    st["attend_rows"] = st["shared_mean"] + st["priv_max"] if n_min else None
+                    print("DUB " + json.dumps(dict(sample=name, part="gather", n_min=n_min,
+                                                   us=us, per_chunk_us=round(us / 16, 1),
+                                                   passes=runs, **st)), flush=True)
+            except Exception as e:  # report, do not hide
+                import traceback
+
+                traceback.print_exc()
+                print("DUB " + json.dumps(dict(sample=name, fail=repr(e)[:800])), flush=True)
+
+        # (2) attention alone with Kp rows per query (tile content does not
+        # matter for time; every query attends all Kp rows).
+        for kp in (2048, 2560, 2688, 3072, 3328, 3712, 4288):
+            r = dict(part="attention", rows_per_query=kp)
+            try:
+                at = next(x for x in (32, 16, 8, 4, 2, 1)
+                          if (CHUNK * kp) % (nsc.NUM_CORES * nsc.NUM_SUBCORES * x
+                                              * nsc.OCCURRENCES_PER_ATOM) == 0)
+                rr = kp // (nsc.ROPE_PACKING * (2 if gkw.get("compact_rope_output") else 1))
+                ids = jnp.asarray(np.sort(np.stack(
+                    [rng.choice(n, kp, replace=False) for _ in range(CHUNK)]), 1).astype(np.int32))
+                gn, gr = jax.jit(lambda ix: nsc.dsa_gather_native_sc(
+                    nope, rope, ix, out_size=CHUNK * kp, atoms_per_batch=at,
+                    compact_rope_output=gkw.get("compact_rope_output", False),
+                    rows_per_dma=gkw["sparsecore_rows_per_dma"]))(ids)
+                tile = (gn.reshape(CHUNK, kp, 128), gr.reshape(CHUNK, rr, 128))
+                kvl = jnp.full((T,), kp, jnp.int32)
+
+                def att_k(ql_, qr_, kvl_, t_, _kp=kp):
+                    o = None
+                    for i in range(T // CHUNK):
+                        o = sparse_attention_chunk(
+                            ql_, nope, rope, kvl_, None, None, start_pos=i * CHUNK,
+                            end_pos=(i + 1) * CHUNK, token_end=jnp.int32(T), sm_scale=sm,
+                            k_scale=1.0, cache_layout=SPARSECORE_CACHE_LAYOUT,
+                            sparsecore_atoms_per_batch=atoms, topk_override=_kp,
+                            narrow_output=True, o=o, q_rope=qr_, gathered_group=t_, **gkw)
+                    return o
+
+                f = jax.jit(att_k)
+                jax.block_until_ready(f(ql, qr, kvl, tile))
+                us, runs = med(f, ql, qr, kvl, tile)
+                r.update(us=us, per_chunk_us=round(us / 16, 1), passes=runs)
+            except Exception as e:  # report, do not hide; next size still runs
+                r["fail"] = repr(e)[:600]
+            print("DUB " + json.dumps(r), flush=True)
+        print("DUB_DONE", flush=True)
+        return
     if a.hot_ab:
         # Gather time vs how many reads hit rows shared by many queries, and vs
         # read order (real top-k is sorted ascending, synthetic is random).
