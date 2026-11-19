@@ -62,6 +62,8 @@ def main():
     p.add_argument("--passes", type=int, default=2)
     p.add_argument("--qk-ab", action="store_true",
                    help="QK lowering A/B on the pre-gathered path (QAB lines)")
+    p.add_argument("--hot-ab", action="store_true",
+                   help="gather micro: hot-row share x read order (HAB lines)")
     p.add_argument("--chunk-ab", action="store_true",
                    help="online A/B of uneven chunk schedules (CAB lines)")
     p.add_argument("--timeline", action="store_true",
@@ -166,6 +168,67 @@ def main():
 
     paths = {os.path.basename(f)[:-4]: f
              for f in glob.glob(f"{a.raw_dir}/**/raw-*.npy", recursive=True)}
+    if a.hot_ab:
+        # Gather time vs how many reads hit rows shared by many queries, and vs
+        # read order (real top-k is sorted ascending, synthetic is random).
+        # Every query reads 2048 distinct rows of the 49K prefix; a fraction h
+        # of them comes from one fixed hot set of 2048 rows shared by the chunk.
+        rng = np.random.default_rng(7)
+        prefix = int(c["prefixes"][0])
+        hot_set = rng.choice(prefix, K, replace=False)
+
+        def make(h, order):
+            kh = int(round(h * K))
+            out = np.empty((T, K), np.int32)
+            cold_pool = np.setdiff1d(np.arange(prefix), hot_set)
+            for t in range(T):
+                hot = rng.choice(hot_set, kh, replace=False)
+                cold = rng.choice(cold_pool, K - kh, replace=False)
+                row = np.concatenate([hot, cold])
+                out[t] = np.sort(row) if order == "sorted" else rng.permutation(row)
+            return out
+
+        cases = [(f"h{int(h*100)}_{o}", lambda h=h, o=o: make(h, o))
+                 for h in (0.0, 0.25, 0.5, 0.75, 1.0) for o in ("random", "sorted")]
+        if "raw-0096-layer0" in paths:
+            real = np.load(paths["raw-0096-layer0"]).astype(np.int32)
+            cases += [("layer0_sorted", lambda: np.sort(real, axis=1)),
+                      ("layer0_shuffled",
+                       lambda: np.stack([rng.permutation(r) for r in real]))]
+        for tag, mk in cases:
+            r = dict(case=tag)
+            try:
+                lg = mk()
+                # share of reads from rows read by >= 64 of a chunk's 128 queries
+                hits = []
+                for i in range(T // CHUNK):
+                    u, cnt = np.unique(lg[i * CHUNK:(i + 1) * CHUNK], return_counts=True)
+                    hits.append(float((cnt[cnt >= 64]).sum()) / (CHUNK * K))
+                r["share_hot64"] = round(float(np.mean(hits)), 3)
+                phys_np = to_physical(lg, c["pi"], c["ppr"], c["cu_q"], page=FP)
+                kv_lens, phys = prepare_gather_indices(
+                    jnp.asarray(phys_np), None, jnp.asarray(c["cu_q"]), page_size=FP,
+                    total_num_pages=P)
+                g = jax.jit(gather)
+                on = jax.jit(attend)
+                args = (nope, rope, ql, qr, phys, kv_lens)
+                jax.block_until_ready(g(phys))
+                jax.block_until_ready(on(*args))
+                gu, ou = [], []
+                for _ in range(a.passes):
+                    gu.append(timed(g, phys)[0])
+                    ou.append(timed(on, *args)[0])
+                r.update(gather_us=round(float(np.median(gu)), 1),
+                         online_us=round(float(np.median(ou)), 1),
+                         gather_passes=gu, online_passes=ou)
+            except Exception as e:  # report, do not hide
+                import traceback
+
+                traceback.print_exc()
+                r["fail"] = repr(e)[:600]
+            print("HAB " + json.dumps(r), flush=True)
+        print("HAB_DONE", flush=True)
+        return
     if a.chunk_ab:
         # Online step with uneven chunk schedules; outputs must stay bit-exact
         # (each query attends its own rows, chunking only regroups queries).
