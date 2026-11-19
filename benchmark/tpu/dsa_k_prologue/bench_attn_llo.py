@@ -94,11 +94,35 @@ def report(tag, new_files, key):
     if final is None:
         print("LLOSTAT " + json.dumps({"tag": tag, "error": "no bundle file matched"}), flush=True)
         return
-    f, rows = final
-    print(f"LLOOP_BEGIN {tag} {os.path.basename(f)} {len(rows)}", flush=True)
-    for addr, ops in rows[:20000]:
+    finals[tag] = final
+
+
+def listing(tag, cap):
+    # `falcon exp logs` returns at most 5000 lines: per-64-bundle window counts
+    # for the whole file, then at most `cap` bundles of the densest MXU stretch.
+    f, rows = finals[tag]
+    kinds = [set(kind(o) for o in ops) for _, ops in rows]
+    for s in range(0, len(rows), 64):
+        w = kinds[s:s + 64]
+        print("LLOWIN " + json.dumps({
+            "tag": tag, "start": rows[s][0], "n": len(w),
+            "mxu": sum("mxu" in k for k in w), "vpu": sum("vpu" in k for k in w),
+            "both": sum({"mxu", "vpu"} <= k for k in w), "empty": sum(not k for k in w),
+            "other": sorted({o for _, ops in rows[s:s + 64] for o in ops
+                             if kind(o) == "other"})[:12]}), flush=True)
+    mx = [1 if "mxu" in k else 0 for k in kinds]
+    best, lo = -1, 0
+    for s in range(0, max(1, len(rows) - cap + 1), 64):
+        c = sum(mx[s:s + cap])
+        if c > best:
+            best, lo = c, s
+    print(f"LLOOP_BEGIN {tag} {os.path.basename(f)} {len(rows)} from {lo}", flush=True)
+    for addr, ops in rows[lo:lo + cap]:
         print(f"LLOOP {tag}|{addr} {' '.join(ops)}", flush=True)
     print(f"LLOOP_END {tag}", flush=True)
+
+
+finals = {}
 
 
 def main():
@@ -156,6 +180,9 @@ def main():
     before = files_now()
     jax.jit(llo_tgt).lower(q, no, ro, kv_lens, phys, *tile).compile()
     report("tgt", files_now() - before, "MLA-")
+    for tag, cap in (("src", 2600), ("tgt", 900)):
+        if tag in finals:
+            listing(tag, cap)
     print("LLO_DONE", flush=True)
 
 
