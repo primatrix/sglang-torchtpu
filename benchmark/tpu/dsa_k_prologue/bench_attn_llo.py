@@ -64,11 +64,19 @@ def report(tag, new_files, key):
     names = sorted(new_files)
     print("LLOFILES " + json.dumps({"tag": tag, "files": [os.path.basename(f) for f in names]}),
           flush=True)
-    bundle_files = [f for f in names if "bundles" in os.path.basename(f)
-                    and key in open(f, errors="replace").read(400000)]
-    final = None
+    # Every file of this compile that mentions an MXU op, whatever its name: a
+    # non-unrolled fori_loop body can land in its own region / loop file.
+    texts = {f: open(f, errors="replace").read() for f in names}
+    for f in names:
+        nm = len(re.findall(r"\bvmat\w*", texts[f]))
+        if nm:
+            print("LLOGREP " + json.dumps({"tag": tag, "file": os.path.basename(f),
+                                           "vmat": nm, "bytes": len(texts[f])}), flush=True)
+    bundle_files = [f for f in names if re.search(r"\bvmat\w*", texts[f])
+                    or ("bundles" in os.path.basename(f) and key in texts[f][:400000])]
+    final, final_mxu = None, -1
     for f in bundle_files:
-        lines = open(f, errors="replace").read().splitlines()
+        lines = texts[f].splitlines()
         rows = []
         for ln in lines:
             m = re.match(r"\s*(0x[0-9a-f]+)\s*:\s*>?\s*\{(.*)\}\s*$", ln)
@@ -90,7 +98,12 @@ def report(tag, new_files, key):
             "top_ops": hist.most_common(60),
         }
         print("LLOSTAT " + json.dumps(stat), flush=True)
-        final = (f, rows)  # files sort by pass number; keep the last
+        # Prefer the final-stage file with the most MXU bundles (the k-loop body).
+        score = stat["mxu"] + (10**6 if "final_bundles" in os.path.basename(f) else 0)
+        if stat["mxu"] and score >= final_mxu:
+            final, final_mxu = (f, rows), score
+        elif final is None and "final_bundles" in os.path.basename(f) and key in texts[f]:
+            final = (f, rows)
     if final is None:
         print("LLOSTAT " + json.dumps({"tag": tag, "error": "no bundle file matched"}), flush=True)
         return
