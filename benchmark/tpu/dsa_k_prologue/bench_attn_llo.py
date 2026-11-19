@@ -40,11 +40,18 @@ def files_now():
     return {f for f in glob.glob(f"{DUMP}/**/*", recursive=True) if os.path.isfile(f)}
 
 
+TOK_RE = re.compile(r"(?<![%\w.$#])([a-z][a-z0-9_]*(?:\.[\w]+)*)")
+
+
 def opcodes(bundle):
+    # First lowercase word that is not a register / symbol, after an optional
+    # result ("%v = ") or predicate ("@p0", "(%p1)") prefix.
     ops = []
     for part in bundle.split(";;"):
         part = re.sub(r"/\*.*?\*/", "", part).strip()
-        m = OP_RE.search(part)
+        if "=" in part.split("[")[0]:
+            part = part.split("=", 1)[1]
+        m = TOK_RE.search(part)
         if m:
             ops.append(m.group(1))
     return ops
@@ -84,6 +91,15 @@ def report(tag, new_files, key):
                 rows.append((m.group(1), opcodes(m.group(2))))
         if not rows:
             continue
+        # Lines that mention an MXU op but did not become an MXU bundle: print a
+        # few raw so a parser miss is visible instead of silently counted as 0.
+        miss = [ln for ln in lines if re.search(r"\bvmat\w*", ln)
+                and not any(o.startswith("vmat") for o in opcodes(
+                    (re.match(r"\s*0x[0-9a-f]+\s*:\s*>?\s*\{(.*)\}\s*$", ln) or [None, ""])[1]))]
+        if miss:
+            print("LLOMISS " + json.dumps({"tag": tag, "file": os.path.basename(f)[-50:],
+                                           "n": len(miss),
+                                           "raw": [m[:300] for m in miss[:4]]}), flush=True)
         hist = collections.Counter(op for _, ops in rows for op in ops)
         kinds = [set(kind(o) for o in ops) for _, ops in rows]
         stat = {
