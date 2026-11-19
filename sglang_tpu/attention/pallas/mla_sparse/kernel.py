@@ -1053,6 +1053,7 @@ def sparse_attention_chunk(
     topk_cap: int | None = None,
     topk_override: int | None = None,
     gather_rope: bool = True,
+    gathered_group: tuple | None = None,  # test only: pre-gathered (nope, rope) tiles
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1329,6 +1330,8 @@ def sparse_attention_chunk(
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
         )
+    elif gathered_group is not None:
+        gathered_nope_buffer, gathered_rope_buffer = gathered_group
     else:
         assert indices is not None
         gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(
