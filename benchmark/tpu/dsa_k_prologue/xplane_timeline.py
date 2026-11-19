@@ -96,13 +96,15 @@ def clip(iv, lo, hi):
     return [[max(s, lo), min(e, hi)] for s, e in iv if e > lo and s < hi]
 
 
-def call_timeline(trace_dir, call=1, attn_key="MLA-", gather_keys=("native_sc_gather",)):
+def call_timeline(trace_dir, call=1, attn_key="MLA-", gather_keys=("native_sc_gather",),
+                  module_key=None):
     """One captured call (``call``-th "XLA Modules" event): per-chunk TC attention
     intervals, SparseCore busy (union of TEC lines), their overlap and the TC
     gaps, all in us from the module start."""
     ev = events(trace_dir)
     mods = sorted((s, e, n) for p, ln, n, s, e in ev
-                  if " SparseCore" not in p and ln == "XLA Modules")
+                  if " SparseCore" not in p and ln == "XLA Modules"
+                  and (module_key is None or module_key in n))
     if len(mods) <= call:
         return {"error": f"{len(mods)} module events, wanted call {call}"}
     m0, m1, mname = mods[call]
