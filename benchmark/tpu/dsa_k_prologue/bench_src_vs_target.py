@@ -131,6 +131,21 @@ def main():
         for tag, _, _, ak, gk in traced:
             r = call_timeline(d, call=1, attn_key=ak, gather_keys=gk, module_key=f"jit_{tag}")
             emit(variant=tag, timeline={k: r[k] for k in keep if k in r})
+        # Target online drops most TC events in the shared trace (SparseCore events
+        # fill the buffer); trace it alone, one call per capture, a few captures.
+        for tag, jf, args, ak, gk in traced:
+            if tag != "tgt_online":
+                continue
+            for k in range(3):
+                d1 = os.path.join(a.xprof_dir, f"solo_{tag}_{k}")
+                jax.block_until_ready(jf(*args))
+                jax.profiler.start_trace(d1)
+                try:
+                    jax.block_until_ready(jf(*args))
+                finally:
+                    jax.profiler.stop_trace()
+                r = call_timeline(d1, call=0, attn_key=ak, gather_keys=gk, module_key=f"jit_{tag}")
+                emit(variant=tag, solo=k, timeline={x: r[x] for x in keep if x in r})
 
     # ---------------- Source ----------------
     empty = SplitFP8KVCache(jnp.zeros((P, FP, 4, 128), jnp.uint8),
