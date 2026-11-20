@@ -151,6 +151,36 @@ def listing(tag, cap):
     print(f"LLOOP_END {tag}", flush=True)
 
 
+def raw_dump(new_files, key, n=60):
+    # Raw final_bundles lines that mention an MXU op, comments stripped, so the
+    # bundle syntax can be checked by eye; also a raw-substring classification.
+    fs = [f for f in sorted(new_files) if key in os.path.basename(f)
+          and os.path.basename(f).endswith("final_bundles.txt")]
+    for f in fs:
+        lines = open(f, errors="replace").read().splitlines()
+        hits = [i for i, ln in enumerate(lines) if "vmat" in ln]
+        print("LLORAW_BEGIN " + json.dumps({"file": os.path.basename(f), "lines": len(lines),
+                                            "vmat_lines": len(hits)}), flush=True)
+        for i in hits[:n]:
+            for j in (i - 1, i, i + 1):
+                if 0 <= j < len(lines):
+                    t = re.sub(r"/\*.*?\*/", "", lines[j]).strip()
+                    print(f"LLORAW {j}|{t[:600]}", flush=True)
+        # Raw classification: each line holding an address is one bundle.
+        both = mx = 0
+        for ln in lines:
+            t = re.sub(r"/\*.*?\*/", "", ln)
+            if not re.match(r"\s*0x[0-9a-f]+\s*:", t):
+                continue
+            has_m = "vmat" in t
+            has_v = bool(re.search(r"\bv(?!mat|ld|st|trace|sync|delay|nop)[a-z]\w*\.", t))
+            mx += has_m
+            both += has_m and has_v
+        print("LLORAWSTAT " + json.dumps({"file": os.path.basename(f), "mxu_lines": mx,
+                                          "mxu_and_vpu_lines": both}), flush=True)
+        print("LLORAW_END", flush=True)
+
+
 finals = {}
 
 
@@ -189,6 +219,7 @@ def main():
     before = files_now()
     jax.jit(llo_src).lower(ql, qr, g, counts).compile()
     report("src", files_now() - before, "dsa_tensor_core_attention")
+    raw_dump(files_now() - before, "dsa_tensor_core_attention_fp8_qkv")
 
     # ---------------- Target: one 64-query chunk, per-query kernel ----------------
     T = 64
@@ -209,7 +240,7 @@ def main():
     before = files_now()
     jax.jit(llo_tgt).lower(q, no, ro, kv_lens, phys, *tile).compile()
     report("tgt", files_now() - before, "MLA-")
-    for tag, cap in (("src", 2600), ("tgt", 900)):
+    for tag, cap in (("src", 1200), ("tgt", 600)):
         if tag in finals:
             listing(tag, cap)
     print("LLO_DONE", flush=True)
