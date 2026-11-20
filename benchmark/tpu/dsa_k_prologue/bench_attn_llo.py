@@ -40,6 +40,7 @@ def files_now():
     return {f for f in glob.glob(f"{DUMP}/**/*", recursive=True) if os.path.isfile(f)}
 
 
+BUNDLE_RE = re.compile(r"\s*(0x[0-9a-f]+)\s*:\s*(>*)\s*\{(.*)\}\s*$")
 TOK_RE = re.compile(r"(?<![%\w.$#])([a-z][a-z0-9_]*(?:\.[\w]+)*)")
 
 
@@ -86,22 +87,38 @@ def report(tag, new_files, key):
         lines = texts[f].splitlines()
         rows = []
         for ln in lines:
-            m = re.match(r"\s*(0x[0-9a-f]+)\s*:\s*>?\s*\{(.*)\}\s*$", ln)
+            # ">" marks loop nesting depth: ">" outer loop, ">>" the k loop.
+            m = BUNDLE_RE.match(ln)
             if m:
-                rows.append((m.group(1), opcodes(m.group(2))))
+                rows.append((m.group(1), opcodes(m.group(3)), len(m.group(2))))
         if not rows:
             continue
         # Lines that mention an MXU op but did not become an MXU bundle: print a
         # few raw so a parser miss is visible instead of silently counted as 0.
         miss = [ln for ln in lines if re.search(r"\bvmat\w*", ln)
                 and not any(o.startswith("vmat") for o in opcodes(
-                    (re.match(r"\s*0x[0-9a-f]+\s*:\s*>?\s*\{(.*)\}\s*$", ln) or [None, ""])[1]))]
+                    (BUNDLE_RE.match(ln) or [None, "", "", ""])[3]))]
         if miss:
             print("LLOMISS " + json.dumps({"tag": tag, "file": os.path.basename(f)[-50:],
                                            "n": len(miss),
                                            "raw": [m[:300] for m in miss[:4]]}), flush=True)
-        hist = collections.Counter(op for _, ops in rows for op in ops)
-        kinds = [set(kind(o) for o in ops) for _, ops in rows]
+        hist = collections.Counter(op for _, ops, _ in rows for op in ops)
+        kinds = [set(kind(o) for o in ops) for _, ops, _ in rows]
+        # Same counts per loop depth, plus the opcode mix of each depth.
+        for depth in sorted({d for _, _, d in rows}):
+            sub = [r for r in rows if r[2] == depth]
+            ks = [set(kind(o) for o in ops) for _, ops, _ in sub]
+            h = collections.Counter(o for _, ops, _ in sub for o in ops)
+            print("LLODEPTH " + json.dumps({
+                "tag": tag, "file": os.path.basename(f)[-50:], "depth": depth,
+                "bundles": len(sub), "empty": sum(not k for k in ks),
+                "mxu": sum("mxu" in k for k in ks),
+                "mxu_and_vpu": sum({"mxu", "vpu"} <= k for k in ks),
+                "vpu_only": sum("vpu" in k and "mxu" not in k for k in ks),
+                "mem_only": sum(k == {"mem"} for k in ks),
+                "ops_by_kind": {c: sum(n for o, n in h.items() if kind(o) == c)
+                                for c in ("mxu", "vpu", "mem", "other")},
+                "top_ops": h.most_common(45)}), flush=True)
         stat = {
             "tag": tag, "file": os.path.basename(f), "bundles": len(rows),
             "empty": sum(not k for k in kinds),
@@ -130,14 +147,14 @@ def listing(tag, cap):
     # `falcon exp logs` returns at most 5000 lines: per-64-bundle window counts
     # for the whole file, then at most `cap` bundles of the densest MXU stretch.
     f, rows = finals[tag]
-    kinds = [set(kind(o) for o in ops) for _, ops in rows]
+    kinds = [set(kind(o) for o in ops) for _, ops, _ in rows]
     for s in range(0, len(rows), 64):
         w = kinds[s:s + 64]
         print("LLOWIN " + json.dumps({
             "tag": tag, "start": rows[s][0], "n": len(w),
             "mxu": sum("mxu" in k for k in w), "vpu": sum("vpu" in k for k in w),
             "both": sum({"mxu", "vpu"} <= k for k in w), "empty": sum(not k for k in w),
-            "other": sorted({o for _, ops in rows[s:s + 64] for o in ops
+            "other": sorted({o for _, ops, _ in rows[s:s + 64] for o in ops
                              if kind(o) == "other"})[:12]}), flush=True)
     mx = [1 if "mxu" in k else 0 for k in kinds]
     best, lo = -1, 0
@@ -146,7 +163,7 @@ def listing(tag, cap):
         if c > best:
             best, lo = c, s
     print(f"LLOOP_BEGIN {tag} {os.path.basename(f)} {len(rows)} from {lo}", flush=True)
-    for addr, ops in rows[lo:lo + cap]:
+    for addr, ops, _ in rows[lo:lo + cap]:
         print(f"LLOOP {tag}|{addr} {' '.join(ops)}", flush=True)
     print(f"LLOOP_END {tag}", flush=True)
 
