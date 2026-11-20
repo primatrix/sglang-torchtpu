@@ -141,15 +141,28 @@ def report(tag, new_files, key):
 def mosaic_layouts():
     fs = sorted(f for f in glob.glob(f"{MOSAIC}/**/*", recursive=True) if os.path.isfile(f))
     print("MOSAICFILES " + json.dumps([os.path.basename(f) for f in fs][:80]), flush=True)
+    # File names are "anonymous"; tell kernels apart by content. Only the two
+    # layout passes: memref tiling of every ref, and the layout of vector loads.
     for f in fs:
-        if not any(k in os.path.basename(f) for k in ("dsa_tensor_core", "MLA-")):
+        base = os.path.basename(f)
+        if not any(p in base for p in ("infer-memref-layout", "infer-vector-layout")):
             continue
-        types = []
-        for t in re.findall(r"memref<[^>]*(?:<[^>]*>[^>]*)*>", open(f, errors="replace").read()):
-            if t not in types:
-                types.append(t)
-        print("MOSAIC " + json.dumps({"file": os.path.basename(f)[-80:],
-                                      "memrefs": [t[:200] for t in types[:40]]}), flush=True)
+        text = open(f, errors="replace").read()
+        tag = ("src" if "dsa_tensor_core_attention" in text
+               else "tgt" if "MLA-" in text else "unk")
+        if "infer-memref-layout" in base:
+            types = []
+            for t in re.findall(r"memref<[^<>]*(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>[^<>]*)*>", text):
+                if t not in types:
+                    types.append(t)
+            print("MOSAIC " + json.dumps({"tag": tag, "pass": "memref", "file": base[-70:],
+                                          "memrefs": [t[:260] for t in types[:60]]}), flush=True)
+        else:
+            loads = [ln.strip()[:500] for ln in text.splitlines()
+                     if ("vector.load" in ln or "tpu.load" in ln or "vector_load" in ln)
+                     and "layout" in ln]
+            print("MOSAIC " + json.dumps({"tag": tag, "pass": "vector", "file": base[-70:],
+                                          "n_loads": len(loads), "loads": loads[:25]}), flush=True)
 
 
 def main():
