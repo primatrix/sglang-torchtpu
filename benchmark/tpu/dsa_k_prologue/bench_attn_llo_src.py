@@ -94,6 +94,48 @@ def src_text(path, line):
     return lines[line - 1].strip()[:120] if 0 < line <= len(lines) else ""
 
 
+# The tile-read source line of each kernel: Source fp8_attention.py:194, Target kernel.py:396.
+VLD_LINES = {"src": ("fp8_attention.py", 194), "tgt": ("kernel.py", 396)}
+SM_RE = re.compile(r"\bsm:\$?(0x[0-9a-f]+|\d+)")
+SS_RE = re.compile(r"\bss:\$?(0x[0-9a-f]+|-?\d+)")
+ADDR_RE = re.compile(r"\[vmem:\[([^\]]*)\]")
+
+
+def vld_detail(tag, lines):
+    """Every vld attributed to the tile-read line: sublane-mask / stride histogram,
+    how many distinct VMEM addresses they read (re-reads show as repeats), and
+    a raw sample, so the per-row vld count can be accounted for exactly."""
+    want = VLD_LINES.get(tag)
+    if want is None:
+        return
+    raw, masks, strides, addrs, depths = [], collections.Counter(), collections.Counter(), \
+        collections.Counter(), collections.Counter()
+    for ln in lines:
+        m = BUNDLE_RE.match(ln)
+        if not m:
+            continue
+        for part in m.group(3).split(";;"):
+            op, (fname, lno, _) = parse_part(part)
+            if not op or not op.startswith("vld") or (fname, lno) != want:
+                continue
+            body = re.sub(r"/\*.*?\*/", "", part).strip()
+            raw.append(body)
+            depths[len(m.group(2))] += 1
+            sm, ss, ad = SM_RE.search(body), SS_RE.search(body), ADDR_RE.search(body)
+            masks[sm.group(1) if sm else "none"] += 1
+            strides[ss.group(1) if ss else "none"] += 1
+            addrs[ad.group(1) if ad else "?"] += 1
+    print("VLDSTAT " + json.dumps({
+        "tag": tag, "line": f"{want[0]}:{want[1]}", "n": len(raw), "by_depth": dict(depths),
+        "sublane_masks": masks.most_common(12), "strides": strides.most_common(12),
+        "distinct_addrs": len(addrs), "max_repeat": max(addrs.values()) if addrs else 0,
+        "addr_repeat_hist": collections.Counter(addrs.values()).most_common(8),
+        "opcodes": collections.Counter(TOK_RE.search(r.split("=", 1)[-1]).group(1)
+                                       for r in raw).most_common(6)}), flush=True)
+    for r in raw[:48]:
+        print(f"VLDRAW {tag}|{r[:260]}", flush=True)
+
+
 def report(tag, new_files, key):
     fs = [f for f in sorted(new_files) if key in os.path.basename(f)
           and os.path.basename(f).endswith("final_bundles.txt")
@@ -122,6 +164,7 @@ def report(tag, new_files, key):
             noloc += fname == "noloc"
             agg[(depth, fname, lno)][category(op)] += 1
             paths[(fname, lno)] = full
+    vld_detail(tag, lines)
     print("SRCHEAD " + json.dumps({"tag": tag, "file": os.path.basename(f),
                                     "bundles_by_depth": dict(bundles), "noloc_ops": noloc}),
           flush=True)
