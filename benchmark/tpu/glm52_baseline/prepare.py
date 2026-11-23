@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import struct
 from pathlib import Path
 
@@ -85,7 +86,12 @@ def prepare(model: Path, output: Path):
         host="0.0.0.0",
         port=30000,
         tp_size=16,
-        attn_dp_size=16,
+        attn_dp_size=16 // int(os.environ.get("GLM52_ATTN_CP", "1")),
+        **(
+            dict(attn_cp_size=int(os.environ["GLM52_ATTN_CP"]),
+                 enable_prefill_cp=True, cp_strategy="zigzag")
+            if int(os.environ.get("GLM52_ATTN_CP", "1")) > 1 else {}
+        ),
         ep_size=16,
         nnodes=2,
         attention_backend="pallas_tpu_mla_sparse",

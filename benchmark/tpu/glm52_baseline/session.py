@@ -46,10 +46,13 @@ def run_client(proc, command, out, art, shared, deadline):
                     check=True,
                     timeout=max(1, deadline - time.monotonic()),
                 )
-                summary = json.loads((destination / "summary.json").read_text())
                 smoke = json.loads((destination / "smoke-summary.json").read_text())
-                assert len(summary["rounds"]) == 6 and smoke["status"] == "PASS"
-                assert {row["dp_rank"] for row in smoke["checks"]} == set(range(16))
+                assert smoke["status"] == "PASS"
+                dp = 16 // int(os.environ.get("GLM52_ATTN_CP", "1"))
+                assert {row["dp_rank"] for row in smoke["checks"]} == set(range(dp))
+                if os.environ.get("GLM52_SMOKE_ONLY") != "1":
+                    summary = json.loads((destination / "summary.json").read_text())
+                    assert len(summary["rounds"]) == 6
                 atomic(
                     shared / "client-attention.json",
                     dict(
@@ -357,6 +360,7 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     str(model),
                     "--decode-prefix",
                     "shared",
+                    *(["--smoke-only"] if os.environ.get("GLM52_SMOKE_ONLY") == "1" else []),
                 ]
                 measurements = run_client(proc, client, out, art, shared, deadline)
                 result.update(status="SUCCEEDED", measurements=str(measurements))

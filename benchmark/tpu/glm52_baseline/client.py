@@ -15,6 +15,9 @@ from pathlib import Path
 
 import aiohttp
 
+CP = int(__import__("os").environ.get("GLM52_ATTN_CP", "1"))
+DP = 16 // CP
+
 
 def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
@@ -331,7 +334,7 @@ async def main(a):
         await asyncio.to_thread(save, a.output / "server-info.json", info)
         expected = dict(
             tp_size=16,
-            attn_dp_size=16,
+            attn_dp_size=DP,
             ep_size=16,
             speculative_algorithm="EAGLE",
             speculative_num_steps=5,
@@ -350,7 +353,7 @@ async def main(a):
         tokenizer = await asyncio.to_thread(load_tokenizer, a.model)
         assert tokenizer.chat_template
         checks = []
-        for rank in range(16):
+        for rank in range(DP):
             text = tokenizer.apply_chat_template(
                 [
                     dict(
@@ -374,6 +377,24 @@ async def main(a):
             )
             assert "4" in r["text"], r["text"]
             checks.append(r["meta"])
+        # Long prompt: > top-k 2048 keys and split by the CP zigzag layout.
+        long_checks = []
+        filler = "The grass is green. The sky is blue. The sun is bright. " * 900
+        for rank in range(DP):
+            key = str(73100 + 37 * rank)
+            content = (filler[: len(filler) // 2] + f" The secret passkey is {key}. Remember it. "
+                       + filler[len(filler) // 2 :]
+                       + " What is the secret passkey? Answer with the number only.")
+            text = tokenizer.apply_chat_template(
+                [dict(role="user", content=content)], tokenize=False,
+                add_generation_prompt=True, enable_thinking=False)
+            r = await generate(session, a.base_url, [], rank, 16, a.output,
+                               f"smoke-long-{rank:02d}", text=text)
+            long_checks.append(dict(dp_rank=rank, key=key, text=r["text"],
+                                    prompt_tokens=r["meta"]["prompt_tokens"],
+                                    passed=key in (r["text"] or "")))
+        await asyncio.to_thread(save, a.output / "smoke-long.json", long_checks)
+        assert all(c["passed"] for c in long_checks), long_checks
         await asyncio.to_thread(
             save, a.output / "smoke-summary.json", dict(status="PASS", checks=checks)
         )
