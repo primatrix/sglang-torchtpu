@@ -37,7 +37,7 @@ def main():
         chunked_prefill_size=2048,
         max_running_requests=64,
         tp_size=16,
-        attn_dp_size=16,
+        attn_dp_size=16 // int(os.environ.get("GLM52_ATTN_CP", "1")),
         ep_size=16,
         nnodes=2,
         speculative_algorithm="EAGLE",
@@ -51,6 +51,12 @@ def main():
         moe_runner_backend="pallas_tpu",
         attention_backend="pallas_tpu_mla_sparse",
     )
+    if int(os.environ.get("GLM52_ATTN_CP", "1")) > 1:
+        expected.update(
+            attn_cp_size=int(os.environ["GLM52_ATTN_CP"]),
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+        )
     assert not json.loads(resolved.get("json_model_override_args") or "{}"), (
         resolved.get("json_model_override_args")
     )

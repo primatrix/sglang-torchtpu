@@ -176,7 +176,8 @@ def run():
         for key in ("XDG_CACHE_HOME", "TMPDIR", "JAX_COMPILATION_CACHE_DIR"):
             Path(os.environ[key]).mkdir(parents=True, exist_ok=True)
         config = root / "recipe/server.json"
-        with (art / "cli-validation.log").open("wb") as validation_log:
+        try:
+          with (art / "cli-validation.log").open("wb") as validation_log:
             subprocess.run(
                 [
                     sys.executable,
@@ -190,6 +191,11 @@ def run():
                 check=True,
                 timeout=180,
             )
+        except subprocess.CalledProcessError:
+            # The log lives on GCS; echo its tail so the pod log shows why.
+            tail = (art / "cli-validation.log").read_text(errors="replace")[-4000:]
+            print("==== cli-validation.log (tail)\n" + tail, flush=True)
+            raise
         # Reuse the successful weekend host preparation before starting the
         # native normalization timeout. Physical host order can differ from Falcon order.
         query = """import os
