@@ -409,6 +409,49 @@ def capped_live_windows(
     return jnp.clip(jnp.max(token_windows), 1, num_windows).astype(jnp.int32)
 
 
+def _vperm_slane_byte(val_u8, pat_u32):
+    """One vperm.slane per (8, 128) u32 vreg (libtpu-agent#292 idiom).
+
+    `pat_u32` holds physical byte selectors (src_byte << 3 | src_sublane); the
+    bit swap below is what the LLO simplifier folds away, leaving one vperm.
+    """
+    p_bytes = (pat_u32 & jnp.uint32(0x18181818)) >> jnp.uint32(3)
+    p_slanes = (pat_u32 & jnp.uint32(0x07070707)) << jnp.uint32(2)
+    logical = pltpu.bitcast(p_bytes | p_slanes, jnp.uint8)
+    return jnp.take_along_axis(
+        val_u8, logical, axis=-2, mode="promise_in_bounds", wrap_negative_indices=False
+    )
+
+
+def _vperm_unpack_nope(nope_ref, num_rows):
+    """SparseCore NOPE u32[num_rows, 128] -> fp8[num_rows, 512], in place.
+
+    Test-only alternative to `bitcast(u8).reshape`. Each 8-token vreg is
+    permuted in VMEM so sublane 4h+g holds feature block g of tokens 4h..4h+3
+    (byte = token); column block g of 32 tokens is then sublanes g, g+4, ...,
+    g+28 of each 32-row span, read with one stride-4 load. Overwrites the
+    gathered slot, so the caller must not read it again (no capped fix-up).
+    """
+    slane = lax.broadcasted_iota(jnp.uint32, (8, 128), 0)
+    # Byte b of out sublane 4h+g <- src sublane 4h+b, byte g; no carries.
+    pat = ((slane & 3) << 3 | (slane >> 2) << 2) * jnp.uint32(0x01010101)
+    pat = pat + jnp.uint32(0x03020100)
+    for k in range(num_rows // 8):
+        rows = pl.ds(8 * k, 8)
+        x = pltpu.bitcast(nope_ref[rows, :], jnp.uint8)
+        nope_ref[rows, :] = pltpu.bitcast(_vperm_slane_byte(x, pat), jnp.uint32)
+    blocks = []
+    for g in range(kv_cache_utils.WORD_BYTES):
+        tiles = [
+            pltpu.bitcast(
+                nope_ref[pl.ds(32 * m + g, 8, stride=4), :], jnp.float8_e4m3fn
+            )
+            for m in range(num_rows // 32)
+        ]
+        blocks.append(jnp.concatenate(tiles, axis=0))
+    return jnp.concatenate(blocks, axis=1)
+
+
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_tokens] valid top-k count per query token
@@ -431,6 +474,7 @@ def _attention_kernel(
     capped_windows: int | None = None,
     split_q: bool = False,
     lse_lane_dense: bool = False,
+    nope_unpack: str = "reshape",
 ):
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
@@ -736,14 +780,17 @@ def _attention_kernel(
         )
 
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
-        bkv_nope = bkv_nope_ref[...]
-        if sparsecore_layout:
-            # Native SC returns one uint32[128] row per token. Bitcasting
-            # expands the packed byte lanes before folding them into the
-            # logical 512-byte NOPE vector.
-            bkv_nope = pltpu.bitcast(bkv_nope, jnp.uint8)
-        bkv_nope = bkv_nope.reshape(bkv_sz, nope_dim)
-        bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
+        if sparsecore_layout and nope_unpack == "vperm":
+            bkv_nope = _vperm_unpack_nope(bkv_nope_ref, bkv_sz)
+        else:
+            bkv_nope = bkv_nope_ref[...]
+            if sparsecore_layout:
+                # Native SC returns one uint32[128] row per token. Bitcasting
+                # expands the packed byte lanes before folding them into the
+                # logical 512-byte NOPE vector.
+                bkv_nope = pltpu.bitcast(bkv_nope, jnp.uint8)
+            bkv_nope = bkv_nope.reshape(bkv_sz, nope_dim)
+            bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
 
         bkv_rope = bkv_rope_ref[...]
         if sparsecore_layout:
@@ -1073,6 +1120,7 @@ def prepare_outputs(
         "live_gather_all_chunks",
         "topk_cap",
         "lse_lane_dense",
+        "nope_unpack",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1107,6 +1155,7 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    nope_unpack: str = "reshape",
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1391,6 +1440,7 @@ def sparse_ragged_paged_attention(
             ),
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
+            nope_unpack=nope_unpack,
         )
         if return_lse:
             q, lse = result
@@ -1492,6 +1542,7 @@ def sparse_attention_chunk(
     window_indices: jax.Array | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    nope_unpack: str = "reshape",
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1522,6 +1573,11 @@ def sparse_attention_chunk(
     if window_indices is not None and topk_cap is None:
         raise ValueError("window_indices requires topk_cap")
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    if nope_unpack not in ("reshape", "vperm"):
+        raise ValueError(f"unknown {nope_unpack=}")
+    if nope_unpack == "vperm" and topk_cap is not None:
+        # The vperm unpack overwrites the gathered slot the capped fix-up re-reads.
+        raise ValueError("nope_unpack='vperm' does not support topk_cap")
     if topk_cap is not None and not sparsecore_layout:
         raise ValueError("topk_cap requires the sparsecore cache layout")
     if topk_cap is not None and (topk_cap % GATHER_ATOM_ROWS or topk % topk_cap):
@@ -1642,6 +1698,7 @@ def sparse_attention_chunk(
             capped_windows=capped_windows,
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
+            nope_unpack=nope_unpack,
         )
 
         scope_name = (
