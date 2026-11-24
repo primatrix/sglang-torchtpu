@@ -35,7 +35,8 @@ DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
 # Test only (roofline ablation, not in vllm-torchtpu): None keeps the kernel
 # unchanged; "dma" / "mxu" / "vpu" keep only that unit's work in the uncapped
-# attention body. Read at trace time, so set it before tracing and call
+# attention body ("vpu_repack": "vpu" plus a forced byte unpack/repack of the
+# KV, see attention_step1_qk_softmax). Read at trace time, so set it before tracing and call
 # jax.clear_caches() when switching.
 _ABLATE = None
 
@@ -459,7 +460,7 @@ def _attention_kernel(
     # double-buffered window DMAs (two-slot scratch trails the usual scratch).
     ablate = _ABLATE
     abl_kv_ref = None
-    if ablate in ("mxu", "vpu"):
+    if ablate in ("mxu", "vpu", "vpu_repack"):
         abl_kv_ref = refs[-1]  # fp8[bkv_sz, head_dim], VMEM
         refs = refs[:-1]
     q_pe_hbm_ref = None
@@ -547,7 +548,16 @@ def _attention_kernel(
         if ablate == "mxu":
             s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
             return s, s[:, :1], s[:, :1]
-        if ablate == "vpu":
+        if ablate == "vpu_repack":
+            # As "vpu", but a plain store lets the compiler skip the byte
+            # relayout the MXU push needs. Widen every byte to s32 and pack it
+            # back instead (vunpack + vpack); the xor with a runtime zero
+            # (kv_len >= 0) keeps the round trip from folding away.
+            zero = kv_len >> 31
+            wide = pltpu.bitcast(kv, jnp.uint8).astype(jnp.int32) ^ zero
+            abl_kv_ref[...] = pltpu.bitcast(wide.astype(jnp.uint8), jnp.float8_e4m3fn)
+            s = jnp.broadcast_to(q[:, :1].astype(jnp.float32), (q.shape[0], bkv_sz))
+        elif ablate == "vpu":
             # No matmul: keep the unpacked kv live with a store, and fake the
             # scores from one q column so softmax still runs on [H, bkv_sz].
             abl_kv_ref[...] = kv
@@ -581,7 +591,7 @@ def _attention_kernel(
             return jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32).astype(
                 q_dtype
             )
-        if ablate == "vpu":
+        if ablate in ("vpu", "vpu_repack"):
             pv = jnp.tile(p[:, :128], (1, head_dim // 128))
         else:
             pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
@@ -1658,7 +1668,7 @@ def sparse_attention_chunk(
                 pltpu.VMEM((2, batch_size, num_q_heads, q_pe.shape[-1]), q_pe.dtype)
             )
 
-        if _ABLATE in ("mxu", "vpu"):
+        if _ABLATE in ("mxu", "vpu", "vpu_repack"):
             assert capped_windows is None, "ablation covers the uncapped body only"
             abl_bkv_sz = (
                 cache_kv_nope.shape[1]
