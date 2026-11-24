@@ -42,7 +42,7 @@ FP = att.FP = 64
 BUNDLE_RE = re.compile(r"\s*(0x[0-9a-f]+)\s*:\s*(>*)\s*\{(.*)\}\s*$")
 TOK_RE = re.compile(r"(?<![%\w.$#])([a-z][a-z0-9_]*(?:\.[\w]+)*)")
 KEEP = ("vmat", "vpop", "vcvt", "vunpack", "vpack", "vperm", "vrot", "vcombine",
-        "vshl", "vshr", "vand", "vor", "vsel", "vcmp", "vexp", "vpow", "vrcp", "vmax", "vadd",
+        "vshl", "vshr", "vand", "vor", "vxor", "vsel", "vcmp", "vexp", "vpow", "vrcp", "vmax", "vadd",
         "vmul", "vsub", "vld", "vst")
 
 

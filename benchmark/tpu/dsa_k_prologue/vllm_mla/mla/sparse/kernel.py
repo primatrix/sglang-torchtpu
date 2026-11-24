@@ -549,14 +549,24 @@ def _attention_kernel(
             s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
             return s, s[:, :1], s[:, :1]
         if ablate == "vpu_repack":
-            # As "vpu", but a plain store lets the compiler skip the byte
-            # relayout the MXU push needs. Widen every byte to s32 and pack it
-            # back instead (vunpack + vpack); the xor with a runtime zero
-            # (kv_len >= 0) keeps the round trip from folding away.
+            # As "vpu", but the KV must reach the output: a scratch store that
+            # is overwritten every query and never read is dropped together
+            # with the unpack feeding it. Widen every byte to s32 and pack it
+            # back (vunpack + vpack; the xor with a runtime zero, kv_len >= 0,
+            # keeps the round trip), xor-fold it to [128, 128] i32 (~300 vxor),
+            # and add it to the scores behind a select that is never taken.
             zero = kv_len >> 31
             wide = pltpu.bitcast(kv, jnp.uint8).astype(jnp.int32) ^ zero
-            abl_kv_ref[...] = pltpu.bitcast(wide.astype(jnp.uint8), jnp.float8_e4m3fn)
+            w = pltpu.bitcast(wide.astype(jnp.uint8), jnp.int32)  # i32[bkv_sz // 4, head_dim]
+            f = w[0:128]
+            for r in range(128, w.shape[0], 128):
+                f = f ^ w[r : r + 128]
+            g = f[:, 0:128]
+            for c in range(128, f.shape[1], 128):
+                g = g ^ f[:, c : c + 128]
+            keep = jnp.where(zero != 0, g[: q.shape[0]].astype(jnp.float32), 0.0)
             s = jnp.broadcast_to(q[:, :1].astype(jnp.float32), (q.shape[0], bkv_sz))
+            s = jnp.concatenate([s[:, :128] + keep, s[:, 128:]], axis=1)
         elif ablate == "vpu":
             # No matmul: keep the unpacked kv live with a store, and fake the
             # scores from one q column so softmax still runs on [H, bkv_sz].

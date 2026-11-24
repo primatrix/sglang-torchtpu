@@ -12,9 +12,11 @@ unit's work in the uncapped attention body:
 * ``vpu``: unpack (kept live by a store), mask, softmax, normalize and the
   output cast; scores are a broadcast q column, PV is a tile of p. No matmul.
 * ``vpu_repack``: ``vpu`` plus a forced s8->s32->s8 round trip of the KV
-  bytes. A plain store lets the compiler skip the byte relayout that the MXU
-  push needs (``vpu`` ran 16 ``vunpack`` per query vs 1,280 in ``full``); this
-  stands in for it with a similar instruction count, not the same shuffles.
+  bytes, xor-folded into the scores so it cannot be dropped. In ``vpu`` the KV
+  only reached a scratch store that is overwritten each query and never read,
+  and the compiler dropped it with its unpack (16 ``vunpack`` per query vs
+  1,280 in ``full``). The round trip stands in for the MXU relayout with a
+  similar instruction count, not the same shuffles; the fold adds ~300 VALU.
 
 Each mode runs the same step as ``bench_vllm_vs_sglang.py`` (KV write, then
 ``sparse_ragged_paged_attention``) on the vllm-default layout for that shape,
