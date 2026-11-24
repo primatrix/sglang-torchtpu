@@ -37,7 +37,7 @@ CATEGORIES = [
     ("q_prep", ("q_hbm_ref", "concatenate")),
     ("copy", ("copy",)),
 ]
-VARIANTS = ("reshape", "vperm")
+VARIANTS = ("reshape", "vperm", "vperm_reg")
 
 
 def emit(**kw):

@@ -452,6 +452,56 @@ def _vperm_unpack_nope(nope_ref, num_rows):
     return jnp.concatenate(blocks, axis=1)
 
 
+def _vcombine_low_high(x, y):
+    """vcombine.low / vcombine.high of two u32[8, 128] (libtpu-agent#309 idiom)."""
+    x32 = pltpu.bitcast(x, jnp.int16).astype(jnp.int32)
+    y32 = pltpu.bitcast(y, jnp.int16).astype(jnp.int32)
+    lo = pltpu.bitcast(
+        jnp.concatenate([x32[:8], y32[:8]], axis=0).astype(jnp.int16), jnp.uint32
+    )
+    hi = pltpu.bitcast(
+        jnp.concatenate([x32[8:], y32[8:]], axis=0).astype(jnp.int16), jnp.uint32
+    )
+    return lo, hi
+
+
+def _vperm_reg_unpack_nope(nope_ref, num_rows):
+    """SparseCore NOPE u32[num_rows, 128] -> fp8[num_rows, 512] in registers.
+
+    Test-only, libtpu-agent#309 scheme A: per 32 tokens 4 vperm.slane (even /
+    odd source vregs), 4 vsel, 2 vrot.slane and 4 vcombine; reads the gathered
+    slot only. Patterns come from iota and are closed over, never loop-carried,
+    so the #292 bit swap folds away.
+    """
+    slane = lax.broadcasted_iota(jnp.uint32, (8, 128), 0)
+    even = (slane << 2) * jnp.uint32(0x01010101) + jnp.uint32(0x03020100)
+    odd = (((slane - jnp.uint32(2)) & jnp.uint32(7)) << 2) * jnp.uint32(
+        0x01010101
+    ) + jnp.uint32(0x03020100)
+    sel = (slane & jnp.uint32(2)) != jnp.uint32(0)
+    blocks = [[] for _ in range(kv_cache_utils.WORD_BYTES)]
+    for m in range(num_rows // 32):
+        p = [
+            pltpu.bitcast(
+                _vperm_slane_byte(
+                    pltpu.bitcast(nope_ref[pl.ds(32 * m + 8 * k, 8), :], jnp.uint8),
+                    even if k % 2 == 0 else odd,
+                ),
+                jnp.uint32,
+            )
+            for k in range(4)
+        ]
+        a01 = jnp.where(sel, p[1], p[0])
+        b01 = pltpu.roll(jnp.where(sel, p[0], p[1]), 6, axis=0)  # out[s] = x[s + 2]
+        a23 = jnp.where(sel, p[3], p[2])
+        b23 = pltpu.roll(jnp.where(sel, p[2], p[3]), 6, axis=0)
+        t0, t2 = _vcombine_low_high(a01, a23)
+        t1, t3 = _vcombine_low_high(b01, b23)
+        for g, t in enumerate((t0, t1, t2, t3)):
+            blocks[g].append(pltpu.bitcast(t, jnp.float8_e4m3fn))
+    return jnp.concatenate([jnp.concatenate(b, axis=0) for b in blocks], axis=1)
+
+
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_tokens] valid top-k count per query token
@@ -782,6 +832,8 @@ def _attention_kernel(
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
         if sparsecore_layout and nope_unpack == "vperm":
             bkv_nope = _vperm_unpack_nope(bkv_nope_ref, bkv_sz)
+        elif sparsecore_layout and nope_unpack == "vperm_reg":
+            bkv_nope = _vperm_reg_unpack_nope(bkv_nope_ref, bkv_sz)
         else:
             bkv_nope = bkv_nope_ref[...]
             if sparsecore_layout:
@@ -1573,7 +1625,7 @@ def sparse_attention_chunk(
     if window_indices is not None and topk_cap is None:
         raise ValueError("window_indices requires topk_cap")
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
-    if nope_unpack not in ("reshape", "vperm"):
+    if nope_unpack not in ("reshape", "vperm", "vperm_reg"):
         raise ValueError(f"unknown {nope_unpack=}")
     if nope_unpack == "vperm" and topk_cap is not None:
         # The vperm unpack overwrites the gathered slot the capped fix-up re-reads.
