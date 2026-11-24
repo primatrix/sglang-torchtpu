@@ -44,12 +44,69 @@ def emit(**kw):
     print("VPU " + json.dumps(kw), flush=True)
 
 
+def _emit_chunked(kind, head, items, limit=3200):
+    """Print ``items`` as several ``kind`` lines, each JSON under ``limit`` chars."""
+    part, size, idx = [], 0, 0
+    for it in items:
+        n = len(json.dumps(it)) + 1
+        if part and size + n > limit:
+            print(f"{kind} " + json.dumps({**head, "part": idx, "ev": part}), flush=True)
+            part, size, idx = [], 0, idx + 1
+        part.append(it)
+        size += n
+    print(f"{kind} " + json.dumps({**head, "part": idx, "ev": part, "last": True}), flush=True)
+
+
+def dump_timeline(jax, call, sync, base, case, variant, traces):
+    """Each trace holds two calls; the second (warm) is dumped.
+
+    With all SparseCore tiles traced the TEC lines carry ~800k events and the
+    TC "XLA Ops" line loses most attention chunks (5 of 48 kept in
+    exp-qcw0lbk9bs's layer-0 trace), so a second config traces one SC tile.
+    """
+    from xplane_timeline import call_events
+
+    configs = (("default", None), ("sc_tile1", {"tpu_num_sparse_core_tiles_to_trace": 1}))
+    for cfg, adv in configs:
+        for t in range(traces):
+            d = f"{base}_{cfg}_{t}"
+            head = {"case": case, "variant": variant, "cfg": cfg, "trace": t}
+            opts = None
+            if adv is not None:
+                opts = jax.profiler.ProfileOptions()
+                opts.advanced_configuration = adv
+            sync()
+            try:
+                jax.profiler.start_trace(d, profiler_options=opts)
+            except Exception as e:  # unknown option: report, keep the other config
+                print("TLM " + json.dumps({**head, "fail": repr(e)[:400]}), flush=True)
+                break
+            for _ in range(2):
+                call()
+            sync()
+            jax.profiler.stop_trace()
+            r = call_events(d, call=1)
+            if "error" in r:
+                print("TLM " + json.dumps({**head, **r}), flush=True)
+                continue
+            n_mla = sum("MLA-" in n for n, _, _ in r["tc"])
+            print("TLM " + json.dumps({**head, "module_us": r["module_us"],
+                                        "n_modules": r["n_modules"], "n_tc": len(r["tc"]),
+                                        "n_mla": n_mla, "n_sc": len(r["sc"]),
+                                        "dropped_small_us": r["dropped_small_us"]}), flush=True)
+            _emit_chunked("TLE", {**head, "plane": "tc"}, r["tc"])
+            _emit_chunked("TLE", {**head, "plane": "sc"}, r["sc"])
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cases", nargs="+", default=list(CASES))
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--xprof-dir", required=True)
+    p.add_argument("--timeline", action="store_true",
+                   help="also dump per-op absolute TC/SC intervals of single warm calls (TLE lines)")
+    p.add_argument("--timeline-traces", type=int, default=2)
     a = p.parse_args()
 
     os.environ.setdefault("JAX_PLATFORMS", "tpu")
@@ -132,6 +189,9 @@ def main():
                 row["module_us"] = round(sum(u for _, u in x.get("modules", [])), 1)
                 row["categories"] = breakdown(d, a.iters, CATEGORIES).get("categories")
                 row["top_ops"] = [(nm[:60], round(u, 1)) for nm, u in x.get("ops", [])[:6]]
+                if a.timeline:
+                    dump_timeline(jax, call, sync, f"{a.xprof_dir}/tl_{name}_{variant}",
+                                  name, variant, a.timeline_traces)
             except Exception as e:  # report, keep the other variants
                 import traceback
 
