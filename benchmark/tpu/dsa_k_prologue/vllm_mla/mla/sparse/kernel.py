@@ -33,6 +33,11 @@ DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
+# Test only (roofline ablation, not in vllm-torchtpu): None keeps the kernel
+# unchanged; "dma" / "mxu" / "vpu" keep only that unit's work in the uncapped
+# attention body. Read at trace time, so set it before tracing and call
+# jax.clear_caches() when switching.
+_ABLATE = None
 
 
 def cdiv(a, b):
@@ -452,6 +457,11 @@ def _attention_kernel(
     # exactly like the uncapped path. Tokens with more than `bkv_sz` live rows
     # are recomputed over all their windows by an online-softmax fix-up with
     # double-buffered window DMAs (two-slot scratch trails the usual scratch).
+    ablate = _ABLATE
+    abl_kv_ref = None
+    if ablate in ("mxu", "vpu"):
+        abl_kv_ref = refs[-1]  # fp8[bkv_sz, head_dim], VMEM
+        refs = refs[:-1]
     q_pe_hbm_ref = None
     bq_pe_x2_ref = None
     if split_q:
@@ -534,7 +544,16 @@ def _attention_kernel(
         # block, so no FlashAttention running-max/rescale state (GLM-5.2 DSA
         # has no SWA or sinks). The step1/step2 split only interleaves VPU
         # and MXU work across batch entries.
-        s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+        if ablate == "mxu":
+            s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+            return s, s[:, :1], s[:, :1]
+        if ablate == "vpu":
+            # No matmul: keep the unpacked kv live with a store, and fake the
+            # scores from one q column so softmax still runs on [H, bkv_sz].
+            abl_kv_ref[...] = kv
+            s = jnp.broadcast_to(q[:, :1].astype(jnp.float32), (q.shape[0], bkv_sz))
+        else:
+            s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
         if k_scale != 1.0:
             s *= k_scale
@@ -558,7 +577,14 @@ def _attention_kernel(
         kv,
         l_sum,
     ):
-        pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+        if ablate == "mxu":
+            return jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32).astype(
+                q_dtype
+            )
+        if ablate == "vpu":
+            pv = jnp.tile(p[:, :128], (1, head_dim // 128))
+        else:
+            pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
 
         # We use `k_scale` for the PV step as well since MLA uses a shared
         # compressed latent for k/v and k_scale ~= v_scale.
@@ -729,6 +755,9 @@ def _attention_kernel(
             tile_ref[...] = jnp.where(pick, row, tile_ref[...])
 
     def load_bkv(bkv_sem_idx, batch_idx):
+        if ablate == "mxu":
+            # The MXU operand in compute layout, without the unpack.
+            return abl_kv_ref[...]
         return unpack_bkv(
             bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx],
             bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx],
@@ -928,7 +957,7 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
-        for batch_idx in range(batch_size):
+        for batch_idx in range(batch_size if ablate != "dma" else 0):
             kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
             bkv = load_bkv(bi_sem_idx, batch_idx)
             bq = load_bq(bi_sem_idx, batch_idx)
@@ -958,9 +987,16 @@ def _attention_kernel(
             prev_m = m
 
         # end of pipelining loop
-        out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
-        bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
-        write_blse(batch_size - 1, prev_m, prev_l_sum)
+        if ablate == "dma":
+            # DMAs only: the in/out transfers and waits stay, no compute.
+            for batch_idx in range(batch_size):
+                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = load_bq(bi_sem_idx, batch_idx)[
+                    :, :o_dim
+                ]
+        else:
+            out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+            bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
+            write_blse(batch_size - 1, prev_m, prev_l_sum)
         if capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
@@ -1621,6 +1657,15 @@ def sparse_attention_chunk(
             scratch_shapes.append(
                 pltpu.VMEM((2, batch_size, num_q_heads, q_pe.shape[-1]), q_pe.dtype)
             )
+
+        if _ABLATE in ("mxu", "vpu"):
+            assert capped_windows is None, "ablation covers the uncapped body only"
+            abl_bkv_sz = (
+                cache_kv_nope.shape[1]
+                if sparsecore_layout
+                else cache_kv_nope.shape[1] // kv_cache_utils.WORD_BYTES
+            )
+            scratch_shapes.append(pltpu.VMEM((abl_bkv_sz, head_dim), jnp.float8_e4m3fn))
 
         bounds = [start_seq_idx, end_seq_idx]
         if preserve_suffix:
