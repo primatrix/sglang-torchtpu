@@ -88,10 +88,60 @@ def report(tag, new_files):
         print("LLORAW " + json.dumps({"tag": tag, "file": base[-60:], "lines": raw}), flush=True)
 
 
+def report_order(tag, new_files):
+    """Walk the TC attention MLA bundle file in program order and show how the
+    MXU (vmat/vpop) work interleaves with reorder (vunpack/vperm...) vs softmax
+    (vexp/vmax/vrcp) VPU work: per-bundle co-issue counts + a run-length tag
+    sequence. Answers whether PV overlaps the reorder or the softmax."""
+    names = sorted(
+        f for f in new_files
+        if f.endswith("final_bundles.txt") and "MLA-" in os.path.basename(f)
+    )
+    for f in names:
+        base = os.path.basename(f)
+        seq = []
+        n_mxu = co_reorder = co_softmax = mxu_alone = 0
+        for ln in open(f, errors="replace"):
+            m = BUNDLE_RE.match(ln)
+            if not m:
+                continue
+            ops = opcodes(m.group(3))
+            mxu = any(o.startswith(("vmat", "vpop")) for o in ops)
+            reorder = any(
+                o.startswith(("vunpack", "vperm", "vrot", "vcombine", "vshrl", "vshr"))
+                for o in ops
+            )
+            softmax = any(o.startswith(("vexp", "vmax", "vrcp")) for o in ops)
+            if mxu:
+                n_mxu += 1
+                co_reorder += reorder
+                co_softmax += softmax
+                mxu_alone += not (reorder or softmax)
+                seq.append("M")
+            elif reorder:
+                seq.append("R")
+            elif softmax:
+                seq.append("S")
+            else:
+                seq.append(".")
+        rle = []
+        for ch in seq:
+            if rle and rle[-1][0] == ch:
+                rle[-1][1] += 1
+            else:
+                rle.append([ch, 1])
+        rle_str = " ".join(f"{c}{n}" for c, n in rle)
+        print("LLOORDER " + json.dumps({
+            "tag": tag, "file": base[-70:], "bundles": len(seq), "mxu": n_mxu,
+            "mxu_coissue_reorder": co_reorder, "mxu_coissue_softmax": co_softmax,
+            "mxu_alone": mxu_alone, "rle": rle_str[:12000]}), flush=True)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cases", nargs="+", default=["pr2198_extend_c1", "pr2198_verify_b4"])
     p.add_argument("--layouts", nargs="+", default=["sparsecore", "tensorcore"])
+    p.add_argument("--order", action="store_true", help="also dump ordered MXU/reorder/softmax interleave")
     a = p.parse_args()
 
     import jax
@@ -138,7 +188,10 @@ def main():
                         jax.ShapeDtypeStruct(rs.shape, rs.jax_dtype), q, kvc, kpe)
                 before = files_now()
                 jax.jit(step).lower(*args).compile()
-                report(tag, files_now() - before)
+                new = files_now() - before
+                report(tag, new)
+                if a.order:
+                    report_order(tag, new)
             except Exception as e:  # report, keep the other variants
                 import traceback
 
